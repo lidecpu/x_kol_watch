@@ -1,151 +1,153 @@
 # X KOL Watch
 
-每天扫描 KOL 最近 24 小时 X 推文，英文翻译成中文，生成报告并可发送 Telegram。
+X KOL Watch 是一个 X/Twitter KOL 推文监控脚本，用于每天扫描指定账号最近 24 小时推文，翻译英文内容，过滤低信息噪音，并把重点摘要发送到 Telegram。
+
+适合用途：
+
+- 每天固定时间汇总加密市场、链上数据、交易员和新闻账号动态
+- 英文推文自动翻译成中文
+- Telegram 按 KOL 分组发送，长内容自动拆组
+- 过滤广告、抽奖、短回复、URL 残片、长钱包地址和单独币种词
+- 支持本地 Windows 运行，也支持 GitHub Actions 定时运行
 
 ## 配置
 
-复制 `.env.example` 为 `.env`，填入：
+复制 `.env.example` 为 `.env`，只在本地填写真实值：
 
 ```text
-X_AUTH=你的 auth_token
-X_CT0=你的 ct0
-TELEGRAM_BOT_TOKEN=你的 Telegram bot token
-TELEGRAM_CHAT_ID=你的 chat id
+X_AUTH=your_x_auth_token
+X_CT0=your_x_ct0
+TELEGRAM_BOT_TOKEN=1234567890:replace_with_bot_token
+TELEGRAM_CHAT_ID=123456789
 ```
 
-`.env` 已被 `.gitignore` 忽略，不要提交。
+`.env` 已被 `.gitignore` 忽略，不要提交到 Git 仓库。
 
-## 安装依赖
+## GitHub Actions
+
+仓库已内置 `.github/workflows/x-kol-daily.yml`：
+
+- 支持手动运行
+- 每天北京时间 `23:30` 自动运行
+- 默认 `focus` 重点模式
+- 手动运行时可选择 `focus` 或 `full`
+- `max_kols=0` 表示扫描全部 KOL，测试时建议先填 `2`
+
+需要在 GitHub 仓库的 `Settings -> Secrets and variables -> Actions -> Repository secrets` 添加：
+
+```text
+X_AUTH
+X_CT0
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+```
+
+Secret 只填值本身，不要填 `KEY=value` 整行。
+
+## 本地运行
+
+安装依赖：
 
 ```powershell
-py -3 -m pip install playwright
-py -3 -m playwright install chromium
+python -m pip install playwright
+python -m playwright install chromium
 ```
 
 默认使用 Playwright 自带的 headless Chromium，不会打开桌面浏览器窗口。
 
-`CHROME_PATH` 默认留空。只有排查浏览器问题时，才临时指定本机 Chrome：
-
-```text
-CHROME_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
-```
-
-## 运行
-
-日常隐藏入口：扫描完成后自动发送 Telegram 重点版，不会弹出控制台黑窗：
-
-```text
-run_daily_hidden.vbs
-```
-
-兼容入口，同样会自动发送 Telegram 重点版，适合放到计划任务：
-
-```text
-run_daily_send_hidden.vbs
-```
-
-调试时再手动运行 PowerShell 脚本：
+生成报告并发送 Telegram 重点版：
 
 ```powershell
-.\run_daily.ps1
-```
-
-PowerShell 默认也会在扫描完成后自动发送 Telegram 重点版。只扫不发：
-
-```powershell
-.\run_daily.ps1 -NoSend
-```
-
-如果需要自动发送全量版：
-
-```powershell
-.\run_daily.ps1 -TelegramMode full
+python .\x_kol_daily.py
 ```
 
 只生成报告，不发送 Telegram：
 
 ```powershell
-py -3 .\x_kol_daily.py --no-send
-```
-
-生成报告并自动发送 Telegram 重点版：
-
-```powershell
-py -3 .\x_kol_daily.py
-```
-
-Telegram 默认发送全量版：最近 24 小时推文按 KOL 聚合，同一个 KOL 放在一起；每组最多 20 条，并按 Telegram 长度自动拆组；本地 `reports/` 仍保存完整报告。
-
-Telegram 默认会过滤短回复、低信息 CTA、孤立英文短句和 URL 残片；本地报告和缓存仍保留原始内容。
-
-```powershell
-py -3 .\x_kol_daily.py --send
-```
-
-只发送重点版：过滤明显噪音，合并同一时间连发 thread，适合日常快速看。
-
-```powershell
-py -3 .\x_kol_daily.py --telegram-mode focus
+python .\x_kol_daily.py --no-send
 ```
 
 发送全量版：
 
 ```powershell
-py -3 .\x_kol_daily.py --telegram-mode full
+python .\x_kol_daily.py --telegram-mode full
 ```
 
-如果需要连低信息短回复也一起发送：
+只看本地缓存，不打开 X：
 
 ```powershell
-py -3 .\x_kol_daily.py --telegram-mode full --include-low-signal
+python .\x_kol_daily.py --cache-recent 48 --telegram-preview --telegram-mode focus
 ```
 
-调整 Telegram 分组大小：
+把本地缓存发送到 Telegram：
 
 ```powershell
-py -3 .\x_kol_daily.py --send --telegram-group-size 20
+python .\x_kol_daily.py --cache-recent 48 --send
 ```
 
-只看本地已保存推文，不打开 X：
+## Windows 隐藏运行
 
-```powershell
-py -3 .\x_kol_daily.py --cache-recent 3
-```
-
-把本地缓存摘要发送到 Telegram，不重新扫描 X：
-
-```powershell
-py -3 .\x_kol_daily.py --cache-recent 48 --send
-```
-
-预览 Telegram 重点版，不发送：
-
-```powershell
-py -3 .\x_kol_daily.py --cache-recent 48 --telegram-preview --telegram-mode focus
-```
-
-报告目录：
+日常隐藏入口，适合计划任务：
 
 ```text
-reports/
+run_daily_hidden.vbs
 ```
 
-状态和翻译缓存：
+兼容发送入口：
 
 ```text
-state/
-cache/
+run_daily_send_hidden.vbs
 ```
 
-去重后的本地推文库：
+调试时使用 PowerShell：
+
+```powershell
+.\run_daily.ps1
+```
+
+只扫不发：
+
+```powershell
+.\run_daily.ps1 -NoSend
+```
+
+发送全量版：
+
+```powershell
+.\run_daily.ps1 -TelegramMode full
+```
+
+## 文件说明
 
 ```text
-cache/tweets.json
+kols.txt                      KOL 列表
+x_kol_daily.py                主脚本
+.github/workflows/            GitHub Actions 定时任务
+reports/                      每日 Markdown 报告，本地忽略
+state/                        每日状态，本地忽略
+cache/tweets.json             本地推文缓存，本地忽略
+cache/translations.json       翻译缓存，本地忽略
 ```
 
-脚本会自动清理旧输出：
+`reports/` 和 `state/` 按日期保存，每天一个文件；`cache/` 用于去重和翻译缓存。
+
+## KOL 列表
+
+编辑 `kols.txt`：
 
 ```text
-reports/ 只保留最近 5 个报告
-state/   只保留最近 5 个状态快照
+名称 | @handle | 备注
 ```
+
+示例：
+
+```text
+Watcher.Guru | @WatcherGuru | 加密新闻
+Lookonchain | @lookonchain | 链上监测
+```
+
+## 注意
+
+- X 登录 Cookie 可能过期，抓不到推文时先更新 `X_AUTH` 和 `X_CT0`
+- GitHub Actions 运行在 GitHub 服务器，X 可能对机房 IP 有限制
+- Telegram Bot Token 和 X Cookie 都属于敏感信息，必须放在 `.env` 或 GitHub Secrets

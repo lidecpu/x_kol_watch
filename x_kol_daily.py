@@ -554,6 +554,7 @@ HARD_LOW_SIGNAL_TERMS = [
 ]
 TOKEN_ONLY_TERMS = {
     "btc", "bitcoin", "eth", "ethereum", "sol", "hype", "mstr",
+    "crypto", "比特币", "加密", "加密货币",
     "$btc", "$eth", "$sol", "$hype", "$mstr",
 }
 EXCLUDED_TELEGRAM_TERMS = ["slowmist", "慢雾"]
@@ -593,9 +594,10 @@ def has_important_signal(text: str) -> bool:
 
 
 def is_token_only_text(text: str) -> bool:
-    normalized = re.sub(r"^[#＃]", "", text.strip().lower())
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized in TOKEN_ONLY_TERMS
+    token_text = re.sub(r"[#＃$＄]", "", text.strip().lower())
+    token_text = re.sub(r"[，,。.!！?？；;：:、/|()\[\]【】]+", " ", token_text)
+    tokens = [token for token in re.split(r"\s+", token_text) if token]
+    return bool(tokens) and len(tokens) <= 5 and all(token in TOKEN_ONLY_TERMS for token in tokens)
 
 
 def is_low_signal_row(row: dict[str, Any]) -> bool:
@@ -708,8 +710,7 @@ def telegram_section(number: int, row: dict[str, Any], tweet_chars: int) -> str:
     if not body:
         return ""
     when = tweet_time_text(tw)
-    name = str(row.get("name") or row.get("handle") or "").strip() or "unknown"
-    return "\n".join([f"{number}. {name} | {when}", body])
+    return "\n".join([f"{number}. {when}", body])
 
 
 def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict[str, Any]]:
