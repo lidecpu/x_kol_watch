@@ -299,7 +299,6 @@ def prune_daily_outputs() -> None:
             for path in paths:
                 if path != keep:
                     path.unlink(missing_ok=True)
-            path.unlink(missing_ok=True)
 
 
 def tweet_id(tweet: dict[str, Any]) -> str:
