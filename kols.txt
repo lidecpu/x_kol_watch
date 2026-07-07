@@ -48,3 +48,19 @@ Bubblemaps | @bubblemaps | 地址图谱
 Nansen | @nansen_ai | 聪明钱
 PeckShield | @PeckShieldAlert | 安全预警
 giantcutie666 | @giantcutie666 | KOL
+Vitalik Buterin | @VitalikButerin | Ethereum 创始人
+CZ | @cz_binance | Binance 创始人
+Brian Armstrong | @brian_armstrong | Coinbase CEO
+Balaji | @balajis | 加密/宏观
+Anthony Pompliano | @APompliano | Bitcoin/宏观
+Andreas Antonopoulos | @aantonop | Bitcoin 教育
+Arthur Hayes | @CryptoHayes | 加密宏观
+ZachXBT | @zachxbt | 链上安全调查
+Chris Dixon | @cdixon | a16z/Web3
+Hayden Adams | @haydenzadams | Uniswap
+Stani Kulechov | @StaniKulechov | Aave
+punk6529 | @punk6529 | NFT/Web3
+ChainLinkGod | @ChainLinkGod | Chainlink/DeFi
+DefiIgnas | @DefiIgnas | DeFi 研究
+foobar | @0xfoobar | 加密开发
+Bankless | @BanklessHQ | Ethereum/DeFi 媒体
