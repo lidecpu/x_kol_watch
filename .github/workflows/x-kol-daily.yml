@@ -104,8 +104,10 @@ jobs:
           printf '\n'
 
           set -o pipefail
+          set +e
           "${cmd[@]}" 2>&1 | tee run.log
           status="${PIPESTATUS[0]}"
+          set -e
           if [ "$status" != "0" ]; then
             {
               echo "### X KOL watcher failed"
