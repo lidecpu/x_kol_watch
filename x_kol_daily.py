@@ -28,6 +28,11 @@ CACHE_DIR = ROOT / "cache"
 TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
+CN_TZ = dt.timezone(dt.timedelta(hours=8))
+
+
+def cn_now() -> dt.datetime:
+    return dt.datetime.now(CN_TZ)
 
 
 def load_dotenv(path: Path) -> None:
@@ -490,7 +495,7 @@ def summarize_item(item: dict[str, Any], tweet_chars: int) -> str:
 
 
 def build_report(results: list[dict[str, Any]], hours: int) -> str:
-    now = dt.datetime.now().strftime("%m-%d %H:%M")
+    now = cn_now().strftime("%m-%d %H:%M")
     total = sum(len(x.get("tweets", [])) for x in results)
     lines = [
         f"X KOL {hours}H | {len(results)}人 | {total}条 | {now}",
@@ -692,16 +697,8 @@ def merge_thread_rows(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict
 
 def focus_rows(rows: list[dict[str, Any]], tweet_chars: int, limit: int) -> list[dict[str, Any]]:
     merged = merge_thread_rows(rows, tweet_chars)
-    scored = [(row_signal_score(row), row) for row in merged]
-    kept = [(score, row) for score, row in scored if score >= 1]
-    if not kept:
-        kept = sorted(scored, key=lambda pair: (pair[0], int(pair[1]["tweet"].get("created_at_ms") or 0)), reverse=True)[:limit]
-    else:
-        kept.sort(key=lambda pair: (pair[0], int(pair[1]["tweet"].get("created_at_ms") or 0)), reverse=True)
-        kept = kept[:limit]
-    rows_out = [row for _, row in kept]
-    rows_out.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
-    return rows_out
+    merged.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
+    return merged[:limit] if limit > 0 else merged
 
 
 def telegram_section(number: int, row: dict[str, Any], tweet_chars: int) -> str:
@@ -816,14 +813,14 @@ def build_telegram_reports(
     style: str,
     group_size: int,
     mode: str = "full",
-    focus_limit: int = 30,
+    focus_limit: int = 0,
     include_low_signal: bool = False,
 ) -> list[str]:
     active = [x for x in results if x.get("tweets")]
     rows = telegram_rows(active, per_kol, include_low_signal)
     if mode == "focus":
         rows = focus_rows(rows, tweet_chars, focus_limit)
-    now = dt.datetime.now().strftime("%m-%d %H:%M")
+    now = cn_now().strftime("%m-%d %H:%M")
     if not rows:
         return [f"X KOL {hours}H | KOL:0 | 总:0 | 本组:0 | {now}\n\n最近 24 小时没有抓到可读推文。\n"]
 
@@ -854,7 +851,7 @@ def build_telegram_report(
     style: str,
     group_size: int = 20,
     mode: str = "full",
-    focus_limit: int = 30,
+    focus_limit: int = 0,
     include_low_signal: bool = False,
 ) -> str:
     return "\n---\n\n".join(
@@ -993,7 +990,7 @@ def main() -> int:
     ap.add_argument("--telegram-group-size", type=int, default=20, help="max tweets per Telegram message group; 0 means one group")
     ap.add_argument("--telegram-style", choices=["digest", "list"], default="list")
     ap.add_argument("--telegram-mode", choices=["full", "focus"], default="focus", help="full sends all selected tweets; focus filters noisy tweets and merges threads")
-    ap.add_argument("--telegram-focus-limit", type=int, default=30, help="max tweets/thread summaries in focus mode")
+    ap.add_argument("--telegram-focus-limit", type=int, default=0, help="max tweets/thread summaries in focus mode; 0 means no limit")
     ap.add_argument("--include-low-signal", action="store_true", help="include short replies, CTA text, and low-signal tweets in Telegram output")
     ap.add_argument("--telegram-preview", action="store_true", help="print Telegram compact format")
     ap.add_argument("--dry-run", action="store_true", help="parse config only")
@@ -1059,8 +1056,8 @@ def main() -> int:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     results = scrape_all(kols, args.hours, args.limit, args.scrolls, headless=not args.headed)
 
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    day = dt.datetime.now().strftime("%Y%m%d")
+    stamp = cn_now().strftime("%Y%m%d-%H%M%S")
+    day = cn_now().strftime("%Y%m%d")
     store_stats = update_tweet_store(results, stamp)
     translate_stats = {"translated": 0, "skipped": 0, "failed": 0}
     if not args.no_translate:
