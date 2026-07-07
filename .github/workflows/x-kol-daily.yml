@@ -114,5 +114,11 @@ jobs:
               tail -n 200 run.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
+            tail -n 60 run.log | while IFS= read -r line; do
+              line="${line//'%'/'%25'}"
+              line="${line//$'\r'/'%0D'}"
+              line="${line//$'\n'/'%0A'}"
+              echo "::error title=X KOL watcher failed::$line"
+            done
             exit "$status"
           fi
