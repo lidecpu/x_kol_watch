@@ -100,6 +100,18 @@ def cookies_from_env() -> list[dict[str, Any]]:
     return cookies
 
 
+def route_static_assets(route: Any) -> None:
+    req = route.request
+    if req.resource_type in {"image", "media", "font", "stylesheet"}:
+        route.abort()
+        return
+    url = req.url.lower()
+    if any(host in url for host in ("twimg.com", "google-analytics.com", "doubleclick.net")):
+        route.abort()
+        return
+    route.continue_()
+
+
 EXTRACT_JS = r"""
 ({handle, cutoffMs, maxItems}) => {
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -138,19 +150,30 @@ EXTRACT_JS = r"""
 """
 
 
-def scrape_handle(page: Any, handle: str, hours: int, limit: int, scrolls: int) -> list[dict[str, Any]]:
+def scrape_handle(
+    page: Any,
+    handle: str,
+    hours: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    search_fallback: bool,
+) -> list[dict[str, Any]]:
     clean_handle = handle.lstrip("@")
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
     urls = [
         f"https://x.com/{urllib.parse.quote(clean_handle)}",
-        "https://x.com/search?" + urllib.parse.urlencode({"q": f"from:{clean_handle}", "src": "typed_query", "f": "live"}),
     ]
+    search_url = "https://x.com/search?" + urllib.parse.urlencode({"q": f"from:{clean_handle}", "src": "typed_query", "f": "live"})
+    if search_fallback:
+        urls.append(search_url)
     merged: dict[str, dict[str, Any]] = {}
-    for url in urls:
+    for url_index, url in enumerate(urls):
         if len(merged) >= limit:
             break
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-        page.wait_for_timeout(2500)
+        page.wait_for_timeout(page_wait_ms)
         for _ in range(scrolls + 1):
             rows = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
             for row in rows:
@@ -159,7 +182,9 @@ def scrape_handle(page: Any, handle: str, hours: int, limit: int, scrolls: int) 
             if len(merged) >= limit:
                 break
             page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(scroll_wait_ms)
+        if url_index == 0 and merged:
+            break
     rows = sorted(merged.values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
     return rows[:limit]
 
@@ -172,7 +197,16 @@ def fmt_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
-def scrape_all(kols: list[dict[str, str]], hours: int, limit: int, scrolls: int, headless: bool) -> list[dict[str, Any]]:
+def scrape_all(
+    kols: list[dict[str, str]],
+    hours: int,
+    limit: int,
+    scrolls: int,
+    headless: bool,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    search_fallback: bool,
+) -> list[dict[str, Any]]:
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
@@ -190,12 +224,7 @@ def scrape_all(kols: list[dict[str, str]], hours: int, limit: int, scrolls: int,
         try:
             context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
             try:
-                context.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in {"image", "media", "font"}
-                    else route.continue_(),
-                )
+                context.route("**/*", route_static_assets)
                 context.add_cookies(cookies)
                 page = context.new_page()
                 page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
@@ -212,7 +241,7 @@ def scrape_all(kols: list[dict[str, str]], hours: int, limit: int, scrolls: int,
                     started = time.time()
                     print(f"[scan {index}/{total_kols}] {handle} start", file=sys.stderr, flush=True)
                     try:
-                        tweets = scrape_handle(page, handle, hours, limit, scrolls)
+                        tweets = scrape_handle(page, handle, hours, limit, scrolls, page_wait_ms, scroll_wait_ms, search_fallback)
                         status = "ok"
                         error = ""
                     except Exception as exc:
@@ -707,7 +736,8 @@ def telegram_section(number: int, row: dict[str, Any], tweet_chars: int) -> str:
     if not body:
         return ""
     when = tweet_time_text(tw)
-    return "\n".join([f"{number}. {when}", body])
+    name = str(row.get("name") or row.get("handle") or "").strip() or "unknown"
+    return "\n".join([f"{number}. {name} | {when}", body])
 
 
 def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict[str, Any]]:
@@ -977,7 +1007,10 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=8, help="max tweets per KOL")
     ap.add_argument("--max-kols", type=int, default=0, help="test only: scan first N KOLs")
     ap.add_argument("--handles", default="", help="comma-separated handles for testing, e.g. @OpenAI,@saylor")
-    ap.add_argument("--scrolls", type=int, default=6)
+    ap.add_argument("--scrolls", type=int, default=3)
+    ap.add_argument("--page-wait-ms", type=int, default=1200)
+    ap.add_argument("--scroll-wait-ms", type=int, default=500)
+    ap.add_argument("--search-fallback", action=argparse.BooleanOptionalAction, default=True, help="try X search only when profile page has no recent tweets")
     ap.add_argument("--headed", action="store_true", help="show browser")
     ap.add_argument("--send", action="store_true", help="send report to Telegram")
     ap.add_argument("--no-send", action="store_true", help="do not send Telegram after a live scan")
@@ -1054,7 +1087,16 @@ def main() -> int:
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    results = scrape_all(kols, args.hours, args.limit, args.scrolls, headless=not args.headed)
+    results = scrape_all(
+        kols,
+        args.hours,
+        args.limit,
+        args.scrolls,
+        headless=not args.headed,
+        page_wait_ms=args.page_wait_ms,
+        scroll_wait_ms=args.scroll_wait_ms,
+        search_fallback=args.search_fallback,
+    )
 
     stamp = cn_now().strftime("%Y%m%d-%H%M%S")
     day = cn_now().strftime("%Y%m%d")
