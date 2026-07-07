@@ -98,4 +98,21 @@ jobs:
             cmd+=(--max-kols "$max_kols")
           fi
 
-          "${cmd[@]}"
+          echo "mode=$mode send=$send max_kols=$max_kols"
+          printf 'command:'
+          printf ' %q' "${cmd[@]}"
+          printf '\n'
+
+          set -o pipefail
+          "${cmd[@]}" 2>&1 | tee run.log
+          status="${PIPESTATUS[0]}"
+          if [ "$status" != "0" ]; then
+            {
+              echo "### X KOL watcher failed"
+              echo
+              echo '```text'
+              tail -n 200 run.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
