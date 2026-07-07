@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -194,6 +195,11 @@ def scrape_all(kols: list[dict[str, str]], hours: int, limit: int, scrolls: int,
                 page = context.new_page()
                 page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
                 page.wait_for_timeout(1500)
+                print(
+                    f"[x-home] url={page.url} title={page.title()[:80]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 total_kols = len(kols)
                 durations: list[float] = []
                 for index, kol in enumerate(kols, 1):
@@ -920,6 +926,10 @@ def telegram_send(text: str) -> None:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         raise RuntimeError("missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    if token.startswith("TELEGRAM_BOT_TOKEN=") or token.startswith("@") or not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", token):
+        raise RuntimeError("invalid TELEGRAM_BOT_TOKEN secret: put only the token value, not the bot name or TELEGRAM_BOT_TOKEN=...")
+    if chat_id.startswith("TELEGRAM_CHAT_ID="):
+        raise RuntimeError("invalid TELEGRAM_CHAT_ID secret: put only the chat id value, not TELEGRAM_CHAT_ID=...")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     chunks = split_message(text)
     for chunk in chunks:
@@ -929,8 +939,12 @@ def telegram_send(text: str) -> None:
             "disable_web_page_preview": "true",
         }).encode()
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"telegram HTTP {exc.code}: check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets; response={body}") from exc
         data = json.loads(body)
         if not data.get("ok"):
             raise RuntimeError(f"telegram send failed: {body}")
