@@ -1,23 +1,7 @@
 name: X KOL Daily
 
 on:
-  workflow_dispatch:
-    inputs:
-      telegram_mode:
-        description: "Telegram report mode"
-        type: choice
-        options:
-          - focus
-          - full
-        default: focus
-      send_telegram:
-        description: "Send report to Telegram"
-        type: boolean
-        default: true
-      max_kols:
-        description: "Test only. 0 means all KOLs"
-        type: number
-        default: 0
+  workflow_dispatch: {}
   schedule:
     # 23:30 Asia/Shanghai. GitHub cron uses UTC.
     - cron: "30 15 * * *"
@@ -74,31 +58,8 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          mode="${{ github.event.inputs.telegram_mode }}"
-          send="${{ github.event.inputs.send_telegram }}"
-          max_kols="${{ github.event.inputs.max_kols }}"
-
-          if [ -z "$mode" ]; then
-            mode="focus"
-          fi
-          if [ -z "$send" ]; then
-            send="true"
-          fi
-          if [ -z "$max_kols" ]; then
-            max_kols="0"
-          fi
-
-          cmd=(python x_kol_daily.py --telegram-mode "$mode")
-          if [ "$send" = "true" ]; then
-            cmd+=(--send)
-          else
-            cmd+=(--no-send)
-          fi
-          if [ "$max_kols" != "0" ]; then
-            cmd+=(--max-kols "$max_kols")
-          fi
-
-          echo "mode=$mode send=$send max_kols=$max_kols"
+          cmd=(python x_kol_daily.py --telegram-mode focus --send)
+          echo "mode=focus send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
