@@ -102,11 +102,7 @@ def cookies_from_env() -> list[dict[str, Any]]:
 
 def route_static_assets(route: Any) -> None:
     req = route.request
-    if req.resource_type in {"image", "media", "font", "stylesheet"}:
-        route.abort()
-        return
-    url = req.url.lower()
-    if any(host in url for host in ("twimg.com", "google-analytics.com", "doubleclick.net")):
+    if req.resource_type in {"image", "media", "font"}:
         route.abort()
         return
     route.continue_()
@@ -164,10 +160,10 @@ def scrape_handle(
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
     urls = [
         f"https://x.com/{urllib.parse.quote(clean_handle)}",
+        "https://x.com/search?" + urllib.parse.urlencode({"q": f"from:{clean_handle}", "src": "typed_query", "f": "live"}),
     ]
-    search_url = "https://x.com/search?" + urllib.parse.urlencode({"q": f"from:{clean_handle}", "src": "typed_query", "f": "live"})
-    if search_fallback:
-        urls.append(search_url)
+    if not search_fallback:
+        urls = urls[:1]
     merged: dict[str, dict[str, Any]] = {}
     for url_index, url in enumerate(urls):
         if len(merged) >= limit:
@@ -183,8 +179,6 @@ def scrape_handle(
                 break
             page.mouse.wheel(0, 1800)
             page.wait_for_timeout(scroll_wait_ms)
-        if url_index == 0 and merged:
-            break
     rows = sorted(merged.values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
     return rows[:limit]
 
@@ -1007,9 +1001,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=8, help="max tweets per KOL")
     ap.add_argument("--max-kols", type=int, default=0, help="test only: scan first N KOLs")
     ap.add_argument("--handles", default="", help="comma-separated handles for testing, e.g. @OpenAI,@saylor")
-    ap.add_argument("--scrolls", type=int, default=3)
-    ap.add_argument("--page-wait-ms", type=int, default=1200)
-    ap.add_argument("--scroll-wait-ms", type=int, default=500)
+    ap.add_argument("--scrolls", type=int, default=6)
+    ap.add_argument("--page-wait-ms", type=int, default=2500)
+    ap.add_argument("--scroll-wait-ms", type=int, default=900)
     ap.add_argument("--search-fallback", action=argparse.BooleanOptionalAction, default=True, help="try X search only when profile page has no recent tweets")
     ap.add_argument("--headed", action="store_true", help="show browser")
     ap.add_argument("--send", action="store_true", help="send report to Telegram")
