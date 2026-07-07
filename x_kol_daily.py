@@ -552,6 +552,10 @@ HARD_LOW_SIGNAL_TERMS = [
     "立即开始", "交易赚币", "折价买币奖池", "观赛季", "看球",
     "女团", "德州", "竞猜区", "奖池", "赞助。有观点",
 ]
+TOKEN_ONLY_TERMS = {
+    "btc", "bitcoin", "eth", "ethereum", "sol", "hype", "mstr",
+    "$btc", "$eth", "$sol", "$hype", "$mstr",
+}
 EXCLUDED_TELEGRAM_TERMS = ["slowmist", "慢雾"]
 
 
@@ -588,11 +592,19 @@ def has_important_signal(text: str) -> bool:
     return "$" in text or any(term.lower() in blob for term in IMPORTANT_TERMS)
 
 
+def is_token_only_text(text: str) -> bool:
+    normalized = re.sub(r"^[#＃]", "", text.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized in TOKEN_ONLY_TERMS
+
+
 def is_low_signal_row(row: dict[str, Any]) -> bool:
     body = tweet_body(row["tweet"], 900)
     compact = re.sub(r"\s+", " ", body).strip()
     lower = compact.lower()
     if not compact:
+        return True
+    if is_token_only_text(compact):
         return True
     if any(term.lower() in lower for term in HARD_LOW_SIGNAL_TERMS):
         return True
