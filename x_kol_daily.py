@@ -458,8 +458,20 @@ def clean_report_text(text: str) -> str:
 def shorten_text(text: str, limit: int) -> str:
     text = clean_report_text(text).replace("\n", " ")
     if limit > 0 and len(text) > limit:
-        return text[:limit].rstrip() + "..."
+        return trim_text(text, limit)
     return text
+
+
+def trim_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = text[:limit]
+    min_pos = max(40, int(limit * 0.55))
+    for mark in ["。", "！", "？", ". ", "! ", "? ", "；", ";", "，", ","]:
+        pos = head.rfind(mark)
+        if pos >= min_pos:
+            return head[:pos + len(mark)].rstrip(" ，,。:：;；") + "..."
+    return head.rstrip(" ，,。:：;；") + "..."
 
 
 def compact_text(text: str, limit: int) -> str:
@@ -468,7 +480,7 @@ def compact_text(text: str, limit: int) -> str:
     text = re.sub(r"^\s*\d+\s*/\s*", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     if limit > 0 and len(text) > limit:
-        return text[:limit].rstrip(" ，,。:：;；") + "..."
+        return trim_text(text, limit)
     return text
 
 
@@ -502,7 +514,7 @@ def headline_text(text: str, limit: int) -> str:
     parts = re.split(r"(?<=[。！？!?])\s+|[；;]\s*", text)
     text = parts[0].strip() if parts and parts[0].strip() else text
     if limit > 0 and len(text) > limit:
-        return text[:limit].rstrip(" ，,。:：;；") + "..."
+        return trim_text(text, limit)
     return text
 
 
@@ -565,7 +577,8 @@ IMPORTANT_TERMS = [
     "抄底", "止盈", "回踩", "突破", "空单", "多单", "杠杆", "爆仓",
     "链上", "巨鲸", "持仓", "资金费率", "稳定币", "监管", "安全", "漏洞",
     "攻击", "洗钱", "lazarus", "drainer", "hack", "exploit", "blackrock",
-    "coinbase", "whale", "钱包", "转移", "gold", "黄金",
+    "coinbase", "whale", "钱包", "转移", "gold", "黄金", "oil", "石油",
+    "伊朗", "霍尔木兹", "制裁", "openai", "ai", "模型", "cursor", "google",
 ]
 
 LOW_SIGNAL_TERMS = [
@@ -585,6 +598,13 @@ TOKEN_ONLY_TERMS = {
     "$btc", "$eth", "$sol", "$hype", "$mstr",
 }
 EXCLUDED_TELEGRAM_TERMS = ["slowmist", "慢雾"]
+FOCUS_SOURCE_TERMS = [
+    "coindesk", "coinmarketcap", "lookonchain", "spot on chain", "whale alert",
+    "wublockchain", "吴说", "arkham", "nansen", "peckshield", "hyperbot",
+    "ethereum foundation", "binance", "币安", "okx", "coinbase",
+    "openai", "sam altman", "sundar pichai",
+]
+DEFAULT_FOCUS_PER_KOL = 6
 
 
 def tweet_body(tweet: dict[str, Any], limit: int) -> str:
@@ -599,10 +619,9 @@ def tweet_time_text(tweet: dict[str, Any]) -> str:
 
 
 def row_signal_score(row: dict[str, Any]) -> int:
-    name = str(row.get("name") or "").lower()
     tweet = row["tweet"]
     body = tweet_body(tweet, 900)
-    blob = f"{name} {body}".lower()
+    blob = body.lower()
     score = 0
     score += sum(2 for term in IMPORTANT_TERMS if term.lower() in blob)
     score -= sum(3 for term in LOW_SIGNAL_TERMS if term.lower() in blob)
@@ -618,6 +637,12 @@ def row_signal_score(row: dict[str, Any]) -> int:
 def has_important_signal(text: str) -> bool:
     blob = text.lower()
     return "$" in text or any(term.lower() in blob for term in IMPORTANT_TERMS)
+
+
+def is_focus_row(row: dict[str, Any]) -> bool:
+    body = tweet_body(row["tweet"], 900)
+    source = f"{row.get('name', '')} {row.get('handle', '')}".lower()
+    return has_important_signal(body) or any(term in source for term in FOCUS_SOURCE_TERMS) or row_signal_score(row) > 0
 
 
 def is_token_only_text(text: str) -> bool:
@@ -717,51 +742,52 @@ def merge_thread_rows(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict
     return merged
 
 
-def focus_rows(rows: list[dict[str, Any]], tweet_chars: int, limit: int) -> list[dict[str, Any]]:
-    merged = merge_thread_rows(rows, tweet_chars)
+def focus_rows(rows: list[dict[str, Any]], tweet_chars: int, limit: int, per_kol: int) -> list[dict[str, Any]]:
+    merged = [row for row in merge_thread_rows(rows, tweet_chars) if is_focus_row(row)]
     merged.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
+    if per_kol > 0:
+        counts: dict[tuple[str, str], int] = {}
+        capped: list[dict[str, Any]] = []
+        for row in merged:
+            key = (str(row.get("name") or ""), str(row.get("handle") or ""))
+            if counts.get(key, 0) >= per_kol:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            capped.append(row)
+        merged = capped
     return merged[:limit] if limit > 0 else merged
 
 
-def telegram_section(number: int, row: dict[str, Any], tweet_chars: int) -> str:
+def telegram_section(number: int, row: dict[str, Any], tweet_chars: int, show_name: bool = True) -> str:
     tw = row["tweet"]
     body = tweet_body(tw, tweet_chars)
     if not body:
         return ""
     when = tweet_time_text(tw)
     name = str(row.get("name") or row.get("handle") or "").strip() or "unknown"
-    return "\n".join([f"{number}. {name} | {when}", body])
+    handle = str(row.get("handle") or "").strip()
+    author = name
+    if show_name and handle and handle not in author:
+        author = f"{author} {handle}"
+    title = f"{number}. {author} | {when}" if show_name else f"{number}. {when}"
+    return "\n".join([title, body])
 
 
 def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    order: list[tuple[str, str]] = []
-    for row in rows:
-        key = (str(row.get("name") or "").strip(), str(row.get("handle") or "").strip())
-        if key not in grouped:
-            order.append(key)
-            grouped[key] = []
-        grouped[key].append(row)
-
     blocks: list[dict[str, Any]] = []
     number = 1
-    for name, handle in order:
-        sections: list[str] = []
-        for row in grouped[(name, handle)]:
-            section = telegram_section(number, row, tweet_chars)
-            if section:
-                sections.append(section)
-                number += 1
-        if not sections:
+    for row in rows:
+        section = telegram_section(number, row, tweet_chars, show_name=True)
+        if not section:
             continue
-        title = name or handle or "unknown"
-        if handle and handle not in title:
-            title = f"{title} {handle}"
-        blocks.append({"title": title, "sections": sections, "count": len(sections)})
+        blocks.append({"title": "", "sections": [section], "count": 1})
+        number += 1
     return blocks
 
 
 def block_text(title: str, sections: list[str], continued: bool = False) -> str:
+    if not title:
+        return "\n\n".join(sections)
     suffix = " 续" if continued else ""
     return "\n\n".join([f"## {title}{suffix}", *sections])
 
@@ -837,19 +863,23 @@ def build_telegram_reports(
     group_size: int,
     mode: str = "full",
     focus_limit: int = 0,
+    focus_per_kol: int = DEFAULT_FOCUS_PER_KOL,
     include_low_signal: bool = False,
 ) -> list[str]:
     active = [x for x in results if x.get("tweets")]
     rows = telegram_rows(active, per_kol, include_low_signal)
     if mode == "focus":
-        rows = focus_rows(rows, tweet_chars, focus_limit)
+        rows = focus_rows(rows, tweet_chars, focus_limit, focus_per_kol)
     now = cn_now().strftime("%m-%d %H:%M")
     if not rows:
         return [f"X KOL {hours}H | KOL:0 | 总:0 | 本组:0 | {now}\n\n最近 24 小时没有抓到可读推文。\n"]
 
     blocks = telegram_kol_blocks(rows, tweet_chars)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
-    display_kol_count = len(blocks)
+    display_kol_count = len({
+        (str(row.get("name") or "").strip(), str(row.get("handle") or "").strip())
+        for row in rows
+    })
     groups = pack_telegram_blocks(blocks, group_size)
     reports: list[str] = []
     for group_index, group in enumerate(groups, 1):
@@ -875,6 +905,7 @@ def build_telegram_report(
     group_size: int = 20,
     mode: str = "full",
     focus_limit: int = 0,
+    focus_per_kol: int = DEFAULT_FOCUS_PER_KOL,
     include_low_signal: bool = False,
 ) -> str:
     return "\n---\n\n".join(
@@ -888,6 +919,7 @@ def build_telegram_report(
             group_size,
             mode,
             focus_limit,
+            focus_per_kol,
             include_low_signal,
         )
     ) + "\n"
@@ -1017,6 +1049,7 @@ def main() -> int:
     ap.add_argument("--telegram-style", choices=["digest", "list"], default="list")
     ap.add_argument("--telegram-mode", choices=["full", "focus"], default="focus", help="full sends all selected tweets; focus filters noisy tweets and merges threads")
     ap.add_argument("--telegram-focus-limit", type=int, default=0, help="max tweets/thread summaries in focus mode; 0 means no limit")
+    ap.add_argument("--telegram-focus-per-kol", type=int, default=DEFAULT_FOCUS_PER_KOL, help="max focus rows per KOL; 0 means no per-KOL cap")
     ap.add_argument("--include-low-signal", action="store_true", help="include short replies, CTA text, and low-signal tweets in Telegram output")
     ap.add_argument("--telegram-preview", action="store_true", help="print Telegram compact format")
     ap.add_argument("--dry-run", action="store_true", help="parse config only")
@@ -1036,6 +1069,7 @@ def main() -> int:
                 args.telegram_group_size,
                 args.telegram_mode,
                 args.telegram_focus_limit,
+                args.telegram_focus_per_kol,
                 args.include_low_signal,
             )
             print(report)
@@ -1054,6 +1088,7 @@ def main() -> int:
                 args.telegram_group_size,
                 args.telegram_mode,
                 args.telegram_focus_limit,
+                args.telegram_focus_per_kol,
                 args.include_low_signal,
             )
             stats = telegram_send_reports(reports)
@@ -1115,6 +1150,7 @@ def main() -> int:
             args.telegram_group_size,
             args.telegram_mode,
             args.telegram_focus_limit,
+            args.telegram_focus_per_kol,
             args.include_low_signal,
         )
         stats = telegram_send_reports(reports)
