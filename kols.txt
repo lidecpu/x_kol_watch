@@ -1,0 +1,49 @@
+# X KOL list
+# Format: name | @handle | note
+
+零下二度 | @jackli727 | 加密货币分析师
+jasonleo | @Jason60704294 | 加密货币研究员
+OpenAI | @OpenAI | AI 动态
+Watcher.Guru | @WatcherGuru | 加密新闻
+CoinMarketCap | @CoinMarketCap | 市场数据
+潜水观察员 | @connectfarm1 | 链上数据
+加密猴哥 | @monkeyjiang | 加密 KOL
+Walter Bloomberg | @DeItaone | 快讯
+CoinDesk | @CoinDesk | 加密媒体
+Sundar Pichai | @sundarpichai | Google
+allincrypto | @thankUcrypto | 加密 KOL
+投机实验室 | @LabSpeculation | 市场研究
+Linea | @LineaBuild | Linea
+Phyrex | @PhyrexNi | 加密研究
+Coinbase | @coinbase | 交易所
+Bitcoin 女博士 | @DoctorMbitcoin | BTC 教育
+BITWU.ETH | @Bitwux | 链上分析
+Arkham | @arkham | 链上数据
+秦爸 | @qinbafrank | 加密 KOL
+a16zcrypto | @a16zcrypto | 加密基金
+Vivek | @Vivek4real_ | 加密投资
+OKX 中文 | @okxchinese | OKX
+DiscoverCrypto | @DiscoverCrypto | 加密媒体
+吴说区块链 | @wublockchain12 | 区块链新闻
+Michael Saylor | @saylor | BTC
+币安中文 | @binancezh | Binance
+宝二爷 | @ChandlerGuo | 加密投资
+Sam Altman | @sama | OpenAI
+余烬 | @EmberCN | 链上分析
+Ai 姨 | @ai_9684xtpa | 加密 KOL
+Cos | @evilcos | 安全研究
+Lookonchain | @lookonchain | 链上监测
+Spot On Chain | @spotonchain | 链上监控
+Hyperbot | @Hyperbotai | 聪明钱工具
+Killa | @KillaXBT | 交易员
+Ethereum Foundation | @ethereumfndn | ETH
+CryptoBullet | @CryptoBullet1 | 交易员
+Bitcoin Professor | @Bitcoinprof0637 | BTC 分析
+NonceSense | @0xNonceSense | 交易分析
+Sunil Gurjar | @sunilgurjar01 | 技术分析
+杀破狼 WolfyXBT | @wolfyxbt | 交易员
+OnchainLens | @OnchainLens | 链上监控
+Whale Alert | @whale_alert | 大额转账
+Bubblemaps | @bubblemaps | 地址图谱
+Nansen | @nansen_ai | 聪明钱
+PeckShield | @PeckShieldAlert | 安全预警
