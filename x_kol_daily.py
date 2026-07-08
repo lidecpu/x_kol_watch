@@ -881,6 +881,8 @@ def build_telegram_reports(
         (str(row.get("name") or "").strip(), str(row.get("handle") or "").strip())
         for row in rows
     })
+    scanned_kol_count = len(results)
+    kol_label = f"{display_kol_count}/{scanned_kol_count}" if scanned_kol_count else str(display_kol_count)
     groups = pack_telegram_blocks(blocks, group_size)
     reports: list[str] = []
     for group_index, group in enumerate(groups, 1):
@@ -888,7 +890,7 @@ def build_telegram_reports(
         group_count = sum(int(part.get("count") or 0) for part in group)
         header = (
             f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | "
-            f"KOL:{display_kol_count} | 总:{display_total} | 本组:{group_count} | {now}"
+            f"KOL:{kol_label} | 总:{display_total} | 本组:{group_count} | {now}"
         )
         lines = [header]
         for part in group:
