@@ -27,6 +27,7 @@ STATE_DIR = ROOT / "state"
 CACHE_DIR = ROOT / "cache"
 TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
+SENT_STATE = CACHE_DIR / "sent.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
@@ -1026,6 +1027,35 @@ def telegram_send_reports(reports: list[str]) -> dict[str, int]:
     return {"groups": len(reports), "rows": rows}
 
 
+def scheduled_send_key(args: argparse.Namespace) -> str:
+    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
+        return ""
+    return os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip() or ":".join([
+        cn_now().strftime("%Y%m%d"),
+        f"{args.hours}h",
+        args.telegram_mode,
+    ])
+
+
+def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> dict[str, int]:
+    key = scheduled_send_key(args)
+    if not key:
+        return telegram_send_reports(reports)
+    state = load_json(SENT_STATE, {"version": 1, "sent": {}})
+    sent = state.setdefault("sent", {})
+    if key in sent:
+        print(f"scheduled send skipped: already sent key={key}")
+        return {"groups": 0, "rows": 0, "skipped": 1}
+    stats = telegram_send_reports(reports)
+    sent[key] = {
+        "sent_at": cn_now().isoformat(timespec="seconds"),
+        "groups": stats.get("groups", 0),
+        "rows": stats.get("rows", 0),
+    }
+    save_json(SENT_STATE, state)
+    return stats
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=int, default=24)
@@ -1091,7 +1121,7 @@ def main() -> int:
                 args.telegram_focus_per_kol,
                 args.include_low_signal,
             )
-            stats = telegram_send_reports(reports)
+            stats = telegram_send_reports_once(reports, args)
             print(f"sent groups={stats['groups']} rows={stats['rows']}")
         return 0
     if args.translate_cache:
@@ -1153,7 +1183,7 @@ def main() -> int:
             args.telegram_focus_per_kol,
             args.include_low_signal,
         )
-        stats = telegram_send_reports(reports)
+        stats = telegram_send_reports_once(reports, args)
         print(f"sent groups={stats['groups']} rows={stats['rows']}")
     return 0
 
