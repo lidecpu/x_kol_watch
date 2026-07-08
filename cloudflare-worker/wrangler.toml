@@ -1,0 +1,12 @@
+name = "x-kol-watch-trigger"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[triggers]
+crons = ["30 15 * * *"]
+
+[vars]
+GITHUB_OWNER = "lidecpu"
+GITHUB_REPO = "x_kol_watch"
+GITHUB_WORKFLOW = "x-kol-daily.yml"
+GITHUB_REF = "main"
