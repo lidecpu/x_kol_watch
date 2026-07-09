@@ -686,24 +686,30 @@ def is_excluded_telegram_row(row: dict[str, Any]) -> bool:
     return any(term in blob for term in EXCLUDED_TELEGRAM_TERMS)
 
 
+def telegram_row_sort_key(row: dict[str, Any]) -> tuple[int, int]:
+    kol_order = int(row.get("_kol_order", 999999))
+    tweet_time = int(row.get("tweet", {}).get("created_at_ms") or 0)
+    return (kol_order, -tweet_time)
+
+
 def telegram_rows(results: list[dict[str, Any]], per_kol: int, include_low_signal: bool) -> list[dict[str, Any]]:
     active = [x for x in results if x.get("tweets")]
     effective_per_kol = per_kol
     if effective_per_kol > 1 and len(active) > 20:
         effective_per_kol = 1
     rows: list[dict[str, Any]] = []
-    for item in active:
+    for kol_order, item in enumerate(active):
         tweets = item.get("tweets", [])
         name = str(item.get("name") or item.get("handle") or "").strip()
         handle = str(item.get("handle") or "").strip()
         shown = tweets[:effective_per_kol] if effective_per_kol > 0 else tweets
         for tw in shown:
-            row = {"name": name, "handle": handle, "tweet": tw}
+            row = {"name": name, "handle": handle, "tweet": tw, "_kol_order": kol_order}
             if is_excluded_telegram_row(row):
                 continue
             if include_low_signal or not is_low_signal_row(row):
                 rows.append(row)
-    rows.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
+    rows.sort(key=telegram_row_sort_key)
     return rows
 
 
@@ -738,14 +744,19 @@ def merge_thread_rows(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict
                 parts.append(head)
         first["_thread_count"] = len(group)
         first["_body"] = f"thread {len(group)}条合并：" + "；".join(parts)
-        merged.append({"name": group[0]["name"], "handle": group[0].get("handle", ""), "tweet": first})
-    merged.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
+        merged.append({
+            "name": group[0]["name"],
+            "handle": group[0].get("handle", ""),
+            "tweet": first,
+            "_kol_order": group[0].get("_kol_order", 999999),
+        })
+    merged.sort(key=telegram_row_sort_key)
     return merged
 
 
 def focus_rows(rows: list[dict[str, Any]], tweet_chars: int, limit: int, per_kol: int) -> list[dict[str, Any]]:
     merged = [row for row in merge_thread_rows(rows, tweet_chars) if is_focus_row(row)]
-    merged.sort(key=lambda row: int(row["tweet"].get("created_at_ms") or 0), reverse=True)
+    merged.sort(key=telegram_row_sort_key)
     if per_kol > 0:
         counts: dict[tuple[str, str], int] = {}
         capped: list[dict[str, Any]] = []
@@ -873,7 +884,7 @@ def build_telegram_reports(
         rows = focus_rows(rows, tweet_chars, focus_limit, focus_per_kol)
     now = cn_now().strftime("%m-%d %H:%M")
     if not rows:
-        return [f"X KOL {hours}H | KOL:0 | 总:0 | 本组:0 | {now}\n\n最近 24 小时没有抓到可读推文。\n"]
+        return [f"X KOL {hours}H | 活跃KOL:0/{len(results)} | 推文:0 | 本组:0 | {now}\n\n最近 24 小时没有抓到可读推文。\n"]
 
     blocks = telegram_kol_blocks(rows, tweet_chars)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
@@ -890,7 +901,7 @@ def build_telegram_reports(
         group_count = sum(int(part.get("count") or 0) for part in group)
         header = (
             f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | "
-            f"KOL:{kol_label} | 总:{display_total} | 本组:{group_count} | {now}"
+            f"活跃KOL:{kol_label} | 推文:{display_total} | 本组:{group_count} | {now}"
         )
         lines = [header]
         for part in group:

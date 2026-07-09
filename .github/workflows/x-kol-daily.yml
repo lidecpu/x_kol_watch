@@ -91,3 +91,24 @@ jobs:
             done
             exit "$status"
           fi
+
+          {
+            echo "### X KOL watcher completed"
+            echo
+            echo '```text'
+            tail -n 80 run.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload run diagnostics
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: x-kol-run-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            run.log
+            reports/*.md
+            state/*.json
+            cache/sent.json
