@@ -619,13 +619,22 @@ def tweet_time_text(tweet: dict[str, Any]) -> str:
     return fmt_time(str(tweet.get("created_at", ""))).split(" ", 1)[-1]
 
 
+def text_has_term(text: str, term: str) -> bool:
+    blob = str(text or "").lower()
+    needle = str(term or "").lower()
+    if not needle:
+        return False
+    if re.fullmatch(r"[a-z0-9 ]+", needle):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", blob))
+    return needle in blob
+
+
 def row_signal_score(row: dict[str, Any]) -> int:
     tweet = row["tweet"]
     body = tweet_body(tweet, 900)
-    blob = body.lower()
     score = 0
-    score += sum(2 for term in IMPORTANT_TERMS if term.lower() in blob)
-    score -= sum(3 for term in LOW_SIGNAL_TERMS if term.lower() in blob)
+    score += sum(2 for term in IMPORTANT_TERMS if text_has_term(body, term))
+    score -= sum(3 for term in LOW_SIGNAL_TERMS if text_has_term(body, term))
     if len(body) < 12:
         score -= 4
     if "$" in body:
@@ -636,8 +645,7 @@ def row_signal_score(row: dict[str, Any]) -> int:
 
 
 def has_important_signal(text: str) -> bool:
-    blob = text.lower()
-    return "$" in text or any(term.lower() in blob for term in IMPORTANT_TERMS)
+    return "$" in text or any(text_has_term(text, term) for term in IMPORTANT_TERMS)
 
 
 def is_focus_row(row: dict[str, Any]) -> bool:
@@ -661,9 +669,9 @@ def is_low_signal_row(row: dict[str, Any]) -> bool:
         return True
     if is_token_only_text(compact):
         return True
-    if any(term.lower() in lower for term in HARD_LOW_SIGNAL_TERMS):
+    if any(text_has_term(lower, term) for term in HARD_LOW_SIGNAL_TERMS):
         return True
-    if any(term.lower() in lower for term in LOW_SIGNAL_TERMS):
+    if any(text_has_term(lower, term) for term in LOW_SIGNAL_TERMS):
         return not has_important_signal(compact)
     cjk = sum("\u4e00" <= ch <= "\u9fff" for ch in compact)
     letters = sum(ch.isascii() and ch.isalpha() for ch in compact)
@@ -680,10 +688,7 @@ def is_low_signal_row(row: dict[str, Any]) -> bool:
 
 def is_excluded_telegram_row(row: dict[str, Any]) -> bool:
     body = tweet_body(row["tweet"], 900).lower()
-    name = str(row.get("name") or "").lower()
-    handle = str(row.get("handle") or "").lower()
-    blob = f"{name} {handle} {body}"
-    return any(term in blob for term in EXCLUDED_TELEGRAM_TERMS)
+    return any(text_has_term(body, term) for term in EXCLUDED_TELEGRAM_TERMS)
 
 
 def telegram_row_sort_key(row: dict[str, Any]) -> tuple[int, int]:
@@ -883,8 +888,14 @@ def build_telegram_reports(
     if mode == "focus":
         rows = focus_rows(rows, tweet_chars, focus_limit, focus_per_kol)
     now = cn_now().strftime("%m-%d %H:%M")
+    selected_kol_title = "重点KOL" if mode == "focus" else "展示KOL"
+    active_kol_label = f"{len(active)}/{len(results)}"
     if not rows:
-        return [f"X KOL {hours}H | 活跃KOL:0/{len(results)} | 推文:0 | 本组:0 | {now}\n\n最近 24 小时没有抓到可读推文。\n"]
+        empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
+        return [
+            f"X KOL {hours}H | 活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
+            f"推文:0 | 本组:0 | {now}\n\n{empty_text}\n"
+        ]
 
     blocks = telegram_kol_blocks(rows, tweet_chars)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
@@ -892,8 +903,6 @@ def build_telegram_reports(
         (str(row.get("name") or "").strip(), str(row.get("handle") or "").strip())
         for row in rows
     })
-    scanned_kol_count = len(results)
-    kol_label = f"{display_kol_count}/{scanned_kol_count}" if scanned_kol_count else str(display_kol_count)
     groups = pack_telegram_blocks(blocks, group_size)
     reports: list[str] = []
     for group_index, group in enumerate(groups, 1):
@@ -901,7 +910,8 @@ def build_telegram_reports(
         group_count = sum(int(part.get("count") or 0) for part in group)
         header = (
             f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | "
-            f"活跃KOL:{kol_label} | 推文:{display_total} | 本组:{group_count} | {now}"
+            f"活跃KOL:{active_kol_label} | {selected_kol_title}:{display_kol_count} | "
+            f"推文:{display_total} | 本组:{group_count} | {now}"
         )
         lines = [header]
         for part in group:
@@ -1041,7 +1051,7 @@ def telegram_send_reports(reports: list[str]) -> dict[str, int]:
 
 
 def scheduled_send_key(args: argparse.Namespace) -> str:
-    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
+    if os.environ.get("GITHUB_EVENT_NAME") not in {"schedule", "workflow_dispatch"}:
         return ""
     return os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip() or ":".join([
         cn_now().strftime("%Y%m%d"),
