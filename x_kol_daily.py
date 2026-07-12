@@ -156,8 +156,12 @@ def scrape_handle(
     page_wait_ms: int,
     scroll_wait_ms: int,
     search_fallback: bool,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     clean_handle = handle.lstrip("@")
+    if diagnostics is not None:
+        diagnostics.setdefault("profile_tweets", 0)
+        diagnostics.setdefault("search_fallback_used", False)
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
     urls = [
         f"https://x.com/{urllib.parse.quote(clean_handle)}",
@@ -167,6 +171,10 @@ def scrape_handle(
         urls = urls[:1]
     merged: dict[str, dict[str, Any]] = {}
     for url_index, url in enumerate(urls):
+        if url_index > 0 and merged:
+            break
+        if url_index > 0 and diagnostics is not None:
+            diagnostics["search_fallback_used"] = True
         if len(merged) >= limit:
             break
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
@@ -176,6 +184,8 @@ def scrape_handle(
             for row in rows:
                 key = str(row.get("url") or f"{handle}:{row.get('created_at')}:{row.get('text','')[:80]}")
                 merged[key] = row
+            if url_index == 0 and diagnostics is not None:
+                diagnostics["profile_tweets"] = len(merged)
             if len(merged) >= limit:
                 break
             page.mouse.wheel(0, 1800)
@@ -235,8 +245,22 @@ def scrape_all(
                     handle = kol["handle"]
                     started = time.time()
                     print(f"[scan {index}/{total_kols}] {handle} start", file=sys.stderr, flush=True)
+                    diagnostics: dict[str, Any] = {
+                        "profile_tweets": 0,
+                        "search_fallback_used": False,
+                    }
                     try:
-                        tweets = scrape_handle(page, handle, hours, limit, scrolls, page_wait_ms, scroll_wait_ms, search_fallback)
+                        tweets = scrape_handle(
+                            page,
+                            handle,
+                            hours,
+                            limit,
+                            scrolls,
+                            page_wait_ms,
+                            scroll_wait_ms,
+                            search_fallback,
+                            diagnostics,
+                        )
                         status = "ok"
                         error = ""
                     except Exception as exc:
@@ -253,12 +277,42 @@ def scrape_all(
                         file=sys.stderr,
                         flush=True,
                     )
-                    results.append({**kol, "status": status, "error": error, "tweets": tweets})
+                    results.append({
+                        **kol,
+                        "status": status,
+                        "error": error,
+                        "tweets": tweets,
+                        "diagnostics": diagnostics,
+                    })
             finally:
                 context.close()
         finally:
             browser.close()
     return results
+
+
+def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
+    errors = sum(1 for item in results if item.get("status") == "error")
+    active = sum(1 for item in results if item.get("tweets"))
+    fallback_used = sum(
+        1
+        for item in results
+        if item.get("diagnostics", {}).get("search_fallback_used")
+    )
+    fallback_hits = sum(
+        1
+        for item in results
+        if item.get("diagnostics", {}).get("search_fallback_used") and item.get("tweets")
+    )
+    return {
+        "total": len(results),
+        "success": len(results) - errors,
+        "errors": errors,
+        "active": active,
+        "no_recent": len(results) - errors - active,
+        "fallback_used": fallback_used,
+        "fallback_hits": fallback_hits,
+    }
 
 
 def is_mostly_english(text: str) -> bool:
@@ -1178,6 +1232,14 @@ def main() -> int:
         scroll_wait_ms=args.scroll_wait_ms,
         search_fallback=args.search_fallback,
     )
+    summary = scan_summary(results)
+    print(json.dumps({"scan": summary}, ensure_ascii=False))
+    for item in results:
+        if item.get("status") == "error":
+            print(
+                f"[scan-error] {item.get('handle', '')} {item.get('error', '')}",
+                file=sys.stderr,
+            )
 
     stamp = cn_now().strftime("%Y%m%d-%H%M%S")
     day = cn_now().strftime("%Y%m%d")
