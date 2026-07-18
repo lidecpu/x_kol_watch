@@ -162,6 +162,8 @@ def scrape_handle(
     if diagnostics is not None:
         diagnostics.setdefault("profile_tweets", 0)
         diagnostics.setdefault("search_fallback_used", False)
+        diagnostics.setdefault("scroll_rounds", 0)
+        diagnostics.setdefault("early_stops", 0)
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
     urls = [
         f"https://x.com/{urllib.parse.quote(clean_handle)}",
@@ -179,14 +181,28 @@ def scrape_handle(
             break
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         page.wait_for_timeout(page_wait_ms)
-        for _ in range(scrolls + 1):
+        unchanged_rounds = 0
+        for round_index in range(scrolls + 1):
+            previous_count = len(merged)
             rows = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
             for row in rows:
                 key = str(row.get("url") or f"{handle}:{row.get('created_at')}:{row.get('text','')[:80]}")
                 merged[key] = row
+            if diagnostics is not None:
+                diagnostics["scroll_rounds"] += 1
             if url_index == 0 and diagnostics is not None:
                 diagnostics["profile_tweets"] = len(merged)
             if len(merged) >= limit:
+                break
+            if len(merged) == previous_count:
+                unchanged_rounds += 1
+            else:
+                unchanged_rounds = 0
+            if unchanged_rounds >= 2:
+                if diagnostics is not None:
+                    diagnostics["early_stops"] += 1
+                break
+            if round_index >= scrolls:
                 break
             page.mouse.wheel(0, 1800)
             page.wait_for_timeout(scroll_wait_ms)
@@ -248,6 +264,8 @@ def scrape_all(
                     diagnostics: dict[str, Any] = {
                         "profile_tweets": 0,
                         "search_fallback_used": False,
+                        "scroll_rounds": 0,
+                        "early_stops": 0,
                     }
                     try:
                         tweets = scrape_handle(
@@ -304,6 +322,14 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         for item in results
         if item.get("diagnostics", {}).get("search_fallback_used") and item.get("tweets")
     )
+    scroll_rounds = sum(
+        int(item.get("diagnostics", {}).get("scroll_rounds") or 0)
+        for item in results
+    )
+    early_stops = sum(
+        int(item.get("diagnostics", {}).get("early_stops") or 0)
+        for item in results
+    )
     return {
         "total": len(results),
         "success": len(results) - errors,
@@ -312,6 +338,8 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "no_recent": len(results) - errors - active,
         "fallback_used": fallback_used,
         "fallback_hits": fallback_hits,
+        "scroll_rounds": scroll_rounds,
+        "early_stops": early_stops,
     }
 
 

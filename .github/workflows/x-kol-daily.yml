@@ -95,14 +95,34 @@ jobs:
           {
             echo "### X KOL watcher completed"
             echo
+            scan_summary="$(grep -F '{"scan":' run.log | tail -n 1 || true)"
+            if [ -n "$scan_summary" ]; then
+              echo "#### Scan summary"
+              echo
+              echo '```json'
+              echo "$scan_summary"
+              echo '```'
+              echo
+            fi
+            scan_errors="$(grep -F '[scan-error]' run.log || true)"
+            if [ -n "$scan_errors" ]; then
+              echo "#### Scan errors"
+              echo
+              echo '```text'
+              echo "$scan_errors"
+              echo '```'
+              echo
+            fi
+            echo "#### Log tail"
+            echo
             echo '```text'
-            tail -n 80 run.log
+            tail -n 40 run.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload run diagnostics
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: x-kol-run-${{ github.run_id }}
           retention-days: 14
