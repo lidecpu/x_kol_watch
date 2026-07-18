@@ -29,6 +29,7 @@ TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
+MIN_SCROLL_ROUNDS = 3
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -114,22 +115,25 @@ EXTRACT_JS = r"""
   const clean = s => (s || '').replace(/\s+/g, ' ').trim();
   const out = [];
   const seen = new Set();
+  const articleKeys = new Set();
   for (const art of Array.from(document.querySelectorAll('article'))) {
     const timeEl = art.querySelector('time');
     const datetime = timeEl ? timeEl.getAttribute('datetime') : '';
     const ms = datetime ? Date.parse(datetime) : NaN;
-    if (!Number.isFinite(ms) || ms < cutoffMs) continue;
-    const text = Array.from(art.querySelectorAll('[data-testid="tweetText"]'))
-      .map(n => clean(n.innerText || n.textContent || ''))
-      .filter(Boolean)
-      .join('\n');
-    if (!text) continue;
     let link = '';
     for (const a of Array.from(art.querySelectorAll('a[href*="/status/"]'))) {
       const href = a.getAttribute('href') || '';
       if (href.includes('/status/')) { link = href; break; }
     }
     if (link.startsWith('/')) link = 'https://x.com' + link;
+    const articleKey = link || datetime || clean(art.innerText || art.textContent || '').slice(0, 120);
+    if (articleKey) articleKeys.add(articleKey);
+    if (!Number.isFinite(ms) || ms < cutoffMs) continue;
+    const text = Array.from(art.querySelectorAll('[data-testid="tweetText"]'))
+      .map(n => clean(n.innerText || n.textContent || ''))
+      .filter(Boolean)
+      .join('\n');
+    if (!text) continue;
     const key = link || `${handle}:${datetime}:${text.slice(0, 80)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -142,9 +146,44 @@ EXTRACT_JS = r"""
     });
   }
   out.sort((a, b) => b.created_at_ms - a.created_at_ms);
-  return out.slice(0, maxItems);
+  return { rows: out.slice(0, maxItems), articleKeys: Array.from(articleKeys) };
 }
 """
+
+PAGE_HEALTH_JS = r"""
+() => {
+  const path = (location.pathname || '').toLowerCase();
+  const text = (document.body?.innerText || '').slice(0, 5000).toLowerCase();
+  const has = values => values.some(value => text.includes(value));
+  const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
+  return {
+    loginRequired: path.includes('/i/flow/login') || path === '/login' ||
+      Boolean(document.querySelector('input[autocomplete="username"]')),
+    errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
+      (!hasMain && has([
+        'rate limit exceeded', 'something went wrong', 'try reloading',
+        '超过频率限制', '出错了，请尝试重新加载'
+      ])),
+    accountUnavailable: has([
+      "this account doesn't exist", 'account suspended',
+      '此账号不存在', '账号已被冻结'
+    ]),
+    hasMain
+  };
+}
+"""
+
+
+def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
+    health = page.evaluate(PAGE_HEALTH_JS)
+    if health.get("loginRequired"):
+        raise RuntimeError("X authentication required")
+    if health.get("errorPage"):
+        raise RuntimeError("X returned an error or rate-limit page")
+    if account_page and health.get("accountUnavailable"):
+        raise RuntimeError("X account unavailable")
+    if not health.get("hasMain"):
+        raise RuntimeError("X page did not render its main content")
 
 
 def scrape_handle(
@@ -181,10 +220,15 @@ def scrape_handle(
             break
         page.goto(url, wait_until="domcontentloaded", timeout=45_000)
         page.wait_for_timeout(page_wait_ms)
+        ensure_x_page_healthy(page, account_page=url_index == 0)
         unchanged_rounds = 0
+        visible_article_keys: set[str] = set()
         for round_index in range(scrolls + 1):
-            previous_count = len(merged)
-            rows = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
+            payload = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
+            rows = payload.get("rows", [])
+            current_article_keys = {str(key) for key in payload.get("articleKeys", []) if key}
+            new_article_keys = current_article_keys - visible_article_keys
+            visible_article_keys.update(current_article_keys)
             for row in rows:
                 key = str(row.get("url") or f"{handle}:{row.get('created_at')}:{row.get('text','')[:80]}")
                 merged[key] = row
@@ -194,11 +238,11 @@ def scrape_handle(
                 diagnostics["profile_tweets"] = len(merged)
             if len(merged) >= limit:
                 break
-            if len(merged) == previous_count:
+            if not new_article_keys:
                 unchanged_rounds += 1
             else:
                 unchanged_rounds = 0
-            if unchanged_rounds >= 2:
+            if unchanged_rounds >= 2 and round_index + 1 >= MIN_SCROLL_ROUNDS:
                 if diagnostics is not None:
                     diagnostics["early_stops"] += 1
                 break
@@ -250,6 +294,7 @@ def scrape_all(
                 page = context.new_page()
                 page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
                 page.wait_for_timeout(1500)
+                ensure_x_page_healthy(page)
                 print(
                     f"[x-home] url={page.url} title={page.title()[:80]}",
                     file=sys.stderr,
@@ -350,12 +395,14 @@ def is_mostly_english(text: str) -> bool:
     return len(letters) >= 20
 
 
-def load_json(path: Path, default: Any) -> Any:
+def load_json(path: Path, default: Any, *, strict: bool = False) -> Any:
     if not path.exists():
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if strict:
+            raise RuntimeError(f"invalid JSON state: {path.name} ({type(exc).__name__})") from exc
         return default
 
 
@@ -397,7 +444,7 @@ def tweet_id(tweet: dict[str, Any]) -> str:
 
 
 def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, Any]:
-    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}})
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
     tweets = store.setdefault("tweets", {})
     now = dt.datetime.now().isoformat(timespec="seconds")
     added = 0
@@ -437,7 +484,7 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
 
 
 def translate_tweet_store(limit: int) -> dict[str, int]:
-    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}})
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
     tweets = store.get("tweets", {})
     rows = sorted(tweets.values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
     translated = 0
@@ -463,7 +510,7 @@ def translate_tweet_store(limit: int) -> dict[str, int]:
 
 
 def apply_store_translations(results: list[dict[str, Any]]) -> None:
-    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}})
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
     tweets = store.get("tweets", {})
     for item in results:
         for tw in item.get("tweets", []):
@@ -473,7 +520,7 @@ def apply_store_translations(results: list[dict[str, Any]]) -> None:
 
 
 def translate_to_zh(text: str) -> str:
-    cache = load_json(TRANSLATION_CACHE, {})
+    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
     key = hashlib.sha256(text.encode("utf-8")).hexdigest()
     if key in cache:
         return str(cache[key])
@@ -538,13 +585,6 @@ def clean_report_text(text: str) -> str:
     return text.strip()
 
 
-def shorten_text(text: str, limit: int) -> str:
-    text = clean_report_text(text).replace("\n", " ")
-    if limit > 0 and len(text) > limit:
-        return trim_text(text, limit)
-    return text
-
-
 def trim_text(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
@@ -567,30 +607,6 @@ def compact_text(text: str, limit: int) -> str:
     return text
 
 
-def topic_of(item: dict[str, Any]) -> str:
-    blob = " ".join([
-        str(item.get("name") or ""),
-        str(item.get("note") or ""),
-        " ".join(str(t.get("translation_zh") or t.get("text") or "") for t in item.get("tweets", [])[:3]),
-    ]).lower()
-    if any(k in blob for k in ["slowmist", "安全", "aml", "漏洞", "攻击", "lazarus", "drainer", "洗钱"]):
-        return "安全"
-    if any(k in blob for k in ["btc", "bitcoin", "eth", "sol", "行情", "止盈", "抄底", "空单", "多单", "回踩", "$"]):
-        return "市场"
-    if any(k in blob for k in ["openai", "ai", "google", "模型"]):
-        return "AI"
-    if any(k in blob for k in ["breaking", "just in", "vanguard", "spacex", "sec", "监管", "银行"]):
-        return "快讯"
-    return "其他"
-
-
-def item_priority(item: dict[str, Any]) -> tuple[int, int]:
-    topic_rank = {"市场": 0, "快讯": 1, "安全": 2, "AI": 3, "其他": 4}
-    topic = topic_of(item)
-    newest = max((int(t.get("created_at_ms") or 0) for t in item.get("tweets", [])), default=0)
-    return (topic_rank.get(topic, 9), -newest)
-
-
 def headline_text(text: str, limit: int) -> str:
     text = compact_text(text, limit=0)
     text = re.sub(r"^(消息|新闻|快讯)\s*[:：]\s*", "", text)
@@ -599,16 +615,6 @@ def headline_text(text: str, limit: int) -> str:
     if limit > 0 and len(text) > limit:
         return trim_text(text, limit)
     return text
-
-
-def summarize_item(item: dict[str, Any], tweet_chars: int) -> str:
-    tweets = item.get("tweets", [])
-    heads: list[str] = []
-    for tw in tweets[:2]:
-        text = headline_text(str(tw.get("translation_zh") or tw.get("text") or ""), tweet_chars)
-        if text and text not in heads:
-            heads.append(text)
-    return "；".join(heads)
 
 
 def build_report(results: list[dict[str, Any]], hours: int) -> str:
@@ -637,21 +643,6 @@ def build_report(results: list[dict[str, Any]], hours: int) -> str:
     if total == 0:
         lines.append("最近 24 小时没有抓到可读推文。")
     return "\n".join(lines).strip() + "\n"
-
-
-def report_total(results: list[dict[str, Any]]) -> int:
-    global_total = max((int(x.get("_global_total_24h") or 0) for x in results), default=0)
-    if global_total:
-        return global_total
-    meta_total = sum(int(x.get("_total_24h") or 0) for x in results)
-    if meta_total:
-        return meta_total
-    return sum(len(x.get("tweets", [])) for x in results)
-
-
-def report_kol_count(results: list[dict[str, Any]]) -> int:
-    global_count = max((int(x.get("_global_kol_24h") or 0) for x in results), default=0)
-    return global_count or len([x for x in results if x.get("tweets")])
 
 
 IMPORTANT_TERMS = [
@@ -781,21 +772,19 @@ def telegram_row_sort_key(row: dict[str, Any]) -> tuple[int, int]:
 
 def telegram_rows(results: list[dict[str, Any]], per_kol: int, include_low_signal: bool) -> list[dict[str, Any]]:
     active = [x for x in results if x.get("tweets")]
-    effective_per_kol = per_kol
-    if effective_per_kol > 1 and len(active) > 20:
-        effective_per_kol = 1
     rows: list[dict[str, Any]] = []
     for kol_order, item in enumerate(active):
         tweets = item.get("tweets", [])
         name = str(item.get("name") or item.get("handle") or "").strip()
         handle = str(item.get("handle") or "").strip()
-        shown = tweets[:effective_per_kol] if effective_per_kol > 0 else tweets
-        for tw in shown:
+        qualified: list[dict[str, Any]] = []
+        for tw in tweets:
             row = {"name": name, "handle": handle, "tweet": tw, "_kol_order": kol_order}
             if is_excluded_telegram_row(row):
                 continue
             if include_low_signal or not is_low_signal_row(row):
-                rows.append(row)
+                qualified.append(row)
+        rows.extend(qualified[:per_kol] if per_kol > 0 else qualified)
     rows.sort(key=telegram_row_sort_key)
     return rows
 
@@ -805,7 +794,10 @@ def merge_thread_rows(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict
     order: list[tuple[str, str]] = []
     for row in rows:
         tweet = row["tweet"]
-        key = (str(row.get("name") or ""), tweet_time_text(tweet))
+        author_key = str(row.get("handle") or row.get("name") or "").lower()
+        created_ms = int(tweet.get("created_at_ms") or 0)
+        minute_key = str(created_ms // 60_000) if created_ms else str(tweet.get("created_at") or "")[:16]
+        key = (author_key, minute_key)
         if key not in buckets:
             order.append(key)
             buckets[key] = []
@@ -814,13 +806,16 @@ def merge_thread_rows(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict
     merged: list[dict[str, Any]] = []
     for key in order:
         group = buckets[key]
-        if len(group) < 3:
+        if len(group) < 2:
             merged.extend(group)
             continue
         bodies = [tweet_body(row["tweet"], 160) for row in group if tweet_body(row["tweet"], 160)]
-        numbered = sum(1 for body in bodies if re.match(r"^\s*\d+\s*/", body))
-        same_time_thread = numbered >= 2 or len(group) >= 4
-        if not same_time_thread:
+        raw_bodies = [
+            str(row["tweet"].get("text") or row["tweet"].get("translation_zh") or "")
+            for row in group
+        ]
+        numbered = sum(1 for body in raw_bodies if re.match(r"^\s*\d+\s*/", body))
+        if numbered < 2:
             merged.extend(group)
             continue
         first = dict(group[0]["tweet"])
@@ -872,9 +867,29 @@ def telegram_section(number: int, row: dict[str, Any], tweet_chars: int, show_na
     return "\n".join([title, body])
 
 
-def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int) -> list[dict[str, Any]]:
+def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int, style: str) -> list[dict[str, Any]]:
+    if style not in {"digest", "list"}:
+        raise ValueError(f"unsupported Telegram style: {style}")
     blocks: list[dict[str, Any]] = []
     number = 1
+    if style == "digest":
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            key = (str(row.get("name") or ""), str(row.get("handle") or ""))
+            grouped.setdefault(key, []).append(row)
+        for (name, handle), group in grouped.items():
+            author = name or handle or "unknown"
+            if handle and handle not in author:
+                author = f"{author} {handle}"
+            sections: list[str] = []
+            for row in group:
+                section = telegram_section(number, row, tweet_chars, show_name=False)
+                if section:
+                    sections.append(section)
+                    number += 1
+            if sections:
+                blocks.append({"title": author, "sections": sections, "count": len(sections)})
+        return blocks
     for row in rows:
         section = telegram_section(number, row, tweet_chars, show_name=True)
         if not section:
@@ -889,27 +904,6 @@ def block_text(title: str, sections: list[str], continued: bool = False) -> str:
         return "\n\n".join(sections)
     suffix = " 续" if continued else ""
     return "\n\n".join([f"## {title}{suffix}", *sections])
-
-
-def split_large_block(block: dict[str, Any], group_size: int, limit: int) -> list[dict[str, Any]]:
-    title = str(block["title"])
-    sections = list(block["sections"])
-    max_items = group_size if group_size > 0 else len(sections)
-    parts: list[dict[str, Any]] = []
-    current: list[str] = []
-    for section in sections:
-        candidate = [*current, section]
-        candidate_text = block_text(title, candidate, continued=bool(parts))
-        too_many = len(candidate) > max_items
-        too_long = len(candidate_text) > limit
-        if current and (too_many or too_long):
-            parts.append({"text": block_text(title, current, continued=bool(parts)), "count": len(current)})
-            current = [section]
-        else:
-            current = candidate
-    if current:
-        parts.append({"text": block_text(title, current, continued=bool(parts)), "count": len(current)})
-    return parts
 
 
 def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[list[dict[str, Any]]]:
@@ -979,7 +973,7 @@ def build_telegram_reports(
             f"推文:0 | 本组:0 | {now}\n\n{empty_text}\n"
         ]
 
-    blocks = telegram_kol_blocks(rows, tweet_chars)
+    blocks = telegram_kol_blocks(rows, tweet_chars, style)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
     display_kol_count = len({
         (str(row.get("name") or "").strip(), str(row.get("handle") or "").strip())
@@ -1031,16 +1025,8 @@ def build_telegram_report(
     ) + "\n"
 
 
-def build_telegram_digest(results: list[dict[str, Any]], hours: int, tweet_chars: int) -> str:
-    return build_telegram_report(results, hours, tweet_chars, per_kol=1, style="hermes")
-
-
-def build_telegram_list(results: list[dict[str, Any]], hours: int, tweet_chars: int, per_kol: int) -> str:
-    return build_telegram_report(results, hours, tweet_chars, per_kol, style="hermes")
-
-
 def cached_results(limit: int, hours: int, handles: str = "") -> list[dict[str, Any]]:
-    store = load_json(TWEET_STORE, {"tweets": {}})
+    store = load_json(TWEET_STORE, {"tweets": {}}, strict=True)
     wanted = {"@" + x.strip().lstrip("@").lower() for x in handles.split(",") if x.strip()}
     allowed = wanted or {row["handle"].lower() for row in parse_kols(KOLS_FILE)}
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
@@ -1132,6 +1118,20 @@ def telegram_send_reports(reports: list[str]) -> dict[str, int]:
     return {"groups": len(reports), "rows": rows}
 
 
+def telegram_reports_fingerprint(reports: list[str]) -> str:
+    normalized = [
+        re.sub(
+            r"(?m)^(X KOL [^\n]* \| )\d{2}-\d{2} \d{2}:\d{2}$",
+            r"\1<generated-at>",
+            report,
+            count=1,
+        )
+        for report in reports
+    ]
+    payload = "\n\0\n".join(normalized).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def scheduled_send_key(args: argparse.Namespace) -> str:
     if os.environ.get("GITHUB_EVENT_NAME") not in {"schedule", "workflow_dispatch"}:
         return ""
@@ -1146,19 +1146,49 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
     key = scheduled_send_key(args)
     if not key:
         return telegram_send_reports(reports)
-    state = load_json(SENT_STATE, {"version": 1, "sent": {}})
+    state = load_json(SENT_STATE, {"version": 2, "sent": {}}, strict=True)
     sent = state.setdefault("sent", {})
-    if key in sent:
+    existing = sent.get(key)
+    if existing and "completed_groups" not in existing:
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
-    stats = telegram_send_reports(reports)
-    sent[key] = {
-        "sent_at": cn_now().isoformat(timespec="seconds"),
-        "groups": stats.get("groups", 0),
-        "rows": stats.get("rows", 0),
+    fingerprint = telegram_reports_fingerprint(reports)
+    record = existing or {
+        "created_at": cn_now().isoformat(timespec="seconds"),
+        "fingerprint": fingerprint,
+        "total_groups": len(reports),
+        "completed_groups": 0,
+        "rows": 0,
+        "completed": False,
     }
+    if record.get("completed"):
+        print(f"scheduled send skipped: already sent key={key}")
+        return {"groups": 0, "rows": 0, "skipped": 1}
+    if record.get("fingerprint") != fingerprint or int(record.get("total_groups") or 0) != len(reports):
+        raise RuntimeError("scheduled report changed after a partial send; refusing to resend")
+    completed_groups = int(record.get("completed_groups") or 0)
+    if completed_groups < 0 or completed_groups > len(reports):
+        raise RuntimeError("invalid Telegram send progress")
+    sent[key] = record
+    state["version"] = 2
     save_json(SENT_STATE, state)
-    return stats
+
+    sent_groups = 0
+    sent_rows = 0
+    for index in range(completed_groups, len(reports)):
+        report = reports[index]
+        telegram_send(report)
+        rows = telegram_report_row_count(report)
+        sent_groups += 1
+        sent_rows += rows
+        record["completed_groups"] = index + 1
+        record["rows"] = int(record.get("rows") or 0) + rows
+        record["updated_at"] = cn_now().isoformat(timespec="seconds")
+        record["completed"] = index + 1 == len(reports)
+        if record["completed"]:
+            record["sent_at"] = record["updated_at"]
+        save_json(SENT_STATE, state)
+    return {"groups": sent_groups, "rows": sent_rows, "resumed_from": completed_groups}
 
 
 def main() -> int:
