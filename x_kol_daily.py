@@ -176,6 +176,12 @@ PAGE_HEALTH_JS = r"""
 
 def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
     health = page.evaluate(PAGE_HEALTH_JS)
+    if not health.get("hasMain") and not any(
+        health.get(key) for key in ("loginRequired", "errorPage", "accountUnavailable")
+    ):
+        page.reload(wait_until="domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(2500)
+        health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
         raise RuntimeError("X authentication required")
     if health.get("errorPage"):
@@ -1212,7 +1218,7 @@ def main() -> int:
     ap.add_argument("--telegram-per-kol", type=int, default=0, help="max tweets per KOL in Telegram; 0 means no limit")
     ap.add_argument("--telegram-group-size", type=int, default=20, help="max tweets per Telegram message group; 0 means one group")
     ap.add_argument("--telegram-style", choices=["digest", "list"], default="list")
-    ap.add_argument("--telegram-mode", choices=["full", "focus"], default="focus", help="full sends all selected tweets; focus filters noisy tweets and merges threads")
+    ap.add_argument("--telegram-mode", choices=["full", "focus"], default="full", help="full sends all selected tweets; focus filters noisy tweets and merges threads")
     ap.add_argument("--telegram-focus-limit", type=int, default=0, help="max tweets/thread summaries in focus mode; 0 means no limit")
     ap.add_argument("--telegram-focus-per-kol", type=int, default=DEFAULT_FOCUS_PER_KOL, help="max focus rows per KOL; 0 means no per-KOL cap")
     ap.add_argument("--include-low-signal", action="store_true", help="include short replies, CTA text, and low-signal tweets in Telegram output")

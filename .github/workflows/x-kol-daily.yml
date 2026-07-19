@@ -64,8 +64,8 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          cmd=(python x_kol_daily.py --telegram-mode focus --send)
-          echo "mode=focus send=true"
+          cmd=(python x_kol_daily.py --telegram-mode full --send)
+          echo "mode=full send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
@@ -119,6 +119,10 @@ jobs:
             tail -n 40 run.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$scan_errors" ]; then
+            scan_error_count="$(printf '%s\n' "$scan_errors" | grep -c .)"
+            echo "::warning title=X KOL partial scan::$scan_error_count KOL scan(s) failed; see job summary"
+          fi
 
       - name: Upload run diagnostics
         if: always()
