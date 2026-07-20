@@ -972,11 +972,18 @@ def build_telegram_reports(
     now = cn_now().strftime("%m-%d %H:%M")
     selected_kol_title = "重点KOL" if mode == "focus" else "展示KOL"
     active_kol_label = f"{len(active)}/{len(results)}"
+    unavailable_handles = [
+        str(item.get("handle") or "").strip()
+        for item in results
+        if str(item.get("error") or "").endswith("X account unavailable")
+    ]
+    unavailable_line = f"不可用KOL:{'、'.join(unavailable_handles)}" if unavailable_handles else ""
+    unavailable_suffix = f"\n{unavailable_line}" if unavailable_line else ""
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
         return [
             f"X KOL {hours}H | 活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
-            f"推文:0 | 本组:0 | {now}\n\n{empty_text}\n"
+            f"推文:0 | 本组:0 | {now}{unavailable_suffix}\n\n{empty_text}\n"
         ]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
@@ -996,6 +1003,8 @@ def build_telegram_reports(
             f"推文:{display_total} | 本组:{group_count} | {now}"
         )
         lines = [header]
+        if group_index == 1 and unavailable_line:
+            lines.append(unavailable_line)
         for part in group:
             lines.extend(["", str(part.get("text") or "").strip()])
         reports.append("\n".join(lines).strip() + "\n")
@@ -1065,23 +1074,22 @@ def cached_results(limit: int, hours: int, handles: str = "") -> list[dict[str, 
 
 
 def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    continuation = "（续）\n"
+    chunk_limit = limit - len(continuation)
     chunks: list[str] = []
-    current: list[str] = []
-    size = 0
-    for line in text.splitlines():
-        line_size = len(line) + 1
-        if current and size + line_size > limit:
-            chunks.append("\n".join(current).strip())
-            current = []
-            size = 0
-        if line_size > limit:
-            chunks.append(line[:limit - 3].rstrip() + "...")
-            continue
-        current.append(line)
-        size += line_size
-    if current:
-        chunks.append("\n".join(current).strip())
-    return chunks or [text]
+    remaining = text.strip()
+    while len(remaining) > chunk_limit:
+        split_at = remaining.rfind("\n", 0, chunk_limit + 1)
+        if split_at < chunk_limit // 2:
+            split_at = chunk_limit
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+        else:
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at + 1:]
+    if remaining:
+        chunks.append(remaining)
+    return [chunk if index == 0 else continuation + chunk for index, chunk in enumerate(chunks)] or [text]
 
 
 def telegram_send(text: str) -> None:
@@ -1214,7 +1222,7 @@ def main() -> int:
     ap.add_argument("--translate-cache", action="store_true", help="translate missing English tweets in cache only")
     ap.add_argument("--translate-limit", type=int, default=20, help="max cached tweets to translate after scan; 0 means no limit")
     ap.add_argument("--cache-recent", type=int, default=0, help="print recent tweets from local cache, no web scan")
-    ap.add_argument("--telegram-chars", type=int, default=260, help="max chars per tweet in Telegram")
+    ap.add_argument("--telegram-chars", type=int, default=0, help="max chars per tweet in Telegram; 0 keeps full text")
     ap.add_argument("--telegram-per-kol", type=int, default=0, help="max tweets per KOL in Telegram; 0 means no limit")
     ap.add_argument("--telegram-group-size", type=int, default=20, help="max tweets per Telegram message group; 0 means one group")
     ap.add_argument("--telegram-style", choices=["digest", "list"], default="list")

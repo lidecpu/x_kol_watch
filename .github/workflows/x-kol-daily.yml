@@ -64,8 +64,8 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          cmd=(python x_kol_daily.py --telegram-mode full --send)
-          echo "mode=full send=true"
+          cmd=(python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
+          echo "mode=full chars=full send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
