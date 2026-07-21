@@ -30,6 +30,8 @@ TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
 MIN_SCROLL_ROUNDS = 3
+PAGE_RENDER_ERROR = "X page did not render its main content"
+MAX_PAGE_RECOVERIES = 2
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -189,7 +191,7 @@ def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
     if account_page and health.get("accountUnavailable"):
         raise RuntimeError("X account unavailable")
     if not health.get("hasMain"):
-        raise RuntimeError("X page did not render its main content")
+        raise RuntimeError(PAGE_RENDER_ERROR)
 
 
 def scrape_handle(
@@ -308,6 +310,7 @@ def scrape_all(
                 )
                 total_kols = len(kols)
                 durations: list[float] = []
+                page_recovery_attempts = 0
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
                     started = time.time()
@@ -317,30 +320,54 @@ def scrape_all(
                         "search_fallback_used": False,
                         "scroll_rounds": 0,
                         "early_stops": 0,
+                        "page_retries": 0,
                     }
-                    try:
-                        tweets = scrape_handle(
-                            page,
-                            handle,
-                            hours,
-                            limit,
-                            scrolls,
-                            page_wait_ms,
-                            scroll_wait_ms,
-                            search_fallback,
-                            diagnostics,
-                        )
-                        status = "ok"
-                        error = ""
-                    except Exception as exc:
-                        tweets = []
-                        status = "error"
-                        error = f"{type(exc).__name__}: {exc}"
+                    recreate_page = False
+                    while True:
+                        try:
+                            if recreate_page:
+                                if not page.is_closed():
+                                    page.close()
+                                page = context.new_page()
+                                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
+                                page.wait_for_timeout(max(page_wait_ms, 5000))
+                                ensure_x_page_healthy(page)
+                            tweets = scrape_handle(
+                                page,
+                                handle,
+                                hours,
+                                limit,
+                                scrolls,
+                                page_wait_ms,
+                                scroll_wait_ms,
+                                search_fallback,
+                                diagnostics,
+                            )
+                        except Exception as exc:
+                            if str(exc) == PAGE_RENDER_ERROR and page_recovery_attempts < MAX_PAGE_RECOVERIES:
+                                page_recovery_attempts += 1
+                                diagnostics["page_retries"] += 1
+                                recreate_page = True
+                                print(
+                                    f"[x-recover] {handle} recreate page attempt={page_recovery_attempts}/{MAX_PAGE_RECOVERIES}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                continue
+                            tweets = []
+                            status = "error"
+                            error = f"{type(exc).__name__}: {exc}"
+                        else:
+                            status = "ok"
+                            error = ""
+                            page_recovery_attempts = 0
+                        break
                     elapsed = time.time() - started
                     durations.append(elapsed)
                     avg = sum(durations) / len(durations)
                     eta = fmt_duration(avg * (total_kols - index))
-                    suffix = f" error={error}" if error else ""
+                    retry_suffix = f" retries={diagnostics['page_retries']}" if diagnostics["page_retries"] else ""
+                    suffix = f"{retry_suffix} error={error}" if error else retry_suffix
                     print(
                         f"[scan {index}/{total_kols}] {handle} {status} tweets={len(tweets)} {elapsed:.1f}s eta={eta}{suffix}",
                         file=sys.stderr,
@@ -381,6 +408,10 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         int(item.get("diagnostics", {}).get("early_stops") or 0)
         for item in results
     )
+    page_retries = sum(
+        int(item.get("diagnostics", {}).get("page_retries") or 0)
+        for item in results
+    )
     return {
         "total": len(results),
         "success": len(results) - errors,
@@ -391,6 +422,7 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "fallback_hits": fallback_hits,
         "scroll_rounds": scroll_rounds,
         "early_stops": early_stops,
+        "page_retries": page_retries,
     }
 
 
@@ -972,6 +1004,8 @@ def build_telegram_reports(
     now = cn_now().strftime("%m-%d %H:%M")
     selected_kol_title = "重点KOL" if mode == "focus" else "展示KOL"
     active_kol_label = f"{len(active)}/{len(results)}"
+    scan_error_count = sum(1 for item in results if item.get("status") == "error")
+    scan_kol_label = f"{len(results) - scan_error_count}/{len(results)}"
     unavailable_handles = [
         str(item.get("handle") or "").strip()
         for item in results
@@ -982,7 +1016,8 @@ def build_telegram_reports(
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
         return [
-            f"X KOL {hours}H | 活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
+            f"X KOL {hours}H | 扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
+            f"活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
             f"推文:0 | 本组:0 | {now}{unavailable_suffix}\n\n{empty_text}\n"
         ]
 
@@ -999,6 +1034,7 @@ def build_telegram_reports(
         group_count = sum(int(part.get("count") or 0) for part in group)
         header = (
             f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | "
+            f"扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
             f"活跃KOL:{active_kol_label} | {selected_kol_title}:{display_kol_count} | "
             f"推文:{display_total} | 本组:{group_count} | {now}"
         )
@@ -1122,7 +1158,11 @@ def telegram_send(text: str) -> None:
 
 
 def telegram_report_row_count(report: str) -> int:
-    return len(re.findall(r"(?m)^\d+\.\s+", report))
+    header = report.partition("\n")[0]
+    match = re.search(r"(?:^| \| )本组:(\d+)(?: \| |$)", header)
+    if not match:
+        raise RuntimeError("Telegram report header is missing its row count")
+    return int(match.group(1))
 
 
 def telegram_send_reports(reports: list[str]) -> dict[str, int]:
