@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -152,6 +153,16 @@ EXTRACT_JS = r"""
 }
 """
 
+EXPAND_TWEETS_JS = r"""
+() => {
+  const buttons = Array.from(document.querySelectorAll(
+    'article button[data-testid="tweet-text-show-more-link"]'
+  )).filter(button => button.closest('article')?.querySelector('[data-testid="tweetText"]'));
+  for (const button of buttons) button.click();
+  return buttons.length;
+}
+"""
+
 PAGE_HEALTH_JS = r"""
 () => {
   const path = (location.pathname || '').toLowerCase();
@@ -232,6 +243,9 @@ def scrape_handle(
         unchanged_rounds = 0
         visible_article_keys: set[str] = set()
         for round_index in range(scrolls + 1):
+            expanded = int(page.evaluate(EXPAND_TWEETS_JS) or 0)
+            if expanded:
+                page.wait_for_timeout(250)
             payload = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
             rows = payload.get("rows", [])
             current_article_keys = {str(key) for key in payload.get("articleKeys", []) if key}
@@ -426,10 +440,15 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def normalize_translation_source(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+
 def is_mostly_english(text: str) -> bool:
-    if re.search(r"[\u4e00-\u9fff]", text):
+    source = normalize_translation_source(text)
+    if re.search(r"[\u4e00-\u9fff]", source):
         return False
-    letters = re.findall(r"[A-Za-z]", text)
+    letters = re.findall(r"[A-Za-z]", source)
     return len(letters) >= 20
 
 
@@ -491,6 +510,13 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
         for tw in item.get("tweets", []):
             tid = tweet_id(tw)
             existing = tweets.get(tid)
+            tweet_text = str(tw.get("text") or "")
+            existing_text = str((existing or {}).get("text") or "")
+            existing_translation = (
+                str((existing or {}).get("translation_zh") or "")
+                if existing_text == tweet_text
+                else ""
+            )
             record = {
                 "id": tid,
                 "handle": item.get("handle", ""),
@@ -498,8 +524,8 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
                 "note": item.get("note", ""),
                 "created_at": tw.get("created_at", ""),
                 "created_at_ms": tw.get("created_at_ms", 0),
-                "text": tw.get("text", ""),
-                "translation_zh": tw.get("translation_zh") or (existing or {}).get("translation_zh", ""),
+                "text": tweet_text,
+                "translation_zh": tw.get("translation_zh") or existing_translation,
                 "url": tw.get("url", ""),
                 "last_seen_at": now,
                 "last_run": stamp,
@@ -559,7 +585,8 @@ def apply_store_translations(results: list[dict[str, Any]]) -> None:
 
 def translate_to_zh(text: str) -> str:
     cache = load_json(TRANSLATION_CACHE, {}, strict=True)
-    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    source = normalize_translation_source(text).strip()
+    key = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if key in cache:
         return str(cache[key])
     query = urllib.parse.urlencode({
@@ -567,7 +594,7 @@ def translate_to_zh(text: str) -> str:
         "sl": "auto",
         "tl": "zh-CN",
         "dt": "t",
-        "q": text[:4500],
+        "q": source[:4500],
     })
     url = "https://translate.googleapis.com/translate_a/single?" + query
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
