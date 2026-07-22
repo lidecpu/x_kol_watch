@@ -63,4 +63,4 @@ punk6529 | @punk6529 | NFT/Web3
 ChainLinkGod | @ChainLinkGod | Chainlink/DeFi
 DefiIgnas | @DefiIgnas | DeFi 研究
 foobar | @0xfoobar | 加密开发
-Bankless | @BanklessHQ | Ethereum/DeFi 媒体
+Bankless | @Bankless | Ethereum/DeFi 媒体

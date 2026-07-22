@@ -32,7 +32,10 @@ SENT_STATE = CACHE_DIR / "sent.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
+ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 MAX_PAGE_RECOVERIES = 2
+RENAME_STATUS_CANDIDATES = 3
+UNAVAILABLE_REMOVAL_DAYS = 7
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -75,6 +78,49 @@ def parse_kols(path: Path) -> list[dict[str, str]]:
         note = parts[2] if len(parts) >= 3 else ""
         rows.append({"name": name, "handle": handle, "note": note})
     return rows
+
+
+def canonical_handle(value: Any) -> str:
+    match = re.fullmatch(r"@?([A-Za-z0-9_]{1,32})", str(value or "").strip())
+    return "@" + match.group(1) if match else ""
+
+
+def resolve_handle_alias(handle: str, aliases: dict[str, Any]) -> str:
+    start = canonical_handle(handle)
+    mapping = {
+        source.lower(): target
+        for key, value in aliases.items()
+        if (source := canonical_handle(key)) and (target := canonical_handle(value))
+    }
+    current = start
+    seen: set[str] = set()
+    while current and current.lower() in mapping:
+        key = current.lower()
+        if key in seen:
+            return start
+        seen.add(key)
+        target = mapping[key]
+        if target.lower() == key:
+            return current
+        current = target
+    return current or start
+
+
+def apply_handle_aliases(kols: list[dict[str, str]]) -> list[dict[str, str]]:
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
+    aliases = store.get("handle_aliases", {})
+    if not isinstance(aliases, dict):
+        raise RuntimeError("invalid handle_aliases in tweets.json")
+    resolved: list[dict[str, str]] = []
+    for kol in kols:
+        row = dict(kol)
+        configured = row["handle"]
+        current = resolve_handle_alias(configured, aliases)
+        if current.lower() != configured.lower():
+            row["configured_handle"] = configured
+            row["handle"] = current
+        resolved.append(row)
+    return resolved
 
 
 def cookies_from_env() -> list[dict[str, Any]]:
@@ -186,6 +232,25 @@ PAGE_HEALTH_JS = r"""
 }
 """
 
+STATUS_AUTHOR_JS = r"""
+statusId => {
+  const statusPath = `/status/${statusId}`;
+  const article = Array.from(document.querySelectorAll('article')).find(node =>
+    Array.from(node.querySelectorAll('a[href*="/status/"]')).some(link =>
+      (link.getAttribute('href') || '').split('?')[0].endsWith(statusPath)
+    )
+  );
+  const userName = article?.querySelector('[data-testid="User-Name"]');
+  if (!userName) return '';
+  for (const link of Array.from(userName.querySelectorAll('a[href]'))) {
+    const path = (link.getAttribute('href') || '').split('?')[0].replace(/\/$/, '');
+    const match = path.match(/^\/([A-Za-z0-9_]{1,32})$/);
+    if (match) return `@${match[1]}`;
+  }
+  return '';
+}
+"""
+
 
 def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
     health = page.evaluate(PAGE_HEALTH_JS)
@@ -200,7 +265,7 @@ def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
     if health.get("errorPage"):
         raise RuntimeError("X returned an error or rate-limit page")
     if account_page and health.get("accountUnavailable"):
-        raise RuntimeError("X account unavailable")
+        raise RuntimeError(ACCOUNT_UNAVAILABLE_ERROR)
     if not health.get("hasMain"):
         raise RuntimeError(PAGE_RENDER_ERROR)
 
@@ -335,8 +400,10 @@ def scrape_all(
                         "scroll_rounds": 0,
                         "early_stops": 0,
                         "page_retries": 0,
+                        "rename_checks": 0,
                     }
                     recreate_page = False
+                    rename_attempted = False
                     while True:
                         try:
                             if recreate_page:
@@ -358,6 +425,35 @@ def scrape_all(
                                 diagnostics,
                             )
                         except Exception as exc:
+                            if str(exc) == ACCOUNT_UNAVAILABLE_ERROR and not rename_attempted:
+                                rename_attempted = True
+                                try:
+                                    renamed_handle, checked = recover_renamed_handle(page, handle, page_wait_ms)
+                                    diagnostics["rename_checks"] = checked
+                                    if renamed_handle:
+                                        record_handle_alias(handle, renamed_handle)
+                                except Exception as recovery_exc:
+                                    diagnostics["rename_error"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
+                                    renamed_handle = ""
+                                if renamed_handle:
+                                    previous_handle = handle
+                                    kol.setdefault("configured_handle", previous_handle)
+                                    kol["handle"] = renamed_handle
+                                    handle = renamed_handle
+                                    diagnostics["renamed_from"] = previous_handle
+                                    diagnostics["renamed_to"] = renamed_handle
+                                    print(
+                                        f"[account-renamed] {previous_handle} -> {renamed_handle} verified; retrying",
+                                        file=sys.stderr,
+                                        flush=True,
+                                    )
+                                    recreate_page = False
+                                    continue
+                                print(
+                                    f"[account-rename-unresolved] {handle} cached_statuses={diagnostics['rename_checks']}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                             if str(exc) == PAGE_RENDER_ERROR and page_recovery_attempts < MAX_PAGE_RECOVERIES:
                                 page_recovery_attempts += 1
                                 diagnostics["page_retries"] += 1
@@ -437,6 +533,11 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "scroll_rounds": scroll_rounds,
         "early_stops": early_stops,
         "page_retries": page_retries,
+        "renamed": sum(1 for item in results if item.get("diagnostics", {}).get("renamed_to")),
+        "unavailable": sum(
+            1 for item in results if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+        ),
+        "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
 
 
@@ -444,12 +545,27 @@ def normalize_translation_source(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
-def is_mostly_english(text: str) -> bool:
+def translation_signal_text(text: str) -> str:
     source = normalize_translation_source(text)
-    if re.search(r"[\u4e00-\u9fff]", source):
-        return False
+    source = re.sub(r"(?:https?://|www\.)\s*\S+", "", source, flags=re.IGNORECASE)
+    return re.sub(r"\b0x[0-9A-Fa-f]{8,}\b", "", source)
+
+
+def has_english_phrase(text: str) -> bool:
+    for segment in re.split(r"[\u4e00-\u9fff]+", translation_signal_text(text)):
+        words = re.findall(r"[A-Za-z][A-Za-z'-]*", segment)
+        if len(words) >= 3 and sum(len(word) for word in words) >= 12:
+            return True
+    return False
+
+
+def is_mostly_english(text: str) -> bool:
+    source = translation_signal_text(text)
     letters = re.findall(r"[A-Za-z]", source)
-    return len(letters) >= 20
+    han = re.findall(r"[\u4e00-\u9fff]", source)
+    return len(letters) >= 20 and (
+        not han or len(letters) >= len(han) * 4 or has_english_phrase(source)
+    )
 
 
 def load_json(path: Path, default: Any, *, strict: bool = False) -> Any:
@@ -468,6 +584,117 @@ def save_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def cached_status_ids(handle: str, limit: int = RENAME_STATUS_CANDIDATES) -> list[str]:
+    target = canonical_handle(handle).lower()
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
+    tweets = store.get("tweets", {})
+    if not isinstance(tweets, dict):
+        raise RuntimeError("invalid tweets in tweets.json")
+    records = sorted(
+        (row for row in tweets.values() if isinstance(row, dict)),
+        key=lambda row: int(row.get("created_at_ms") or 0),
+        reverse=True,
+    )
+    status_ids: list[str] = []
+    for row in records:
+        if canonical_handle(row.get("handle")).lower() != target:
+            continue
+        match = re.search(
+            r"https?://(?:www\.)?(?:x|twitter)\.com/([A-Za-z0-9_]{1,32})/status/(\d+)",
+            str(row.get("url") or ""),
+            flags=re.IGNORECASE,
+        )
+        if not match or ("@" + match.group(1)).lower() != target:
+            continue
+        status_id = match.group(2)
+        if status_id not in status_ids:
+            status_ids.append(status_id)
+        if len(status_ids) >= limit:
+            break
+    return status_ids
+
+
+def recover_renamed_handle(page: Any, handle: str, page_wait_ms: int) -> tuple[str, int]:
+    status_ids = cached_status_ids(handle)
+    for status_id in status_ids:
+        try:
+            page.goto(f"https://x.com/i/status/{status_id}", wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(page_wait_ms)
+            ensure_x_page_healthy(page)
+            candidate = canonical_handle(page.evaluate(STATUS_AUTHOR_JS, status_id))
+            if not candidate or candidate.lower() == handle.lower():
+                continue
+            page.goto(
+                f"https://x.com/{urllib.parse.quote(candidate.lstrip('@'))}",
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+            page.wait_for_timeout(page_wait_ms)
+            ensure_x_page_healthy(page, account_page=True)
+            return candidate, len(status_ids)
+        except Exception:
+            continue
+    return "", len(status_ids)
+
+
+def record_handle_alias(old_handle: str, new_handle: str) -> None:
+    old_handle = canonical_handle(old_handle)
+    new_handle = canonical_handle(new_handle)
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
+    aliases = store.setdefault("handle_aliases", {})
+    if not isinstance(aliases, dict):
+        raise RuntimeError("invalid handle_aliases in tweets.json")
+    aliases[old_handle.lower()] = new_handle
+    save_json(TWEET_STORE, store)
+
+
+def update_kol_status(results: list[dict[str, Any]]) -> None:
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
+    statuses = store.get("kol_status", {})
+    if not isinstance(statuses, dict):
+        raise RuntimeError("invalid kol_status in tweets.json")
+    today = cn_now().date()
+    yesterday = (today - dt.timedelta(days=1)).isoformat()
+    changed = False
+    for item in results:
+        identity = canonical_handle(item.get("configured_handle") or item.get("handle"))
+        if not identity:
+            continue
+        key = identity.lower()
+        if item.get("status") == "ok":
+            if key in statuses:
+                statuses.pop(key)
+                changed = True
+            continue
+        if not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR):
+            continue
+        previous = statuses.get(key, {})
+        if not isinstance(previous, dict):
+            previous = {}
+        if previous.get("last_unavailable_date") == today.isoformat():
+            days = max(1, int(previous.get("unavailable_days") or 0))
+        elif previous.get("last_unavailable_date") == yesterday:
+            days = min(UNAVAILABLE_REMOVAL_DAYS, int(previous.get("unavailable_days") or 0) + 1)
+        else:
+            days = 1
+        pending_removal = days >= UNAVAILABLE_REMOVAL_DAYS
+        current = {
+            "handle": identity,
+            "current_handle": canonical_handle(item.get("handle")),
+            "unavailable_days": days,
+            "last_unavailable_date": today.isoformat(),
+            "pending_removal": pending_removal,
+        }
+        if statuses.get(key) != current:
+            statuses[key] = current
+            changed = True
+        item["unavailable_days"] = days
+        item["pending_removal"] = pending_removal
+    if changed:
+        store["kol_status"] = statuses
+        save_json(TWEET_STORE, store)
 
 
 def prune_daily_outputs() -> None:
@@ -547,15 +774,31 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
     return {"store": str(TWEET_STORE), "total": len(tweets), "added": added, "updated": updated}
 
 
-def translate_tweet_store(limit: int) -> dict[str, int]:
+def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> dict[str, int]:
     store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
     tweets = store.get("tweets", {})
-    rows = sorted(tweets.values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
+    priority_ids = priority_ids or set()
+    rows = sorted(
+        tweets.values(),
+        key=lambda row: (
+            str(row.get("id") or "") in priority_ids,
+            row.get("created_at_ms", 0),
+        ),
+        reverse=True,
+    )
+    priority_needed = sum(
+        1
+        for row in rows
+        if str(row.get("id") or "") in priority_ids
+        and not row.get("translation_zh")
+        and is_mostly_english(str(row.get("text") or ""))
+    )
     translated = 0
     skipped = 0
     failed = 0
     for row in rows:
-        if limit > 0 and translated >= limit:
+        row_id = str(row.get("id") or "")
+        if limit > 0 and translated >= limit and row_id not in priority_ids:
             break
         text = str(row.get("text") or "")
         if row.get("translation_zh") or not is_mostly_english(text):
@@ -570,7 +813,20 @@ def translate_tweet_store(limit: int) -> dict[str, int]:
             failed += 1
     store["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(TWEET_STORE, store)
-    return {"translated": translated, "skipped": skipped, "failed": failed}
+    priority_pending = sum(
+        1
+        for row in rows
+        if str(row.get("id") or "") in priority_ids
+        and not row.get("translation_zh")
+        and is_mostly_english(str(row.get("text") or ""))
+    )
+    return {
+        "translated": translated,
+        "skipped": skipped,
+        "failed": failed,
+        "priority_needed": priority_needed,
+        "priority_pending": priority_pending,
+    }
 
 
 def apply_store_translations(results: list[dict[str, Any]]) -> None:
@@ -586,12 +842,14 @@ def apply_store_translations(results: list[dict[str, Any]]) -> None:
 def translate_to_zh(text: str) -> str:
     cache = load_json(TRANSLATION_CACHE, {}, strict=True)
     source = normalize_translation_source(text).strip()
-    key = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
+    cache_source = source if source_language == "auto" else f"{source_language}\0{source}"
+    key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
     if key in cache:
         return str(cache[key])
     query = urllib.parse.urlencode({
         "client": "gtx",
-        "sl": "auto",
+        "sl": source_language,
         "tl": "zh-CN",
         "dt": "t",
         "q": source[:4500],
@@ -638,7 +896,6 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r"\bs/\d+\S*(?:\s*…)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(?:y|ss|dress|ost|announcement/detail|proposal)/\S+(?:\s*…)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\S+\?(?:activeTab|_dp|utm_|ref=)\S*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\S{48,}", "", text)
     text = re.sub(r"感谢\s+@\w+\s+作为.*?赞助商。?", "", text)
     text = re.sub(r"\b0x[0-9a-f]{10,}(?:[.#/][\w.-]+)?(?:\s*…|\s*\.\.\.)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b[0-9a-f]{24,}(?:[.#/][\w.-]+)?(?:\s*…|\s*\.\.\.)?", "", text, flags=re.IGNORECASE)
@@ -1033,19 +1290,28 @@ def build_telegram_reports(
     active_kol_label = f"{len(active)}/{len(results)}"
     scan_error_count = sum(1 for item in results if item.get("status") == "error")
     scan_kol_label = f"{len(results) - scan_error_count}/{len(results)}"
-    unavailable_handles = [
-        str(item.get("handle") or "").strip()
+    renamed_handles = [
+        f"{item['configured_handle']}->{item['handle']}"
         for item in results
-        if str(item.get("error") or "").endswith("X account unavailable")
+        if item.get("configured_handle")
+        and str(item.get("configured_handle")).lower() != str(item.get("handle")).lower()
+    ]
+    unavailable_handles = [
+        f"{str(item.get('handle') or '').strip()}({int(item.get('unavailable_days') or 1)}/"
+        f"{UNAVAILABLE_REMOVAL_DAYS}{'，待人工删除' if item.get('pending_removal') else ''})"
+        for item in results
+        if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
     ]
     unavailable_line = f"不可用KOL:{'、'.join(unavailable_handles)}" if unavailable_handles else ""
-    unavailable_suffix = f"\n{unavailable_line}" if unavailable_line else ""
+    renamed_line = f"账号改名:{'、'.join(renamed_handles)}" if renamed_handles else ""
+    status_lines = [line for line in (renamed_line, unavailable_line) if line]
+    status_suffix = "".join(f"\n{line}" for line in status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
         return [
             f"X KOL {hours}H | 扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
             f"活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
-            f"推文:0 | 本组:0 | {now}{unavailable_suffix}\n\n{empty_text}\n"
+            f"推文:0 | 本组:0 | {now}{status_suffix}\n\n{empty_text}\n"
         ]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
@@ -1066,8 +1332,8 @@ def build_telegram_reports(
             f"推文:{display_total} | 本组:{group_count} | {now}"
         )
         lines = [header]
-        if group_index == 1 and unavailable_line:
-            lines.append(unavailable_line)
+        if group_index == 1:
+            lines.extend(status_lines)
         for part in group:
             lines.extend(["", str(part.get("text") or "").strip()])
         reports.append("\n".join(lines).strip() + "\n")
@@ -1287,7 +1553,12 @@ def main() -> int:
     ap.add_argument("--no-send", action="store_true", help="do not send Telegram after a live scan")
     ap.add_argument("--no-translate", action="store_true")
     ap.add_argument("--translate-cache", action="store_true", help="translate missing English tweets in cache only")
-    ap.add_argument("--translate-limit", type=int, default=20, help="max cached tweets to translate after scan; 0 means no limit")
+    ap.add_argument(
+        "--translate-limit",
+        type=int,
+        default=20,
+        help="target translations per run; current scan is always completed even above it; 0 means no limit",
+    )
     ap.add_argument("--cache-recent", type=int, default=0, help="print recent tweets from local cache, no web scan")
     ap.add_argument("--telegram-chars", type=int, default=0, help="max chars per tweet in Telegram; 0 keeps full text")
     ap.add_argument("--telegram-per-kol", type=int, default=0, help="max tweets per KOL in Telegram; 0 means no limit")
@@ -1345,7 +1616,7 @@ def main() -> int:
         print(json.dumps({"cache": str(TWEET_STORE), **stats}, ensure_ascii=False))
         return 0
 
-    kols = parse_kols(KOLS_FILE)
+    kols = apply_handle_aliases(parse_kols(KOLS_FILE))
     if args.dry_run:
         print(json.dumps({"ok": True, "kols": len(kols), "sample": kols[:5]}, ensure_ascii=False, indent=2))
         return 0
@@ -1353,7 +1624,11 @@ def main() -> int:
         raise RuntimeError(f"no KOLs found: {KOLS_FILE}")
     if args.handles.strip():
         wanted = {"@" + x.strip().lstrip("@").lower() for x in args.handles.split(",") if x.strip()}
-        kols = [x for x in kols if x["handle"].lower() in wanted]
+        kols = [
+            x for x in kols
+            if x["handle"].lower() in wanted
+            or str(x.get("configured_handle") or "").lower() in wanted
+        ]
         if not kols:
             raise RuntimeError(f"no matching handles: {args.handles}")
     if args.max_kols > 0:
@@ -1371,6 +1646,7 @@ def main() -> int:
         scroll_wait_ms=args.scroll_wait_ms,
         search_fallback=args.search_fallback,
     )
+    update_kol_status(results)
     summary = scan_summary(results)
     print(json.dumps({"scan": summary}, ensure_ascii=False))
     for item in results:
@@ -1383,9 +1659,20 @@ def main() -> int:
     stamp = cn_now().strftime("%Y%m%d-%H%M%S")
     day = cn_now().strftime("%Y%m%d")
     store_stats = update_tweet_store(results, stamp)
-    translate_stats = {"translated": 0, "skipped": 0, "failed": 0}
+    translate_stats = {
+        "translated": 0,
+        "skipped": 0,
+        "failed": 0,
+        "priority_needed": 0,
+        "priority_pending": 0,
+    }
     if not args.no_translate:
-        translate_stats = translate_tweet_store(args.translate_limit)
+        current_tweet_ids = {
+            tweet_id(tw)
+            for item in results
+            for tw in item.get("tweets", [])
+        }
+        translate_stats = translate_tweet_store(args.translate_limit, current_tweet_ids)
         apply_store_translations(results)
     save_json(STATE_DIR / f"{day}.json", {"hours": args.hours, "store": store_stats, "results": results})
     report = build_report(results, args.hours)
