@@ -36,6 +36,7 @@ ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 MAX_PAGE_RECOVERIES = 2
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
+TRANSLATION_RETRIES = 1
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -811,6 +812,12 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
         except Exception as exc:
             row["translation_error"] = f"{type(exc).__name__}: {exc}"
             failed += 1
+            print(
+                f"[translation-error] id={row_id} handle={row.get('handle') or '?'} "
+                f"priority={row_id in priority_ids} type={type(exc).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
     store["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(TWEET_STORE, store)
     priority_pending = sum(
@@ -856,8 +863,18 @@ def translate_to_zh(text: str) -> str:
     })
     url = "https://translate.googleapis.com/translate_a/single?" + query
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    for attempt in range(TRANSLATION_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if attempt >= TRANSLATION_RETRIES or exc.code not in {429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            if attempt >= TRANSLATION_RETRIES:
+                raise
+        time.sleep(1)
     translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
     cache[key] = translated
     save_json(TRANSLATION_CACHE, cache)
