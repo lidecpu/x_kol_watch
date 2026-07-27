@@ -184,6 +184,10 @@ EXTRACT_JS = r"""
       .filter(Boolean)
       .join('\n');
     if (!text) continue;
+    const externalUrls = Array.from(art.querySelectorAll('a[href]'))
+      .map(a => a.href || '')
+      .filter(href => /^https?:\/\//i.test(href) &&
+        !/^https?:\/\/(?:[^/]+\.)?(?:x\.com|twitter\.com)\//i.test(href));
     const key = link || `${handle}:${datetime}:${text.slice(0, 80)}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -191,6 +195,7 @@ EXTRACT_JS = r"""
       handle,
       text,
       url: link,
+      external_urls: Array.from(new Set(externalUrls)),
       created_at: datetime,
       created_at_ms: ms
     });
@@ -745,6 +750,11 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
                 if existing_text == tweet_text
                 else ""
             )
+            external_urls = [
+                str(url).strip()
+                for url in tw.get("external_urls", [])
+                if str(url).strip().startswith(("http://", "https://"))
+            ]
             record = {
                 "id": tid,
                 "handle": item.get("handle", ""),
@@ -755,6 +765,7 @@ def update_tweet_store(results: list[dict[str, Any]], stamp: str) -> dict[str, A
                 "text": tweet_text,
                 "translation_zh": tw.get("translation_zh") or existing_translation,
                 "url": tw.get("url", ""),
+                "external_urls": external_urls or list((existing or {}).get("external_urls") or []),
                 "last_seen_at": now,
                 "last_run": stamp,
             }
@@ -849,8 +860,9 @@ def apply_store_translations(results: list[dict[str, Any]]) -> None:
 def translate_to_zh(text: str) -> str:
     cache = load_json(TRANSLATION_CACHE, {}, strict=True)
     source = normalize_translation_source(text).strip()
+    translation_source = URL_RE.sub("", source).strip()
     source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
-    cache_source = source if source_language == "auto" else f"{source_language}\0{source}"
+    cache_source = translation_source if source_language == "auto" else f"{source_language}\0{translation_source}"
     key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
     if key in cache:
         return str(cache[key])
@@ -859,7 +871,7 @@ def translate_to_zh(text: str) -> str:
         "sl": source_language,
         "tl": "zh-CN",
         "dt": "t",
-        "q": source[:4500],
+        "q": translation_source[:4500],
     })
     url = "https://translate.googleapis.com/translate_a/single?" + query
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -893,7 +905,7 @@ def fmt_time(value: str) -> str:
 
 
 URL_RE = re.compile(
-    r"https?://\s*\S+|www\.\S+|\b(?:x\.com|twitter\.com)/\S+",
+    r"https?://\s*\S+|www\.\S+|(?<![A-Za-z0-9@])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/\S+",
     re.IGNORECASE,
 )
 
@@ -912,6 +924,7 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r"地址[:：]\s*\S+(?:\s*…)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\bs/\d+\S*(?:\s*…)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(?:y|ss|dress|ost|announcement/detail|proposal)/\S+(?:\s*…)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<![A-Za-z0-9])(?:[A-Za-z0-9._~-]+/)+[A-Za-z0-9._~-]+\.(?:html?|php)(?:\?\S*)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\S+\?(?:activeTab|_dp|utm_|ref=)\S*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"感谢\s+@\w+\s+作为.*?赞助商。?", "", text)
     text = re.sub(r"\b0x[0-9a-f]{10,}(?:[.#/][\w.-]+)?(?:\s*…|\s*\.\.\.)?", "", text, flags=re.IGNORECASE)
@@ -922,6 +935,24 @@ def clean_report_text(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def tweet_link_lines(tweet: dict[str, Any]) -> list[str]:
+    stored_urls = tweet.get("external_urls")
+    candidates = list(stored_urls) if isinstance(stored_urls, list) else []
+    candidates.extend(re.findall(r"https?://\S+|www\.\S+", str(tweet.get("text") or ""), re.IGNORECASE))
+    urls: list[str] = []
+    for raw in candidates:
+        url = str(raw).strip().rstrip(".,!?;:，。！？；：)]}）】")
+        if url.lower().startswith("www."):
+            url = "https://" + url
+        if url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    lines = [f"链接：{url}" for url in urls]
+    original_url = str(tweet.get("url") or "").strip()
+    if original_url and original_url not in urls:
+        lines.append(f"原推：{original_url}")
+    return lines
 
 
 def trim_text(text: str, limit: int) -> str:
@@ -978,6 +1009,7 @@ def build_report(results: list[dict[str, Any]], hours: int) -> str:
             lines.append("")
             lines.append(f"{index}. {when}")
             lines.append(body)
+            lines.extend(tweet_link_lines(tw))
         lines.append("")
     if total == 0:
         lines.append("最近 24 小时没有抓到可读推文。")
@@ -1203,7 +1235,7 @@ def telegram_section(number: int, row: dict[str, Any], tweet_chars: int, show_na
     if show_name and handle and handle not in author:
         author = f"{author} {handle}"
     title = f"{number}. {author} | {when}" if show_name else f"{number}. {when}"
-    return "\n".join([title, body])
+    return "\n".join([title, body, *tweet_link_lines(tw)])
 
 
 def telegram_kol_blocks(rows: list[dict[str, Any]], tweet_chars: int, style: str) -> list[dict[str, Any]]:
