@@ -946,13 +946,12 @@ def tweet_link_lines(tweet: dict[str, Any]) -> list[str]:
         url = str(raw).strip().rstrip(".,!?;:，。！？；：)]}）】")
         if url.lower().startswith("www."):
             url = "https://" + url
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if host in {"t.co", "www.t.co"}:
+            continue
         if url.startswith(("http://", "https://")) and url not in urls:
             urls.append(url)
-    lines = [f"链接：{url}" for url in urls]
-    original_url = str(tweet.get("url") or "").strip()
-    if original_url and original_url not in urls:
-        lines.append(f"原推：{original_url}")
-    return lines
+    return [f"链接：{url}" for url in urls]
 
 
 def trim_text(text: str, limit: int) -> str:
@@ -1277,12 +1276,10 @@ def block_text(title: str, sections: list[str], continued: bool = False) -> str:
     return "\n\n".join([f"## {title}{suffix}", *sections])
 
 
-def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[list[dict[str, Any]]]:
-    size_limit = max(600, limit - 180)
+def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int) -> list[list[dict[str, Any]]]:
     max_items = group_size if group_size > 0 else sum(int(block.get("count") or 0) for block in blocks)
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    current_len = 0
     current_count = 0
     for block in blocks:
         if not block.get("sections"):
@@ -1294,23 +1291,12 @@ def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int, limit: i
             if current_count >= max_items:
                 groups.append(current)
                 current = []
-                current_len = 0
                 current_count = 0
             room = max_items - current_count if max_items > 0 else len(sections) - sent
             take = min(room, len(sections) - sent)
             continued = sent > 0
             text = block_text(title, sections[sent:sent + take], continued=continued)
-            while take > 1 and current_len + len(text) + 2 > size_limit:
-                take -= 1
-                text = block_text(title, sections[sent:sent + take], continued=continued)
-            if current and current_len + len(text) + 2 > size_limit:
-                groups.append(current)
-                current = []
-                current_len = 0
-                current_count = 0
-                continue
             current.append({"text": text, "count": take})
-            current_len += len(text) + 2
             current_count += take
             sent += take
     if current:
