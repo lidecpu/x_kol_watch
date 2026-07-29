@@ -1443,14 +1443,20 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     chunks: list[str] = []
     remaining = text.strip()
     while len(remaining) > chunk_limit:
-        split_at = remaining.rfind("\n", 0, chunk_limit + 1)
-        if split_at < chunk_limit // 2:
-            split_at = chunk_limit
-            chunks.append(remaining[:split_at])
-            remaining = remaining[split_at:]
-        else:
-            chunks.append(remaining[:split_at])
-            remaining = remaining[split_at + 1:]
+        chunk_count = (len(remaining) + chunk_limit - 1) // chunk_limit
+        target = (len(remaining) + chunk_count - 1) // chunk_count
+        before = remaining.rfind("\n\n", 0, target + 1)
+        after = remaining.find("\n\n", target)
+        candidates = [pos for pos in (before, after) if target // 2 <= pos <= chunk_limit]
+        separator_len = 2
+        if not candidates:
+            before = remaining.rfind("\n", 0, target + 1)
+            after = remaining.find("\n", target)
+            candidates = [pos for pos in (before, after) if target // 2 <= pos <= chunk_limit]
+            separator_len = 1
+        split_at = min(candidates, key=lambda pos: abs(pos - target)) if candidates else target
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at + separator_len:] if candidates else remaining[split_at:]
     if remaining:
         chunks.append(remaining)
     return [chunk if index == 0 else continuation + chunk for index, chunk in enumerate(chunks)] or [text]
