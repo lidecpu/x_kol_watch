@@ -27,11 +27,11 @@ jobs:
           cache: pip
 
       - name: Restore tweet cache
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: |
             cache
-          key: x-kol-cache-${{ github.run_id }}
+          key: x-kol-cache-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             x-kol-cache-
 
@@ -123,6 +123,14 @@ jobs:
             scan_error_count="$(printf '%s\n' "$scan_errors" | grep -c .)"
             echo "::warning title=X KOL partial scan::$scan_error_count KOL scan(s) failed; see job summary"
           fi
+
+      - name: Save tweet cache
+        if: ${{ always() && hashFiles('cache/**') != '' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            cache
+          key: x-kol-cache-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload run diagnostics
         if: always()

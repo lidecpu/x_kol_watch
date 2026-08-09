@@ -37,6 +37,9 @@ MAX_PAGE_RECOVERIES = 2
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
+LEGACY_TRANSLATION_LIMIT = 4500
+TRANSLATION_VERSION = 2
+TRANSLATION_CHUNK_LIMIT = 4000
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -366,7 +369,7 @@ def scrape_all(
     search_fallback: bool,
 ) -> list[dict[str, Any]]:
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except Exception as exc:
         raise RuntimeError("missing playwright; run: python -m pip install playwright && python -m playwright install chromium") from exc
 
@@ -395,7 +398,6 @@ def scrape_all(
                 )
                 total_kols = len(kols)
                 durations: list[float] = []
-                page_recovery_attempts = 0
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
                     started = time.time()
@@ -408,6 +410,7 @@ def scrape_all(
                         "page_retries": 0,
                         "rename_checks": 0,
                     }
+                    page_recovery_attempts = 0
                     recreate_page = False
                     rename_attempted = False
                     while True:
@@ -460,7 +463,11 @@ def scrape_all(
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                            if str(exc) == PAGE_RENDER_ERROR and page_recovery_attempts < MAX_PAGE_RECOVERIES:
+                            recoverable_page_error = (
+                                str(exc) == PAGE_RENDER_ERROR
+                                or isinstance(exc, PlaywrightTimeoutError)
+                            )
+                            if recoverable_page_error and page_recovery_attempts < MAX_PAGE_RECOVERIES:
                                 page_recovery_attempts += 1
                                 diagnostics["page_retries"] += 1
                                 recreate_page = True
@@ -476,7 +483,6 @@ def scrape_all(
                         else:
                             status = "ok"
                             error = ""
-                            page_recovery_attempts = 0
                         break
                     elapsed = time.time() - started
                     durations.append(elapsed)
@@ -802,8 +808,7 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
         1
         for row in rows
         if str(row.get("id") or "") in priority_ids
-        and not row.get("translation_zh")
-        and is_mostly_english(str(row.get("text") or ""))
+        and translation_needed(row)
     )
     translated = 0
     skipped = 0
@@ -813,11 +818,12 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
         if limit > 0 and translated >= limit and row_id not in priority_ids:
             break
         text = str(row.get("text") or "")
-        if row.get("translation_zh") or not is_mostly_english(text):
+        if not translation_needed(row):
             skipped += 1
             continue
         try:
             row["translation_zh"] = translate_to_zh(text)
+            row["translation_version"] = TRANSLATION_VERSION
             row.pop("translation_error", None)
             translated += 1
         except Exception as exc:
@@ -835,8 +841,7 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
         1
         for row in rows
         if str(row.get("id") or "") in priority_ids
-        and not row.get("translation_zh")
-        and is_mostly_english(str(row.get("text") or ""))
+        and translation_needed(row)
     )
     return {
         "translated": translated,
@@ -855,23 +860,52 @@ def apply_store_translations(results: list[dict[str, Any]]) -> None:
             record = tweets.get(tweet_id(tw))
             if record and record.get("translation_zh"):
                 tw["translation_zh"] = record["translation_zh"]
+                if record.get("translation_version"):
+                    tw["translation_version"] = record["translation_version"]
 
 
-def translate_to_zh(text: str) -> str:
-    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
-    source = normalize_translation_source(text).strip()
-    translation_source = URL_RE.sub("", source).strip()
-    source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
-    cache_source = translation_source if source_language == "auto" else f"{source_language}\0{translation_source}"
-    key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
-    if key in cache:
-        return str(cache[key])
+def translation_needed(row: dict[str, Any]) -> bool:
+    text = str(row.get("text") or "")
+    if not is_mostly_english(text):
+        return False
+    if not row.get("translation_zh"):
+        return True
+    source = URL_RE.sub("", normalize_translation_source(text)).strip()
+    return (
+        len(source) > LEGACY_TRANSLATION_LIMIT
+        and int(row.get("translation_version") or 0) < TRANSLATION_VERSION
+    )
+
+
+def split_translation_source(text: str, limit: int = TRANSLATION_CHUNK_LIMIT) -> list[str]:
+    remaining = text.strip()
+    chunks: list[str] = []
+    while len(remaining) > limit:
+        window = remaining[:limit + 1]
+        candidates = [
+            match.end()
+            for match in re.finditer(r"\n{2,}|\n|(?<=[.!?。！？；;])\s+", window)
+            if limit // 2 <= match.end() <= limit
+        ]
+        split_at = max(candidates) if candidates else limit
+        chunk = remaining[:split_at].strip()
+        if not chunk:
+            chunk = remaining[:limit]
+            split_at = limit
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def translate_chunk_to_zh(text: str, source_language: str) -> str:
     query = urllib.parse.urlencode({
         "client": "gtx",
         "sl": source_language,
         "tl": "zh-CN",
         "dt": "t",
-        "q": translation_source[:4500],
+        "q": text,
     })
     url = "https://translate.googleapis.com/translate_a/single?" + query
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -887,7 +921,25 @@ def translate_to_zh(text: str) -> str:
             if attempt >= TRANSLATION_RETRIES:
                 raise
         time.sleep(1)
-    translated = "".join(part[0] for part in data[0] if part and part[0]).strip()
+    return "".join(part[0] for part in data[0] if part and part[0]).strip()
+
+
+def translate_to_zh(text: str) -> str:
+    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
+    source = normalize_translation_source(text).strip()
+    translation_source = URL_RE.sub("", source).strip()
+    if not translation_source:
+        return ""
+    source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
+    cache_source = f"v{TRANSLATION_VERSION}\0{source_language}\0{translation_source}"
+    key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
+    if key in cache:
+        return str(cache[key])
+    translated = "\n\n".join(
+        translated_chunk
+        for chunk in split_translation_source(translation_source)
+        if (translated_chunk := translate_chunk_to_zh(chunk, source_language))
+    )
     cache[key] = translated
     save_json(TRANSLATION_CACHE, cache)
     time.sleep(0.2)
@@ -1407,7 +1459,17 @@ def build_telegram_report(
 def cached_results(limit: int, hours: int, handles: str = "") -> list[dict[str, Any]]:
     store = load_json(TWEET_STORE, {"tweets": {}}, strict=True)
     wanted = {"@" + x.strip().lstrip("@").lower() for x in handles.split(",") if x.strip()}
-    allowed = wanted or {row["handle"].lower() for row in parse_kols(KOLS_FILE)}
+    aliases = store.get("handle_aliases", {})
+    if not isinstance(aliases, dict):
+        raise RuntimeError("invalid handle_aliases in tweets.json")
+    configured = wanted or {row["handle"].lower() for row in parse_kols(KOLS_FILE)}
+    allowed: set[str] = set()
+    for handle in configured:
+        canonical = canonical_handle(handle)
+        if not canonical:
+            continue
+        allowed.add(canonical.lower())
+        allowed.add(resolve_handle_alias(canonical, aliases).lower())
     cutoff_ms = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000)
     rows = sorted(store.get("tweets", {}).values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
     rows_24h = []
@@ -1462,7 +1524,7 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return [chunk if index == 0 else continuation + chunk for index, chunk in enumerate(chunks)] or [text]
 
 
-def telegram_send(text: str) -> None:
+def telegram_send_chunk(chunk: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
@@ -1472,23 +1534,26 @@ def telegram_send(text: str) -> None:
     if chat_id.startswith("TELEGRAM_CHAT_ID="):
         raise RuntimeError("invalid TELEGRAM_CHAT_ID secret: put only the chat id value, not TELEGRAM_CHAT_ID=...")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    chunks = split_message(text)
-    for chunk in chunks:
-        payload = urllib.parse.urlencode({
-            "chat_id": chat_id,
-            "text": chunk,
-            "disable_web_page_preview": "true",
-        }).encode()
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"telegram HTTP {exc.code}: check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets; response={body}") from exc
-        data = json.loads(body)
-        if not data.get("ok"):
-            raise RuntimeError(f"telegram send failed: {body}")
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": chunk,
+        "disable_web_page_preview": "true",
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"telegram HTTP {exc.code}: check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets; response={body}") from exc
+    data = json.loads(body)
+    if not data.get("ok"):
+        raise RuntimeError(f"telegram send failed: {body}")
+
+
+def telegram_send(text: str) -> None:
+    for chunk in split_message(text):
+        telegram_send_chunk(chunk)
 
 
 def telegram_report_row_count(report: str) -> int:
@@ -1520,6 +1585,22 @@ def telegram_reports_fingerprint(reports: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def telegram_report_chunks(reports: list[str]) -> list[dict[str, Any]]:
+    physical: list[dict[str, Any]] = []
+    for group_index, report in enumerate(reports):
+        chunks = split_message(report)
+        rows = telegram_report_row_count(report)
+        for chunk_index, chunk in enumerate(chunks):
+            group_last = chunk_index + 1 == len(chunks)
+            physical.append({
+                "text": chunk,
+                "group_index": group_index,
+                "group_last": group_last,
+                "rows": rows if group_last else 0,
+            })
+    return physical
+
+
 def scheduled_send_key(args: argparse.Namespace) -> str:
     if os.environ.get("GITHUB_EVENT_NAME") not in {"schedule", "workflow_dispatch"}:
         return ""
@@ -1541,11 +1622,15 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
     fingerprint = telegram_reports_fingerprint(reports)
+    physical = telegram_report_chunks(reports)
+    total_chunks = len(physical)
     record = existing or {
         "created_at": cn_now().isoformat(timespec="seconds"),
         "fingerprint": fingerprint,
         "total_groups": len(reports),
+        "total_chunks": total_chunks,
         "completed_groups": 0,
+        "completed_chunks": 0,
         "rows": 0,
         "completed": False,
     }
@@ -1557,26 +1642,56 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
     completed_groups = int(record.get("completed_groups") or 0)
     if completed_groups < 0 or completed_groups > len(reports):
         raise RuntimeError("invalid Telegram send progress")
+    if "completed_chunks" in record:
+        completed_chunks = int(record.get("completed_chunks") or 0)
+    else:
+        completed_chunks = sum(len(split_message(report)) for report in reports[:completed_groups])
+        record["completed_chunks"] = completed_chunks
+    stored_total_chunks = record.get("total_chunks")
+    if stored_total_chunks is None:
+        stored_total_chunks = total_chunks
+        record["total_chunks"] = total_chunks
+    else:
+        stored_total_chunks = int(stored_total_chunks)
+        if stored_total_chunks != total_chunks:
+            if completed_chunks:
+                raise RuntimeError("scheduled report chunk layout changed after a partial send; refusing to resend")
+            record["total_chunks"] = total_chunks
+    if completed_chunks < 0 or completed_chunks > total_chunks:
+        raise RuntimeError("invalid Telegram chunk progress")
+    derived_completed_groups = sum(
+        1 for item in physical[:completed_chunks] if item["group_last"]
+    )
+    if derived_completed_groups != completed_groups:
+        raise RuntimeError("inconsistent Telegram group and chunk progress")
     sent[key] = record
-    state["version"] = 2
+    state["version"] = 3
     save_json(SENT_STATE, state)
 
     sent_groups = 0
     sent_rows = 0
-    for index in range(completed_groups, len(reports)):
-        report = reports[index]
-        telegram_send(report)
-        rows = telegram_report_row_count(report)
-        sent_groups += 1
-        sent_rows += rows
-        record["completed_groups"] = index + 1
-        record["rows"] = int(record.get("rows") or 0) + rows
+    resumed_chunks = completed_chunks
+    for index in range(completed_chunks, total_chunks):
+        item = physical[index]
+        telegram_send_chunk(str(item["text"]))
+        record["completed_chunks"] = index + 1
+        if item["group_last"]:
+            rows = int(item["rows"])
+            sent_groups += 1
+            sent_rows += rows
+            record["completed_groups"] = int(item["group_index"]) + 1
+            record["rows"] = int(record.get("rows") or 0) + rows
         record["updated_at"] = cn_now().isoformat(timespec="seconds")
-        record["completed"] = index + 1 == len(reports)
+        record["completed"] = index + 1 == total_chunks
         if record["completed"]:
             record["sent_at"] = record["updated_at"]
         save_json(SENT_STATE, state)
-    return {"groups": sent_groups, "rows": sent_rows, "resumed_from": completed_groups}
+    return {
+        "groups": sent_groups,
+        "rows": sent_rows,
+        "resumed_from": completed_groups,
+        "resumed_chunks": resumed_chunks,
+    }
 
 
 def main() -> int:
