@@ -76,7 +76,6 @@ class TelegramIPv4HTTPSHandler(urllib.request.HTTPSHandler):
             TelegramIPv4HTTPSConnection,
             req,
             context=self._context,
-            check_hostname=self._check_hostname,
         )
 
 
