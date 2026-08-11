@@ -30,6 +30,10 @@ TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
+TELEGRAM_SEND_RETRIES = 3
+TELEGRAM_RETRY_BASE_SECONDS = 2.0
+TELEGRAM_RETRY_MAX_SECONDS = 30.0
+TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
@@ -1524,6 +1528,24 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return [chunk if index == 0 else continuation + chunk for index, chunk in enumerate(chunks)] or [text]
 
 
+def telegram_retry_delay(attempt: int, body: str = "", headers: Any = None) -> float:
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    if retry_after is None:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = {}
+        parameters = payload.get("parameters")
+        if isinstance(parameters, dict):
+            retry_after = parameters.get("retry_after")
+    try:
+        if retry_after is not None:
+            return max(0.0, min(TELEGRAM_RETRY_MAX_SECONDS, float(retry_after)))
+    except (TypeError, ValueError):
+        pass
+    return min(TELEGRAM_RETRY_MAX_SECONDS, TELEGRAM_RETRY_BASE_SECONDS * (2 ** attempt))
+
+
 def telegram_send_chunk(chunk: str) -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -1540,12 +1562,34 @@ def telegram_send_chunk(chunk: str) -> None:
         "disable_web_page_preview": "true",
     }).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"telegram HTTP {exc.code}: check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets; response={body}") from exc
+    body = ""
+    for attempt in range(TELEGRAM_SEND_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code not in TELEGRAM_RETRYABLE_HTTP_CODES or attempt >= TELEGRAM_SEND_RETRIES:
+                hint = " check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets" if exc.code in {400, 401, 403} else ""
+                raise RuntimeError(f"telegram HTTP {exc.code}:{hint} response={body}") from exc
+            delay = telegram_retry_delay(attempt, body, exc.headers)
+            print(
+                f"[telegram-retry] HTTP {exc.code} attempt={attempt + 1}/{TELEGRAM_SEND_RETRIES} delay={delay:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt >= TELEGRAM_SEND_RETRIES:
+                raise RuntimeError(f"telegram network error after {TELEGRAM_SEND_RETRIES + 1} attempts: {exc}") from exc
+            delay = telegram_retry_delay(attempt)
+            print(
+                f"[telegram-retry] network error attempt={attempt + 1}/{TELEGRAM_SEND_RETRIES} delay={delay:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
     data = json.loads(body)
     if not data.get("ok"):
         raise RuntimeError(f"telegram send failed: {body}")
