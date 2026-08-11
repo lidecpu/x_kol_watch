@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
+import socket
 import sys
 import time
 import unicodedata
@@ -33,7 +35,7 @@ TELEGRAM_MESSAGE_LIMIT = 3900
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
 TELEGRAM_RETRY_MAX_SECONDS = 30.0
-TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({429})
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
@@ -45,6 +47,40 @@ LEGACY_TRANSLATION_LIMIT = 4500
 TRANSLATION_VERSION = 2
 TRANSLATION_CHUNK_LIMIT = 4000
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
+
+
+class TelegramIPv4HTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        if self._tunnel_host:
+            return super().connect()
+        addresses = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM)
+        last_error: OSError | None = None
+        for _, _, _, _, sockaddr in addresses:
+            sock = None
+            try:
+                sock = socket.create_connection(sockaddr, self.timeout, source_address=self.source_address)
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                return
+            except OSError as exc:
+                last_error = exc
+                if sock is not None:
+                    sock.close()
+        if last_error is not None:
+            raise last_error
+        raise OSError(f"no IPv4 address for {self.host}")
+
+
+class TelegramIPv4HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            TelegramIPv4HTTPSConnection,
+            req,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
+TELEGRAM_OPENER = urllib.request.build_opener(TelegramIPv4HTTPSHandler())
 
 
 def cn_now() -> dt.datetime:
@@ -1565,14 +1601,15 @@ def telegram_send_chunk(chunk: str) -> None:
     body = ""
     for attempt in range(TELEGRAM_SEND_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with TELEGRAM_OPENER.open(req, timeout=30) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
             break
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             if exc.code not in TELEGRAM_RETRYABLE_HTTP_CODES or attempt >= TELEGRAM_SEND_RETRIES:
                 hint = " check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets" if exc.code in {400, 401, 403} else ""
-                raise RuntimeError(f"telegram HTTP {exc.code}:{hint} response={body}") from exc
+                uncertainty = " send result is uncertain; not retrying" if exc.code in {408, 425, 500, 502, 503, 504} else ""
+                raise RuntimeError(f"telegram HTTP {exc.code}:{hint}{uncertainty} response={body}") from exc
             delay = telegram_retry_delay(attempt, body, exc.headers)
             print(
                 f"[telegram-retry] HTTP {exc.code} attempt={attempt + 1}/{TELEGRAM_SEND_RETRIES} delay={delay:.1f}s",
@@ -1581,15 +1618,7 @@ def telegram_send_chunk(chunk: str) -> None:
             )
             time.sleep(delay)
         except (urllib.error.URLError, TimeoutError) as exc:
-            if attempt >= TELEGRAM_SEND_RETRIES:
-                raise RuntimeError(f"telegram network error after {TELEGRAM_SEND_RETRIES + 1} attempts: {exc}") from exc
-            delay = telegram_retry_delay(attempt)
-            print(
-                f"[telegram-retry] network error attempt={attempt + 1}/{TELEGRAM_SEND_RETRIES} delay={delay:.1f}s",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(delay)
+            raise RuntimeError(f"telegram network error; send result is uncertain; not retrying: {exc}") from exc
     data = json.loads(body)
     if not data.get("ok"):
         raise RuntimeError(f"telegram send failed: {body}")
