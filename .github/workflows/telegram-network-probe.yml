@@ -1,0 +1,61 @@
+name: Telegram Network Probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: none
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe Telegram API network
+        shell: bash
+        run: |
+          set +e
+          echo "runner=$(uname -a)"
+          echo "timestamp=$(date -u --iso-8601=seconds)"
+          echo "=== getent ahosts ==="
+          getent ahosts api.telegram.org
+          echo "getent_exit=$?"
+          echo "=== getent ahostsv4 ==="
+          getent ahostsv4 api.telegram.org
+          echo "getent_v4_exit=$?"
+          echo "=== getent ahostsv6 ==="
+          getent ahostsv6 api.telegram.org
+          echo "getent_v6_exit=$?"
+
+          echo "=== Python TCP probe ==="
+          python3 - <<'PY'
+          import socket
+          import time
+
+          for family, label in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6")):
+              try:
+                  infos = socket.getaddrinfo("api.telegram.org", 443, family, socket.SOCK_STREAM)
+              except OSError as exc:
+                  print(f"{label} DNS error: {type(exc).__name__}: {exc}", flush=True)
+                  continue
+              seen = set()
+              for _, _, _, _, sockaddr in infos:
+                  key = (family, sockaddr[0])
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  started = time.monotonic()
+                  try:
+                      with socket.create_connection(sockaddr, timeout=10):
+                          elapsed = time.monotonic() - started
+                          print(f"{label} TCP 443 {sockaddr[0]} connected {elapsed:.2f}s", flush=True)
+                  except OSError as exc:
+                      elapsed = time.monotonic() - started
+                      print(f"{label} TCP 443 {sockaddr[0]} failed {elapsed:.2f}s {type(exc).__name__}: {exc}", flush=True)
+          PY
+          echo "=== HTTPS IPv4 ==="
+          curl -4 -sS -D - -o /dev/null --connect-timeout 10 --max-time 20 https://api.telegram.org
+          echo "curl_v4_exit=$?"
+          echo "=== HTTPS IPv6 ==="
+          curl -6 -sS -D - -o /dev/null --connect-timeout 10 --max-time 20 https://api.telegram.org
+          echo "curl_v6_exit=$?"
