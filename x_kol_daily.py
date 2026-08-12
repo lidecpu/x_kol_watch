@@ -34,15 +34,13 @@ TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 MARKET_STATE = CACHE_DIR / "market.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
+TELEGRAM_SECTION_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
 TELEGRAM_RETRY_MAX_SECONDS = 30.0
 TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({429})
 STABLECOIN_API_URL = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
-COINGECKO_MARKETS_URL = (
-    "https://api.coingecko.com/api/v3/coins/markets"
-    "?vs_currency=usd&ids=tether%2Cusd-coin"
-)
+ETHEREUM_STAKING_URL = "https://ethereum.org/zh/staking/"
 COINGECKO_MARKET_CHART_URL = (
     "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     "?vs_currency=usd&days=2"
@@ -54,6 +52,10 @@ DEFILLAMA_DEX_VOLUME_URL = (
     "?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true"
 )
 STABLECOIN_TIMEOUT_SECONDS = 15
+MARKET_HTTP_RETRIES = 2
+MARKET_RETRY_BASE_SECONDS = 2.0
+MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
+MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
@@ -110,8 +112,30 @@ def fetch_market_json(url: str) -> Any:
         url,
         headers={"Accept": "application/json", "User-Agent": "x-kol-watch"},
     )
-    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-        return json.load(response)
+    for attempt in range(MARKET_HTTP_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt >= MARKET_HTTP_RETRIES:
+                raise
+            retry_after = None
+            if exc.headers is not None:
+                raw_retry_after = exc.headers.get("Retry-After")
+                try:
+                    retry_after = float(raw_retry_after)
+                except (TypeError, ValueError):
+                    retry_after = None
+            delay = max(
+                retry_after or 0.0,
+                MARKET_RETRY_BASE_SECONDS * (2**attempt),
+            )
+            print(
+                f"[market-rate-limit] retry {attempt + 1}/{MARKET_HTTP_RETRIES} "
+                f"after {delay:.1f}s: {urllib.parse.urlsplit(url).netloc}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def fetch_stablecoin_supply() -> dict[str, dict[str, float]]:
@@ -127,23 +151,62 @@ def fetch_stablecoin_supply() -> dict[str, dict[str, float]]:
         asset = by_symbol.get(symbol, {})
         current = float(asset.get("circulating", {}).get("peggedUSD"))
         previous = float(asset.get("circulatingPrevDay", {}).get("peggedUSD"))
-        result[symbol] = {"current": current, "delta": current - previous}
+        chain_deltas: dict[str, float] = {}
+        chain_circulating = asset.get("chainCirculating", {})
+        if isinstance(chain_circulating, dict):
+            for chain, item in chain_circulating.items():
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    chain_current = float(item.get("current", {}).get("peggedUSD"))
+                    chain_previous = float(item.get("circulatingPrevDay", {}).get("peggedUSD"))
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if math.isfinite(chain_current) and math.isfinite(chain_previous):
+                    chain_deltas[str(chain)] = chain_current - chain_previous
+        result[symbol] = {
+            "current": current,
+            "delta": current - previous,
+            "chain_deltas": chain_deltas,
+        }
     return result
 
 
+def fetch_eth_staking_metrics() -> dict[str, float]:
+    request = urllib.request.Request(
+        ETHEREUM_STAKING_URL,
+        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        page = response.read().decode("utf-8", "replace")
+
+    def metric_value(label: str) -> str:
+        pattern = (
+            r"<code\b[^>]*>\s*([^<]+?)\s*</code>"
+            r"\s*<div\b[^>]*>(?:(?!<code\b)[\s\S])*?"
+            + re.escape(label)
+        )
+        match = re.search(pattern, page, re.IGNORECASE)
+        if not match:
+            raise ValueError(f"missing Ethereum staking metric: {label}")
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+
+    try:
+        total = float(metric_value("质押的 ETH 总量").replace(",", ""))
+        percent = float(metric_value("已质押的 ETH 百分比").rstrip("%"))
+        apr = float(metric_value("当前 APR").rstrip("%"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Ethereum staking metrics") from exc
+    if not all(math.isfinite(value) for value in (total, percent, apr)):
+        raise ValueError("non-finite Ethereum staking metrics")
+    if total <= 0 or not 0 <= percent <= 100 or apr < 0:
+        raise ValueError("out-of-range Ethereum staking metrics")
+    return {"total": total, "percent": percent, "apr": apr}
+
+
 def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
-    markets = fetch_market_json(COINGECKO_MARKETS_URL)
-    if not isinstance(markets, list):
-        raise ValueError("invalid CoinGecko markets response")
     result: dict[str, dict[str, float]] = {}
-    for coin in markets:
-        if not isinstance(coin, dict):
-            continue
-        symbol = str(coin.get("symbol") or "").upper()
-        coin_id = str(coin.get("id") or "")
-        if symbol not in {"USDT", "USDC"} or not coin_id:
-            continue
-        current = float(coin.get("total_volume"))
+    for symbol, coin_id in (("USDT", "tether"), ("USDC", "usd-coin")):
         history = fetch_market_json(COINGECKO_MARKET_CHART_URL.format(coin_id=coin_id))
         points = history.get("total_volumes", [])
         valid_points = [
@@ -154,6 +217,7 @@ def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
         if not valid_points:
             raise ValueError(f"missing CoinGecko volume history for {symbol}")
         latest_ms = max(point[0] for point in valid_points)
+        current = max(valid_points, key=lambda point: point[0])[1]
         target_ms = latest_ms - 24 * 60 * 60 * 1000
         previous = min(valid_points, key=lambda point: abs(point[0] - target_ms))[1]
         delta = current - previous
@@ -252,23 +316,140 @@ def save_derivatives_snapshot(day: str, value: float) -> None:
     save_json(MARKET_STATE, state)
 
 
+def previous_eth_staking_total(day: str) -> float | None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    snapshots = state.get("snapshots", {}) if isinstance(state, dict) else {}
+    if not isinstance(snapshots, dict):
+        return None
+    previous = snapshots.get(day)
+    if not isinstance(previous, dict):
+        return None
+    try:
+        value = float(previous.get("eth_staking_total"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def save_eth_staking_snapshot(day: str, metrics: dict[str, float]) -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    snapshots = state.get("snapshots")
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+    snapshots.setdefault(day, {})
+    if not isinstance(snapshots[day], dict):
+        snapshots[day] = {}
+    snapshots[day]["eth_staking_total"] = metrics["total"]
+    snapshots[day]["eth_staking_percent"] = metrics["percent"]
+    snapshots[day]["eth_staking_apr"] = metrics["apr"]
+    snapshots[day]["captured_at"] = cn_now().isoformat(timespec="seconds")
+    keep = sorted(snapshots)[-MARKET_SNAPSHOT_RETENTION_DAYS:]
+    state["version"] = 1
+    state["snapshots"] = {key: snapshots[key] for key in keep}
+    save_json(MARKET_STATE, state)
+
+
+def load_market_summary_cache() -> tuple[str, dt.datetime | None, dt.datetime | None]:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    cache = state.get("summary_cache", {}) if isinstance(state, dict) else {}
+    if not isinstance(cache, dict):
+        return "", None, None
+    summary = str(cache.get("summary") or "").strip()
+    captured_at = cache.get("captured_at")
+    failed_at = cache.get("failed_at")
+
+    def parse_timestamp(value: Any) -> dt.datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=CN_TZ)
+
+    captured = parse_timestamp(captured_at)
+    failed = parse_timestamp(failed_at)
+    if not summary:
+        return "", captured, failed
+    return summary, captured, failed
+
+
+def save_market_summary_cache(summary: str) -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    state["version"] = 1
+    state["summary_cache"] = {
+        "summary": summary,
+        "captured_at": cn_now().isoformat(timespec="seconds"),
+    }
+    save_json(MARKET_STATE, state)
+
+
+def save_market_summary_failure() -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    cache = state.get("summary_cache")
+    if not isinstance(cache, dict):
+        cache = {}
+    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
+    state["version"] = 1
+    state["summary_cache"] = cache
+    save_json(MARKET_STATE, state)
+
+
+def compact_percent(value: float) -> str:
+    return f"{value:.2f}".rstrip("0").rstrip(".") + "%"
+
+
 def signed_yi(value: float) -> str:
     return f"{'+' if value >= 0 else ''}{value / 1e8:.2f}亿"
 
 
+def chain_delta_text(delta: float, net: bool = False) -> str:
+    if delta > 0:
+        action = "净增发" if net else "增发"
+    elif delta < 0:
+        action = "净销毁" if net else "销毁"
+    else:
+        action = "无变化"
+    return f"{action} {signed_yi(delta)}"
+
+
 def fetch_stablecoin_summary() -> str:
+    cached_summary, cached_at, failed_at = load_market_summary_cache()
+    now = cn_now()
+    if cached_at is not None:
+        cache_age = (now - cached_at).total_seconds()
+        if 0 <= cache_age < MARKET_SUMMARY_CACHE_TTL_SECONDS:
+            return cached_summary
+    if failed_at is not None:
+        failure_age = (now - failed_at).total_seconds()
+        if 0 <= failure_age < MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS:
+            print("[market-cache] refresh cooldown active", file=sys.stderr)
+            return cached_summary
+
     dex_volume: dict[str, float] = {}
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
+    eth_staking: dict[str, float] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
+    derivatives_snapshot: float | None = None
+    eth_staking_snapshot: dict[str, float] | None = None
+    market_fetch_failed = False
     try:
         dex_volume = fetch_dex_volume()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
         print(f"[dex-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         global_volume = fetch_global_volume()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
         print(f"[global-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         current = fetch_derivatives_volume()
@@ -279,27 +460,56 @@ def fetch_stablecoin_summary() -> str:
             delta = current - previous
             derivatives_volume["delta"] = delta
             derivatives_volume["percent"] = delta / previous * 100 if previous else 0.0
-        save_derivatives_snapshot(cn_now().date().isoformat(), current)
+        derivatives_snapshot = current
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
         print(f"[derivatives-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        current = fetch_eth_staking_metrics()
+        previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
+        previous = previous_eth_staking_total(previous_day)
+        eth_staking = dict(current)
+        if previous is not None:
+            eth_staking["delta"] = current["total"] - previous
+        eth_staking_snapshot = current
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
+        print(f"[eth-staking-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         supply = fetch_stablecoin_supply()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
         print(f"[stablecoin-supply-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         volumes = fetch_stablecoin_volumes()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
         print(f"[stablecoin-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    parts: list[str] = []
+    if market_fetch_failed:
+        save_market_summary_failure()
+        if cached_summary:
+            print("[market-cache] using last complete snapshot", file=sys.stderr)
+            return cached_summary
+        print("[market-cache] no complete snapshot available", file=sys.stderr)
+        return ""
+
+    today = cn_now().date().isoformat()
+    if derivatives_snapshot is not None:
+        save_derivatives_snapshot(today, derivatives_snapshot)
+    if eth_staking_snapshot is not None:
+        save_eth_staking_snapshot(today, eth_staking_snapshot)
+
+    market_lines: list[str] = []
+    spot_lines: list[str] = []
     if global_volume:
-        parts.append(
-            f"全网现货24H成交（CEX+DEX）{global_volume['current'] / 1e8:.2f}亿"
+        spot_lines.append(
+            f"全网（CEX+DEX）24H成交{global_volume['current'] / 1e8:.2f}亿"
             f"（较昨日 {signed_yi(global_volume['delta'])}，{global_volume['percent']:+.2f}%）"
         )
     if dex_volume:
-        parts.append(
-            f"DEX现货24H成交{dex_volume['current'] / 1e8:.2f}亿"
+        spot_lines.append(
+            f"DEX 24H成交{dex_volume['current'] / 1e8:.2f}亿"
             f"（较昨日 {signed_yi(dex_volume['delta'])}，{dex_volume['percent']:+.2f}%）"
         )
     if global_volume and dex_volume:
@@ -307,12 +517,14 @@ def fetch_stablecoin_summary() -> str:
         cex_delta = global_volume["delta"] - dex_volume["delta"]
         cex_previous = cex_current - cex_delta
         if cex_current >= 0 and cex_previous > 0:
-            parts.append(
-                f"CEX现货24H成交（估算）{cex_current / 1e8:.2f}亿"
+            spot_lines.append(
+                f"CEX 24H成交（估算）{cex_current / 1e8:.2f}亿"
                 f"（较昨日 {signed_yi(cex_delta)}，{cex_delta / cex_previous * 100:+.2f}%）"
             )
+    if spot_lines:
+        market_lines.extend(["市场现货（亿美元）", *spot_lines])
     if derivatives_volume:
-        futures_text = f"全网合约24H成交{derivatives_volume['current'] / 1e8:.2f}亿"
+        futures_text = f"全网24H成交{derivatives_volume['current'] / 1e8:.2f}亿"
         if "delta" in derivatives_volume:
             futures_text += (
                 f"（较昨日 {signed_yi(derivatives_volume['delta'])}，"
@@ -320,21 +532,53 @@ def fetch_stablecoin_summary() -> str:
             )
         else:
             futures_text += "（昨日基准待积累）"
-        parts.append(futures_text)
+        market_lines.extend(["市场合约（亿美元）", futures_text])
+    if eth_staking:
+        staking_lines = [f"质押量 {eth_staking['total'] / 1e4:.2f}万枚"]
+        if "delta" in eth_staking:
+            staking_lines[0] += f"（较昨日 {eth_staking['delta'] / 1e4:+.2f}万枚）"
+        else:
+            staking_lines[0] += "（昨日基准待积累）"
+        staking_lines.extend([
+            f"已质押比例 {compact_percent(eth_staking['percent'])}",
+            f"当前 APR {compact_percent(eth_staking['apr'])}",
+        ])
+        market_lines.extend(["ETH 质押", *staking_lines])
+    stablecoin_lines: list[str] = []
+    stablecoin_sections: list[str] = []
     for symbol in ("USDT", "USDC"):
-        fields = [symbol]
+        fields: list[str] = []
         if symbol in supply:
             item = supply[symbol]
-            fields.append(f"流通{item['current'] / 1e8:.2f}亿（较昨日 {signed_yi(item['delta'])}）")
+            fields.append(f"流通量 {item['current'] / 1e8:.2f}亿（较昨日 {signed_yi(item['delta'])}）")
+            chain_deltas = item.get("chain_deltas", {})
+            if isinstance(chain_deltas, dict):
+                tracked_delta = 0.0
+                for label, chain in (("TRX链", "Tron"), ("ETH链", "Ethereum")):
+                    if chain not in chain_deltas:
+                        continue
+                    delta = float(chain_deltas[chain])
+                    tracked_delta += delta
+                    if delta != 0:
+                        fields.append(f"{label}{chain_delta_text(delta, net=True)}")
+                if chain_deltas:
+                    other_delta = float(item["delta"]) - tracked_delta
+                    if other_delta != 0:
+                        fields.append(f"其他链{chain_delta_text(other_delta, net=True)}")
         if symbol in volumes:
             item = volumes[symbol]
             fields.append(
-                f"全市场现货24H成交{item['current'] / 1e8:.2f}亿"
+                f"24H现货成交 {item['current'] / 1e8:.2f}亿"
                 f"（较昨日 {signed_yi(item['delta'])}，{item['percent']:+.2f}%）"
             )
-        if len(fields) > 1:
-            parts.append(" ".join(fields))
-    return "市场 | " + " | ".join(parts) if parts else ""
+        if fields:
+            stablecoin_sections.extend([symbol, *fields])
+    if stablecoin_sections:
+        stablecoin_lines.extend(["稳定币", *stablecoin_sections])
+    summary = "\n".join(market_lines + stablecoin_lines)
+    if summary:
+        save_market_summary_cache(summary)
+    return summary
 
 
 def load_dotenv(path: Path) -> None:
@@ -1682,16 +1926,40 @@ def build_telegram_reports(
     ]
     unavailable_line = f"不可用KOL:{'、'.join(unavailable_handles)}" if unavailable_handles else ""
     renamed_line = f"账号改名:{'、'.join(renamed_handles)}" if renamed_handles else ""
-    status_lines = [line for line in (renamed_line, unavailable_line) if line]
-    status_suffix = "".join(f"\n{line}" for line in status_lines)
+    page_issue_handles = [
+        str(item.get("handle") or "").strip()
+        for item in results
+        if item.get("status") == "error"
+        and str(item.get("error") or "").endswith(PAGE_RENDER_ERROR)
+    ]
+    scan_issue_handles = [
+        str(item.get("handle") or "").strip()
+        for item in results
+        if item.get("status") == "error"
+        and not str(item.get("error") or "").endswith((ACCOUNT_UNAVAILABLE_ERROR, PAGE_RENDER_ERROR))
+    ]
+    page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
+    scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
+    status_lines = [line for line in (renamed_line, unavailable_line, page_issue_line, scan_issue_line) if line]
+    status_header = " | ".join(status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
-        market_suffix = f"\n{stablecoin_summary}" if stablecoin_summary else ""
-        return [
-            f"X KOL {hours}H | 扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
-            f"活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
-            f"推文:0 | 本组:0 | {now}{market_suffix}{status_suffix}\n\n{empty_text}\n"
-        ]
+        mode_label = "重点" if mode == "focus" else "全量"
+        header = f"X KOL {hours}H {mode_label} | 组:1/1 | {now}"
+        stats_line = (
+            f"扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
+            f"{selected_kol_title} 0 | 推文 0 | 本组 0"
+        )
+        lines = [header, stats_line]
+        if status_header:
+            lines.append(f"状态 | {status_header}")
+        if stablecoin_summary:
+            lines.extend([
+                TELEGRAM_SECTION_SEPARATOR,
+                *stablecoin_summary.splitlines(),
+                TELEGRAM_SECTION_SEPARATOR,
+            ])
+        return ["\n".join(lines) + f"\n\n{empty_text}\n"]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
@@ -1704,18 +1972,23 @@ def build_telegram_reports(
     for group_index, group in enumerate(groups, 1):
         mode_label = "重点" if mode == "focus" else "全量"
         group_count = sum(int(part.get("count") or 0) for part in group)
-        header = (
-            f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | "
-            f"扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
-            f"活跃KOL:{active_kol_label} | {selected_kol_title}:{display_kol_count} | "
-            f"推文:{display_total} | 本组:{group_count} | {now}"
+        header = f"X KOL {hours}H {mode_label} | 组:{group_index}/{len(groups)} | {now}"
+        stats_line = (
+            f"扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
+            f"{selected_kol_title} {display_kol_count} | 推文 {display_total} | 本组 {group_count}"
         )
-        lines = [header]
+        lines = [header, stats_line]
         if group_index == 1:
+            if status_header:
+                lines.append(f"状态 | {status_header}")
             if stablecoin_summary:
-                lines.append(stablecoin_summary)
-            lines.extend(status_lines)
+                lines.extend([
+                    TELEGRAM_SECTION_SEPARATOR,
+                    *stablecoin_summary.splitlines(),
+                ])
         for part in group:
+            if group_index == 1 and stablecoin_summary and part is group[0]:
+                lines.extend([TELEGRAM_SECTION_SEPARATOR, "KOL 推文"])
             lines.extend(["", str(part.get("text") or "").strip()])
         reports.append("\n".join(lines).strip() + "\n")
     return reports
@@ -1886,11 +2159,11 @@ def telegram_send(text: str) -> None:
 
 
 def telegram_report_row_count(report: str) -> int:
-    header = report.partition("\n")[0]
-    match = re.search(r"(?:^| \| )本组:(\d+)(?: \| |$)", header)
-    if not match:
-        raise RuntimeError("Telegram report header is missing its row count")
-    return int(match.group(1))
+    for line in report.splitlines()[:3]:
+        match = re.search(r"(?:本组:|本组\s+)(\d+)", line)
+        if match:
+            return int(match.group(1))
+    raise RuntimeError("Telegram report header is missing its row count")
 
 
 def telegram_send_reports(reports: list[str]) -> dict[str, int]:
@@ -1902,23 +2175,63 @@ def telegram_send_reports(reports: list[str]) -> dict[str, int]:
 
 def telegram_report_timestamp_normalized(report: str) -> str:
     return re.sub(
-        r"(?m)^(X KOL [^\n]* \| )\d{2}-\d{2} \d{2}:\d{2}$",
+        r"(?m)^(X KOL [^\n]* \| )\d{2}-\d{2} \d{2}:\d{2}(?= \||$)",
         r"\1<generated-at>",
         report,
         count=1,
     )
 
 
+def telegram_report_is_summary_heading(line: str) -> bool:
+    return line.startswith((
+        "市场 | ",
+        "市场现货",
+        "市场合约",
+        "ETH 质押",
+        "稳定币",
+        "稳定币 | ",
+        "稳定币流通量 | ",
+        "口径：",
+    )) or line.strip() in {"USDT", "USDC"}
+
+
 def telegram_report_without_market_summary(report: str) -> str:
     lines = report.splitlines()
+    metadata_end = len(lines)
     for index in range(1, len(lines)):
-        line = lines[index]
+        if not lines[index].strip():
+            metadata_end = index
+            break
+    kept = lines[:1]
+    in_summary = False
+    for line in lines[1:metadata_end]:
+        if line == TELEGRAM_SECTION_SEPARATOR:
+            continue
+        if telegram_report_is_summary_heading(line):
+            in_summary = True
+            continue
+        if in_summary:
+            continue
+        kept.append(line)
+    kept.extend(lines[metadata_end:])
+    return "\n".join(kept)
+
+
+def telegram_report_summary_lines(report: str) -> list[str]:
+    lines = report.splitlines()
+    summary: list[str] = []
+    for line in lines[1:]:
         if not line.strip():
             break
-        if line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | ")):
-            del lines[index]
+        if line == "KOL 推文":
             break
-    return "\n".join(lines)
+        if line == TELEGRAM_SECTION_SEPARATOR:
+            continue
+        if telegram_report_is_summary_heading(line):
+            summary.append(line)
+        elif summary:
+            summary.append(line)
+    return summary
 
 
 def telegram_reports_fingerprint(reports: list[str]) -> str:
@@ -1933,17 +2246,108 @@ def telegram_reports_fingerprint(reports: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def telegram_reports_legacy_fingerprint(reports: list[str]) -> str:
-    normalized = [telegram_report_timestamp_normalized(report) for report in reports]
-    payload = "\n\0\n".join(normalized).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def telegram_report_legacy_summary_line(report: str) -> str:
+    summary = telegram_report_summary_lines(report)
+    if not summary:
+        return ""
+    if len(summary) == 1 and summary[0].startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | ")):
+        return summary[0]
+
+    sections: dict[str, list[str]] = {}
+    section = ""
+    for line in summary:
+        if telegram_report_is_summary_heading(line):
+            if line.startswith("市场现货"):
+                section = "市场现货"
+            elif line.startswith("市场合约"):
+                section = "市场合约"
+            elif line.startswith("口径："):
+                section = "口径"
+            else:
+                section = line.strip()
+            sections.setdefault(section, [])
+        elif section:
+            sections[section].append(line.strip())
+
+    parts: list[str] = []
+    replacements = (
+        ("全网（CEX+DEX）24H成交", "全网现货24H成交（CEX+DEX）"),
+        ("DEX 24H成交", "DEX现货24H成交"),
+        ("CEX 24H成交（估算）", "CEX现货24H成交（估算）"),
+        ("全网24H成交", "全网合约24H成交"),
+    )
+    for line in sections.get("市场现货", []):
+        for old, new in replacements[:3]:
+            line = line.replace(old, new)
+        parts.append(line)
+    for line in sections.get("市场合约", []):
+        parts.append(line.replace("全网24H成交", "全网合约24H成交"))
+    for symbol in ("USDT", "USDC"):
+        fields = []
+        for line in sections.get(symbol, []):
+            if not line.startswith(("流通量 ", "流通 ", "24H现货成交 ", "现货成交 ", "现货24H成交 ")):
+                continue
+            line = line.replace("流通量 ", "流通")
+            line = line.replace("流通 ", "流通")
+            line = line.replace("24H现货成交 ", "全市场现货24H成交")
+            line = line.replace("现货成交 ", "全市场现货24H成交")
+            line = line.replace("现货24H成交 ", "全市场现货24H成交")
+            fields.append(line)
+        if fields:
+            parts.append(f"{symbol} " + " ".join(fields))
+    return "市场 | " + " | ".join(parts) if parts else ""
+
+
+def telegram_legacy_report(report: str, include_summary: bool) -> str:
+    lines = report.splitlines()
+    metadata_end = next((index for index, line in enumerate(lines[1:], 1) if not line.strip()), len(lines))
+    header = lines[0] if lines else ""
+    stats_line = next((line for line in lines[1:metadata_end] if line.startswith("扫描 ")), "")
+    timestamp_match = re.search(r" \| (\d{2}-\d{2} \d{2}:\d{2})(?: \|.*)?$", header)
+    stats_match = re.match(
+        r"扫描 (\d+/\d+)（失败(\d+)） \| (活跃 (\d+/\d+)) \| "
+        r"((?:展示KOL|重点KOL)) (\d+) \| 推文 (\d+) \| 本组 (\d+)$",
+        stats_line,
+    )
+    if timestamp_match and stats_match:
+        header = (
+            f"{header[:timestamp_match.start()]} | 扫描KOL:{stats_match.group(1)} | "
+            f"扫描失败:{stats_match.group(2)} | 活跃KOL:{stats_match.group(4)} | "
+            f"{stats_match.group(5)}:{stats_match.group(6)} | 推文:{stats_match.group(7)} | "
+            f"本组:{stats_match.group(8)} | {timestamp_match.group(1)}"
+        )
+    summary = []
+    if include_summary:
+        legacy_summary = telegram_report_legacy_summary_line(report)
+        if legacy_summary:
+            summary = [legacy_summary]
+    statuses: list[str] = []
+    for line in lines[1:metadata_end]:
+        if line.startswith("状态 | "):
+            statuses.extend(
+                status
+                for status in line.removeprefix("状态 | ").split(" | ")
+                if status.startswith(("账号改名:", "不可用KOL:"))
+            )
+        elif line.startswith(("账号改名:", "不可用KOL:")):
+            statuses.append(line)
+    return "\n".join([header, *summary, *statuses, *lines[metadata_end:]]) + "\n"
+
+
+def telegram_reports_legacy_fingerprints(reports: list[str]) -> set[str]:
+    fingerprints: set[str] = set()
+    for include_summary in (True, False):
+        normalized = [telegram_report_timestamp_normalized(telegram_legacy_report(report, include_summary)) for report in reports]
+        payload = "\n\0\n".join(normalized).encode("utf-8")
+        fingerprints.add(hashlib.sha256(payload).hexdigest())
+    return fingerprints
 
 
 def stablecoin_summary_from_reports(reports: list[str]) -> str:
     for report in reports[:1]:
-        for line in report.splitlines():
-            if line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | ")):
-                return line
+        summary = telegram_report_summary_lines(report)
+        if summary:
+            return "\n".join(summary)
     return ""
 
 
@@ -1952,13 +2356,31 @@ def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
         return reports
     updated = list(reports)
     lines = updated[0].splitlines()
-    lines = [
-        line
-        for line in lines
-        if not line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | "))
-    ]
+    metadata_end = next((index for index, line in enumerate(lines[1:], 1) if not line.strip()), len(lines))
+    kept = [lines[0]]
+    in_summary = False
+    for line in lines[1:metadata_end]:
+        if line == TELEGRAM_SECTION_SEPARATOR:
+            continue
+        if telegram_report_is_summary_heading(line):
+            in_summary = True
+            continue
+        if in_summary:
+            continue
+        kept.append(line)
+    kept.extend(lines[metadata_end:])
+    lines = kept
     if summary:
-        lines.insert(1, summary)
+        insert_at = 1
+        while insert_at < len(lines) and lines[insert_at].startswith(("扫描 ", "状态 | ", "账号改名:", "不可用KOL:", "扫描异常:", "页面异常:")):
+            insert_at += 1
+        summary_lines = [line for line in summary.splitlines() if line != TELEGRAM_SECTION_SEPARATOR]
+        lines[insert_at:insert_at] = [
+            TELEGRAM_SECTION_SEPARATOR,
+            *summary_lines,
+            TELEGRAM_SECTION_SEPARATOR,
+            "KOL 推文",
+        ]
     updated[0] = "\n".join(lines).rstrip() + "\n"
     return updated
 
@@ -2003,7 +2425,7 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
         stored_summary = str(existing.get("stablecoin_summary") or "")
         reports = apply_stablecoin_summary(reports, stored_summary)
     fingerprint = telegram_reports_fingerprint(reports)
-    legacy_fingerprint = telegram_reports_legacy_fingerprint(reports)
+    legacy_fingerprints = telegram_reports_legacy_fingerprints(reports)
     physical = telegram_report_chunks(reports)
     total_chunks = len(physical)
     record = existing or {
@@ -2021,7 +2443,7 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
     if record.get("fingerprint") != fingerprint:
-        if record.get("fingerprint") == legacy_fingerprint:
+        if record.get("fingerprint") in legacy_fingerprints:
             record["fingerprint"] = fingerprint
         else:
             raise RuntimeError("scheduled report changed after a partial send; refusing to resend")
