@@ -36,6 +36,16 @@ TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
 TELEGRAM_RETRY_MAX_SECONDS = 30.0
 TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({429})
+STABLECOIN_API_URL = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
+COINGECKO_MARKETS_URL = (
+    "https://api.coingecko.com/api/v3/coins/markets"
+    "?vs_currency=usd&ids=tether%2Cusd-coin"
+)
+COINGECKO_MARKET_CHART_URL = (
+    "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    "?vs_currency=usd&days=2"
+)
+STABLECOIN_TIMEOUT_SECONDS = 15
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
@@ -84,6 +94,101 @@ TELEGRAM_OPENER = urllib.request.build_opener(TelegramIPv4HTTPSHandler())
 
 def cn_now() -> dt.datetime:
     return dt.datetime.now(CN_TZ)
+
+
+def fetch_market_json(url: str) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        return json.load(response)
+
+
+def fetch_stablecoin_supply() -> dict[str, dict[str, float]]:
+    payload = fetch_market_json(STABLECOIN_API_URL)
+    assets = payload.get("peggedAssets", [])
+    by_symbol = {
+        str(asset.get("symbol") or "").upper(): asset
+        for asset in assets
+        if isinstance(asset, dict)
+    }
+    result: dict[str, dict[str, float]] = {}
+    for symbol in ("USDT", "USDC"):
+        asset = by_symbol.get(symbol, {})
+        current = float(asset.get("circulating", {}).get("peggedUSD"))
+        previous = float(asset.get("circulatingPrevDay", {}).get("peggedUSD"))
+        result[symbol] = {"current": current, "delta": current - previous}
+    return result
+
+
+def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
+    markets = fetch_market_json(COINGECKO_MARKETS_URL)
+    if not isinstance(markets, list):
+        raise ValueError("invalid CoinGecko markets response")
+    result: dict[str, dict[str, float]] = {}
+    for coin in markets:
+        if not isinstance(coin, dict):
+            continue
+        symbol = str(coin.get("symbol") or "").upper()
+        coin_id = str(coin.get("id") or "")
+        if symbol not in {"USDT", "USDC"} or not coin_id:
+            continue
+        current = float(coin.get("total_volume"))
+        history = fetch_market_json(COINGECKO_MARKET_CHART_URL.format(coin_id=coin_id))
+        points = history.get("total_volumes", [])
+        valid_points = [
+            (float(point[0]), float(point[1]))
+            for point in points
+            if isinstance(point, list) and len(point) >= 2
+        ]
+        if not valid_points:
+            raise ValueError(f"missing CoinGecko volume history for {symbol}")
+        latest_ms = max(point[0] for point in valid_points)
+        target_ms = latest_ms - 24 * 60 * 60 * 1000
+        previous = min(valid_points, key=lambda point: abs(point[0] - target_ms))[1]
+        delta = current - previous
+        result[symbol] = {
+            "current": current,
+            "delta": delta,
+            "percent": delta / previous * 100 if previous else 0.0,
+        }
+    if set(result) != {"USDT", "USDC"}:
+        raise ValueError("missing USDT or USDC CoinGecko volume")
+    return result
+
+
+def signed_yi(value: float) -> str:
+    return f"{'+' if value >= 0 else ''}{value / 1e8:.2f}亿"
+
+
+def fetch_stablecoin_summary() -> str:
+    supply: dict[str, dict[str, float]] = {}
+    volumes: dict[str, dict[str, float]] = {}
+    try:
+        supply = fetch_stablecoin_supply()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[stablecoin-supply-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        volumes = fetch_stablecoin_volumes()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[stablecoin-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    parts: list[str] = []
+    for symbol in ("USDT", "USDC"):
+        fields = [symbol]
+        if symbol in supply:
+            item = supply[symbol]
+            fields.append(f"流通{item['current'] / 1e8:.2f}亿（较昨日 {signed_yi(item['delta'])}）")
+        if symbol in volumes:
+            item = volumes[symbol]
+            fields.append(
+                f"全市场现货24H成交{item['current'] / 1e8:.2f}亿"
+                f"（较昨日 {signed_yi(item['delta'])}，{item['percent']:+.2f}%）"
+            )
+        if len(fields) > 1:
+            parts.append(" ".join(fields))
+    return "稳定币 | " + " | ".join(parts) if parts else ""
 
 
 def load_dotenv(path: Path) -> None:
@@ -1406,6 +1511,7 @@ def build_telegram_reports(
     focus_limit: int = 0,
     focus_per_kol: int = DEFAULT_FOCUS_PER_KOL,
     include_low_signal: bool = False,
+    stablecoin_summary: str = "",
 ) -> list[str]:
     active = [x for x in results if x.get("tweets")]
     rows = telegram_rows(active, per_kol, include_low_signal)
@@ -1434,10 +1540,11 @@ def build_telegram_reports(
     status_suffix = "".join(f"\n{line}" for line in status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
+        market_suffix = f"\n{stablecoin_summary}" if stablecoin_summary else ""
         return [
             f"X KOL {hours}H | 扫描KOL:{scan_kol_label} | 扫描失败:{scan_error_count} | "
             f"活跃KOL:{active_kol_label} | {selected_kol_title}:0 | "
-            f"推文:0 | 本组:0 | {now}{status_suffix}\n\n{empty_text}\n"
+            f"推文:0 | 本组:0 | {now}{market_suffix}{status_suffix}\n\n{empty_text}\n"
         ]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
@@ -1459,6 +1566,8 @@ def build_telegram_reports(
         )
         lines = [header]
         if group_index == 1:
+            if stablecoin_summary:
+                lines.append(stablecoin_summary)
             lines.extend(status_lines)
         for part in group:
             lines.extend(["", str(part.get("text") or "").strip()])
@@ -1477,6 +1586,7 @@ def build_telegram_report(
     focus_limit: int = 0,
     focus_per_kol: int = DEFAULT_FOCUS_PER_KOL,
     include_low_signal: bool = False,
+    stablecoin_summary: str = "",
 ) -> str:
     return "\n---\n\n".join(
         report.strip()
@@ -1491,6 +1601,7 @@ def build_telegram_report(
             focus_limit,
             focus_per_kol,
             include_low_signal,
+            stablecoin_summary,
         )
     ) + "\n"
 
@@ -1657,6 +1768,30 @@ def telegram_reports_fingerprint(reports: list[str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def stablecoin_summary_from_reports(reports: list[str]) -> str:
+    for report in reports[:1]:
+        for line in report.splitlines():
+            if line.startswith(("稳定币 | ", "稳定币流通量 | ")):
+                return line
+    return ""
+
+
+def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
+    if not reports:
+        return reports
+    updated = list(reports)
+    lines = updated[0].splitlines()
+    lines = [
+        line
+        for line in lines
+        if not line.startswith(("稳定币 | ", "稳定币流通量 | "))
+    ]
+    if summary:
+        lines.insert(1, summary)
+    updated[0] = "\n".join(lines).rstrip() + "\n"
+    return updated
+
+
 def telegram_report_chunks(reports: list[str]) -> list[dict[str, Any]]:
     physical: list[dict[str, Any]] = []
     for group_index, report in enumerate(reports):
@@ -1693,6 +1828,8 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
     if existing and "completed_groups" not in existing:
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
+    if existing and "stablecoin_summary" in existing:
+        reports = apply_stablecoin_summary(reports, str(existing.get("stablecoin_summary") or ""))
     fingerprint = telegram_reports_fingerprint(reports)
     physical = telegram_report_chunks(reports)
     total_chunks = len(physical)
@@ -1705,6 +1842,7 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
         "completed_chunks": 0,
         "rows": 0,
         "completed": False,
+        "stablecoin_summary": stablecoin_summary_from_reports(reports),
     }
     if record.get("completed"):
         print(f"scheduled send skipped: already sent key={key}")
@@ -1804,6 +1942,7 @@ def main() -> int:
     load_dotenv(ROOT / ".env")
     if args.cache_recent > 0:
         results = cached_results(args.cache_recent, args.hours, args.handles)
+        stablecoin_summary = fetch_stablecoin_summary() if args.telegram_preview or (args.send and not args.no_send) else ""
         if args.telegram_preview:
             report = build_telegram_report(
                 results,
@@ -1816,6 +1955,7 @@ def main() -> int:
                 args.telegram_focus_limit,
                 args.telegram_focus_per_kol,
                 args.include_low_signal,
+                stablecoin_summary,
             )
             print(report)
         elif args.send:
@@ -1835,6 +1975,7 @@ def main() -> int:
                 args.telegram_focus_limit,
                 args.telegram_focus_per_kol,
                 args.include_low_signal,
+                stablecoin_summary,
             )
             stats = telegram_send_reports_once(reports, args)
             print(f"sent groups={stats['groups']} rows={stats['rows']}")
@@ -1910,6 +2051,7 @@ def main() -> int:
     print(str(report_path))
     print(json.dumps({"store": store_stats, "translate": translate_stats}, ensure_ascii=False))
     if args.send or live_scan_send:
+        stablecoin_summary = fetch_stablecoin_summary()
         reports = build_telegram_reports(
             results,
             args.hours,
@@ -1921,6 +2063,7 @@ def main() -> int:
             args.telegram_focus_limit,
             args.telegram_focus_per_kol,
             args.include_low_signal,
+            stablecoin_summary,
         )
         stats = telegram_send_reports_once(reports, args)
         print(f"sent groups={stats['groups']} rows={stats['rows']}")

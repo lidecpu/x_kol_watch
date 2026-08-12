@@ -10,6 +10,7 @@
 - 支持在 GitHub Actions 页面手动运行
 - 英文推文自动翻译成中文
 - Telegram 按 KOL 分组发送，长内容自动拆分
+- Telegram 首组显示 USDT、USDC 流通量和全市场现货 24H 成交额及较昨日变化；流通量来自 DefiLlama，成交额来自 CoinGecko
 - 定时任务同一天同模式只发送一次，避免重复发 Telegram
 - 过滤广告、抽奖、短回复、URL 残片、长钱包地址和单独币种词
 
