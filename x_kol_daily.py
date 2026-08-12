@@ -1900,16 +1900,41 @@ def telegram_send_reports(reports: list[str]) -> dict[str, int]:
     return {"groups": len(reports), "rows": rows}
 
 
+def telegram_report_timestamp_normalized(report: str) -> str:
+    return re.sub(
+        r"(?m)^(X KOL [^\n]* \| )\d{2}-\d{2} \d{2}:\d{2}$",
+        r"\1<generated-at>",
+        report,
+        count=1,
+    )
+
+
+def telegram_report_without_market_summary(report: str) -> str:
+    lines = report.splitlines()
+    for index in range(1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            break
+        if line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | ")):
+            del lines[index]
+            break
+    return "\n".join(lines)
+
+
 def telegram_reports_fingerprint(reports: list[str]) -> str:
-    normalized = [
-        re.sub(
-            r"(?m)^(X KOL [^\n]* \| )\d{2}-\d{2} \d{2}:\d{2}$",
-            r"\1<generated-at>",
-            report,
-            count=1,
-        )
-        for report in reports
-    ]
+    normalized: list[str] = []
+    for report in reports:
+        report = telegram_report_timestamp_normalized(report)
+        # Market data is refreshed on every run and must not invalidate a
+        # Telegram resume record created before or after that refresh.
+        report = telegram_report_without_market_summary(report)
+        normalized.append(report + "\n")
+    payload = "\n\0\n".join(normalized).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def telegram_reports_legacy_fingerprint(reports: list[str]) -> str:
+    normalized = [telegram_report_timestamp_normalized(report) for report in reports]
     payload = "\n\0\n".join(normalized).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
@@ -1974,9 +1999,11 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
     if existing and "completed_groups" not in existing:
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
-    if existing and "stablecoin_summary" in existing:
-        reports = apply_stablecoin_summary(reports, str(existing.get("stablecoin_summary") or ""))
+    if existing:
+        stored_summary = str(existing.get("stablecoin_summary") or "")
+        reports = apply_stablecoin_summary(reports, stored_summary)
     fingerprint = telegram_reports_fingerprint(reports)
+    legacy_fingerprint = telegram_reports_legacy_fingerprint(reports)
     physical = telegram_report_chunks(reports)
     total_chunks = len(physical)
     record = existing or {
@@ -1993,7 +2020,12 @@ def telegram_send_reports_once(reports: list[str], args: argparse.Namespace) -> 
     if record.get("completed"):
         print(f"scheduled send skipped: already sent key={key}")
         return {"groups": 0, "rows": 0, "skipped": 1}
-    if record.get("fingerprint") != fingerprint or int(record.get("total_groups") or 0) != len(reports):
+    if record.get("fingerprint") != fingerprint:
+        if record.get("fingerprint") == legacy_fingerprint:
+            record["fingerprint"] = fingerprint
+        else:
+            raise RuntimeError("scheduled report changed after a partial send; refusing to resend")
+    if int(record.get("total_groups") or 0) != len(reports):
         raise RuntimeError("scheduled report changed after a partial send; refusing to resend")
     completed_groups = int(record.get("completed_groups") or 0)
     if completed_groups < 0 or completed_groups > len(reports):
