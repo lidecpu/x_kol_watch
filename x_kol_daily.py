@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import socket
@@ -31,6 +32,7 @@ CACHE_DIR = ROOT / "cache"
 TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
+MARKET_STATE = CACHE_DIR / "market.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
@@ -45,7 +47,14 @@ COINGECKO_MARKET_CHART_URL = (
     "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     "?vs_currency=usd&days=2"
 )
+COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives"
+DEFILLAMA_DEX_VOLUME_URL = (
+    "https://api.llama.fi/overview/dexs"
+    "?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true"
+)
 STABLECOIN_TIMEOUT_SECONDS = 15
+MARKET_SNAPSHOT_RETENTION_DAYS = 8
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
@@ -158,13 +167,121 @@ def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
     return result
 
 
+def fetch_global_volume() -> dict[str, float]:
+    payload = fetch_market_json(COINGECKO_GLOBAL_URL)
+    data = payload.get("data", {})
+    current = float(data.get("total_volume", {}).get("usd"))
+    percent = float(data.get("volume_change_percentage_24h_usd"))
+    divisor = 1 + percent / 100
+    if divisor <= 0:
+        raise ValueError("invalid CoinGecko global volume change")
+    previous = current / divisor
+    return {
+        "current": current,
+        "delta": current - previous,
+        "percent": percent,
+    }
+
+
+def fetch_derivatives_volume() -> float:
+    payload = fetch_market_json(COINGECKO_DERIVATIVES_URL)
+    if not isinstance(payload, list):
+        raise ValueError("invalid CoinGecko derivatives response")
+    total = 0.0
+    valid = 0
+    for market in payload:
+        if not isinstance(market, dict):
+            continue
+        try:
+            volume = float(market.get("volume_24h"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(volume) or volume < 0:
+            continue
+        total += volume
+        valid += 1
+    if not valid:
+        raise ValueError("missing CoinGecko derivatives volume")
+    return total
+
+
+def fetch_dex_volume() -> dict[str, float]:
+    payload = fetch_market_json(DEFILLAMA_DEX_VOLUME_URL)
+    current = float(payload.get("total24h"))
+    previous = float(payload.get("total48hto24h"))
+    if current < 0 or previous <= 0:
+        raise ValueError("invalid DefiLlama DEX volume")
+    delta = current - previous
+    return {
+        "current": current,
+        "delta": delta,
+        "percent": delta / previous * 100,
+    }
+
+
+def previous_derivatives_volume(day: str) -> float | None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    snapshots = state.get("snapshots", {}) if isinstance(state, dict) else {}
+    if not isinstance(snapshots, dict):
+        return None
+    previous = snapshots.get(day)
+    if not isinstance(previous, dict):
+        return None
+    try:
+        value = float(previous.get("derivatives_volume"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def save_derivatives_snapshot(day: str, value: float) -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    snapshots = state.get("snapshots")
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+    snapshots.setdefault(day, {})
+    if not isinstance(snapshots[day], dict):
+        snapshots[day] = {}
+    snapshots[day]["derivatives_volume"] = value
+    snapshots[day]["captured_at"] = cn_now().isoformat(timespec="seconds")
+    keep = sorted(snapshots)[-MARKET_SNAPSHOT_RETENTION_DAYS:]
+    state["version"] = 1
+    state["snapshots"] = {key: snapshots[key] for key in keep}
+    save_json(MARKET_STATE, state)
+
+
 def signed_yi(value: float) -> str:
     return f"{'+' if value >= 0 else ''}{value / 1e8:.2f}亿"
 
 
 def fetch_stablecoin_summary() -> str:
+    dex_volume: dict[str, float] = {}
+    global_volume: dict[str, float] = {}
+    derivatives_volume: dict[str, float] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
+    try:
+        dex_volume = fetch_dex_volume()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[dex-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        global_volume = fetch_global_volume()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[global-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        current = fetch_derivatives_volume()
+        previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
+        previous = previous_derivatives_volume(previous_day)
+        derivatives_volume = {"current": current}
+        if previous is not None:
+            delta = current - previous
+            derivatives_volume["delta"] = delta
+            derivatives_volume["percent"] = delta / previous * 100 if previous else 0.0
+        save_derivatives_snapshot(cn_now().date().isoformat(), current)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[derivatives-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         supply = fetch_stablecoin_supply()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -175,6 +292,35 @@ def fetch_stablecoin_summary() -> str:
         print(f"[stablecoin-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
 
     parts: list[str] = []
+    if global_volume:
+        parts.append(
+            f"全网现货24H成交（CEX+DEX）{global_volume['current'] / 1e8:.2f}亿"
+            f"（较昨日 {signed_yi(global_volume['delta'])}，{global_volume['percent']:+.2f}%）"
+        )
+    if dex_volume:
+        parts.append(
+            f"DEX现货24H成交{dex_volume['current'] / 1e8:.2f}亿"
+            f"（较昨日 {signed_yi(dex_volume['delta'])}，{dex_volume['percent']:+.2f}%）"
+        )
+    if global_volume and dex_volume:
+        cex_current = global_volume["current"] - dex_volume["current"]
+        cex_delta = global_volume["delta"] - dex_volume["delta"]
+        cex_previous = cex_current - cex_delta
+        if cex_current >= 0 and cex_previous > 0:
+            parts.append(
+                f"CEX现货24H成交（估算）{cex_current / 1e8:.2f}亿"
+                f"（较昨日 {signed_yi(cex_delta)}，{cex_delta / cex_previous * 100:+.2f}%）"
+            )
+    if derivatives_volume:
+        futures_text = f"全网合约24H成交{derivatives_volume['current'] / 1e8:.2f}亿"
+        if "delta" in derivatives_volume:
+            futures_text += (
+                f"（较昨日 {signed_yi(derivatives_volume['delta'])}，"
+                f"{derivatives_volume['percent']:+.2f}%）"
+            )
+        else:
+            futures_text += "（昨日基准待积累）"
+        parts.append(futures_text)
     for symbol in ("USDT", "USDC"):
         fields = [symbol]
         if symbol in supply:
@@ -188,7 +334,7 @@ def fetch_stablecoin_summary() -> str:
             )
         if len(fields) > 1:
             parts.append(" ".join(fields))
-    return "稳定币 | " + " | ".join(parts) if parts else ""
+    return "市场 | " + " | ".join(parts) if parts else ""
 
 
 def load_dotenv(path: Path) -> None:
@@ -1771,7 +1917,7 @@ def telegram_reports_fingerprint(reports: list[str]) -> str:
 def stablecoin_summary_from_reports(reports: list[str]) -> str:
     for report in reports[:1]:
         for line in report.splitlines():
-            if line.startswith(("稳定币 | ", "稳定币流通量 | ")):
+            if line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | ")):
                 return line
     return ""
 
@@ -1784,7 +1930,7 @@ def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
     lines = [
         line
         for line in lines
-        if not line.startswith(("稳定币 | ", "稳定币流通量 | "))
+        if not line.startswith(("市场 | ", "稳定币 | ", "稳定币流通量 | "))
     ]
     if summary:
         lines.insert(1, summary)
