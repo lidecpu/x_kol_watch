@@ -66,6 +66,5 @@ foobar | @0xfoobar | 加密开发
 Bankless | @Bankless | Ethereum/DeFi 媒体
 K线教主 | @Paris13Jeanne | 加密 KOL
 江卓尔_莱比特矿池 | @Jiangzhuoer2 | 比特币矿业
-DonAlt | @CryptoDonAlt | 交易员
 Dave the Wave | @davethewave | 周期分析
 Rekt Capital | @rektcapital | BTC 周期分析
