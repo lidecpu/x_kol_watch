@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ US_TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
     "?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
 )
+STRATEGY_PURCHASES_URL = "https://www.strategy.com/purchases"
 STABLECOIN_TIMEOUT_SECONDS = 15
 MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
@@ -113,6 +115,25 @@ class TelegramIPv4HTTPSHandler(urllib.request.HTTPSHandler):
 
 
 TELEGRAM_OPENER = urllib.request.build_opener(TelegramIPv4HTTPSHandler())
+
+
+class NextDataParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.in_next_data = False
+        self.chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "script" and dict(attrs).get("id") == "__NEXT_DATA__":
+            self.in_next_data = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self.in_next_data:
+            self.in_next_data = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_next_data:
+            self.chunks.append(data)
 
 
 def cn_now() -> dt.datetime:
@@ -270,6 +291,53 @@ def fetch_us_treasury_yields() -> dict[str, Any]:
             records.append(record)
     if not records:
         raise ValueError("missing US Treasury yield records")
+    return max(records, key=lambda item: item["record_date"])
+
+
+def fetch_strategy_btc() -> dict[str, Any]:
+    request = urllib.request.Request(
+        STRATEGY_PURCHASES_URL,
+        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        page = response.read().decode("utf-8", "replace")
+    parser = NextDataParser()
+    parser.feed(page)
+    if not parser.chunks:
+        raise ValueError("missing Strategy structured data")
+    payload = json.loads("".join(parser.chunks))
+    rows = payload.get("props", {}).get("pageProps", {}).get("bitcoinData", [])
+    if not isinstance(rows, list):
+        raise ValueError("invalid Strategy purchase records")
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("_in_progress") is True:
+            continue
+        try:
+            record = {
+                "record_date": dt.date.fromisoformat(str(row["date_of_purchase"])),
+                "holdings": int(float(row["btc_holdings"])),
+                "change": int(float(row["count"])),
+                "average_price": float(row["average_price"]),
+                "total_cost_millions": float(row["total_acquisition_cost"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        numeric = (
+            record["holdings"],
+            record["change"],
+            record["average_price"],
+            record["total_cost_millions"],
+        )
+        if (
+            all(math.isfinite(value) for value in numeric)
+            and record["holdings"] > 0
+            and record["average_price"] > 0
+            and record["total_cost_millions"] > 0
+        ):
+            records.append(record)
+    if not records:
+        raise ValueError("missing complete Strategy purchase record")
     return max(records, key=lambda item: item["record_date"])
 
 
@@ -519,6 +587,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         "美国国债",
         "ETH 质押",
         "稳定币",
+        "Strategy（微策略）",
     }
     separated: list[str] = []
     for line in lines:
@@ -549,6 +618,7 @@ def fetch_stablecoin_summary() -> str:
     eth_staking: dict[str, float] = {}
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
+    strategy_btc: dict[str, Any] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
     derivatives_snapshot: float | None = None
@@ -598,6 +668,10 @@ def fetch_stablecoin_summary() -> str:
     except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError) as exc:
         market_fetch_failed = True
         print(f"[us-treasury-yield-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        strategy_btc = fetch_strategy_btc()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        print(f"[strategy-btc-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         supply = fetch_stablecoin_supply()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -723,8 +797,20 @@ def fetch_stablecoin_summary() -> str:
             stablecoin_sections.extend([symbol, *fields])
     if stablecoin_sections:
         stablecoin_lines.extend(["稳定币", *stablecoin_sections])
+    strategy_lines: list[str] = []
+    if strategy_btc:
+        record_date = strategy_btc["record_date"].strftime("%m-%d")
+        strategy_lines.extend([
+            "Strategy（微策略）",
+            f"BTC持仓 {strategy_btc['holdings']:,}枚 | "
+            f"持仓变化 {strategy_btc['change']:+,}枚（{record_date}披露）",
+            f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
+            f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
+        ])
     summary = "\n".join(
-        market_summary_with_separators(market_lines + stablecoin_lines + treasury_lines)
+        market_summary_with_separators(
+            market_lines + stablecoin_lines + strategy_lines + treasury_lines
+        )
     )
     if summary:
         save_market_summary_cache(summary)
@@ -2188,8 +2274,8 @@ def build_telegram_reports(
     status_header = " | ".join(status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
-        mode_label = "重点" if mode == "focus" else "全景"
-        header = f"加密市场 {hours}H {mode_label} | 第1/1页 | {now}"
+        mode_suffix = " 重点" if mode == "focus" else ""
+        header = f"市场全景 {hours}H{mode_suffix} | 第1/1页 | {now}"
         stats_line = (
             f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
             f"{selected_kol_title} 0 | 总推文 0 | 本页 0"
@@ -2210,9 +2296,9 @@ def build_telegram_reports(
     groups = pack_telegram_blocks(blocks, group_size)
     reports: list[str] = []
     for group_index, group in enumerate(groups, 1):
-        mode_label = "重点" if mode == "focus" else "全景"
+        mode_suffix = " 重点" if mode == "focus" else ""
         group_count = sum(int(part.get("count") or 0) for part in group)
-        header = f"加密市场 {hours}H {mode_label} | 第{group_index}/{len(groups)}页 | {now}"
+        header = f"市场全景 {hours}H{mode_suffix} | 第{group_index}/{len(groups)}页 | {now}"
         stats_line = (
             f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
             f"{selected_kol_title} {display_kol_count} | 总推文 {display_total} | 本页 {group_count}"
@@ -2428,6 +2514,7 @@ def telegram_report_is_summary_heading(line: str) -> bool:
         "美国国债",
         "ETH 质押",
         "稳定币",
+        "Strategy（微策略）",
         "稳定币 | ",
         "稳定币流通量 | ",
         "口径：",
@@ -2537,6 +2624,8 @@ def telegram_report_legacy_summary_line(report: str) -> str:
             fields.append(line)
         if fields:
             parts.append(f"{symbol} " + " ".join(fields))
+    if sections.get("Strategy（微策略）"):
+        parts.append("Strategy（微策略） " + " ".join(sections["Strategy（微策略）"]))
     if sections.get("美国国债"):
         parts.append("美国国债 " + " ".join(sections["美国国债"]))
     return "市场 | " + " | ".join(parts) if parts else ""
@@ -2581,7 +2670,27 @@ def telegram_legacy_report(report: str, include_summary: bool) -> str:
     return "\n".join([header, *summary, *statuses, *lines[metadata_end:]]) + "\n"
 
 
+def telegram_previous_market_label_report(report: str) -> str:
+    lines = report.splitlines()
+    if len(lines) < 2:
+        return report
+    header_match = re.fullmatch(
+        r"市场全景 (\d+)H( 重点)? \| 第(\d+)/(\d+)页 \| (.+)",
+        lines[0],
+    )
+    if not header_match:
+        return report
+    previous_mode = "重点" if header_match.group(2) else "全景"
+    lines[0] = (
+        f"加密市场 {header_match.group(1)}H {previous_mode} | "
+        f"第{header_match.group(3)}/{header_match.group(4)}页 | {header_match.group(5)}"
+    )
+    suffix = "\n" if report.endswith("\n") else ""
+    return "\n".join(lines) + suffix
+
+
 def telegram_previous_label_report(report: str) -> str:
+    report = telegram_previous_market_label_report(report)
     lines = report.splitlines()
     if len(lines) < 2:
         return report
@@ -2612,6 +2721,10 @@ def telegram_previous_label_report(report: str) -> str:
 
 def telegram_reports_legacy_fingerprints(reports: list[str]) -> set[str]:
     fingerprints = {
+        telegram_reports_fingerprint([
+            telegram_previous_market_label_report(report)
+            for report in reports
+        ]),
         telegram_reports_fingerprint([
             telegram_previous_label_report(report)
             for report in reports
