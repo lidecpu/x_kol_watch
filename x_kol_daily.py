@@ -2402,9 +2402,18 @@ def telegram_report_chunks(reports: list[str]) -> list[dict[str, Any]]:
 
 
 def scheduled_send_key(args: argparse.Namespace) -> str:
-    if os.environ.get("GITHUB_EVENT_NAME") not in {"schedule", "workflow_dispatch"}:
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "").strip()
+    if event_name not in {"schedule", "workflow_dispatch"}:
         return ""
-    return os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip() or ":".join([
+    override = os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip()
+    if override:
+        return override
+    if event_name == "workflow_dispatch":
+        run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
+        if not run_id:
+            return ""
+        return ":".join(["manual", run_id, f"{args.hours}h", args.telegram_mode])
+    return ":".join([
         cn_now().strftime("%Y%m%d"),
         f"{args.hours}h",
         args.telegram_mode,
