@@ -419,6 +419,10 @@ def chain_delta_text(delta: float, net: bool = False) -> str:
     return f"{action} {signed_yi(delta)}"
 
 
+def visible_yi_change(value: float) -> bool:
+    return f"{abs(value) / 1e8:.2f}" != "0.00"
+
+
 def fetch_stablecoin_summary() -> str:
     cached_summary, cached_at, failed_at = load_market_summary_cache()
     now = cn_now()
@@ -559,11 +563,11 @@ def fetch_stablecoin_summary() -> str:
                         continue
                     delta = float(chain_deltas[chain])
                     tracked_delta += delta
-                    if delta != 0:
+                    if visible_yi_change(delta):
                         fields.append(f"{label}{chain_delta_text(delta, net=True)}")
                 if chain_deltas:
                     other_delta = float(item["delta"]) - tracked_delta
-                    if other_delta != 0:
+                    if visible_yi_change(other_delta):
                         fields.append(f"其他链{chain_delta_text(other_delta, net=True)}")
         if symbol in volumes:
             item = volumes[symbol]
@@ -892,6 +896,77 @@ def fmt_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+def rescan_page_render_failures(
+    browser: Any,
+    cookies: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    hours: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    search_fallback: bool,
+) -> None:
+    for item in results:
+        if item.get("status") != "error" or not str(item.get("error") or "").endswith(PAGE_RENDER_ERROR):
+            continue
+        handle = str(item.get("handle") or "")
+        started = time.time()
+        retry_diagnostics: dict[str, Any] = {
+            "profile_tweets": 0,
+            "search_fallback_used": False,
+            "scroll_rounds": 0,
+            "early_stops": 0,
+        }
+        diagnostics = item.setdefault("diagnostics", {})
+        diagnostics["fresh_context_retry"] = 1
+        print(f"[x-fresh-context] {handle} start", file=sys.stderr, flush=True)
+        context = None
+        try:
+            context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            context.route("**/*", route_static_assets)
+            context.add_cookies(cookies)
+            page = context.new_page()
+            page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(max(page_wait_ms, 5000))
+            ensure_x_page_healthy(page)
+            tweets = scrape_handle(
+                page,
+                handle,
+                hours,
+                limit,
+                scrolls,
+                page_wait_ms,
+                scroll_wait_ms,
+                search_fallback,
+                retry_diagnostics,
+            )
+        except Exception as exc:
+            diagnostics["fresh_context_recovered"] = False
+            diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
+            print(
+                f"[x-fresh-context] {handle} failed {time.time() - started:.1f}s "
+                f"error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            diagnostics["fresh_context_recovered"] = True
+            diagnostics["fresh_context_diagnostics"] = retry_diagnostics
+            item["status"] = "ok"
+            item["error"] = ""
+            item["tweets"] = tweets
+            print(
+                f"[x-fresh-context] {handle} recovered tweets={len(tweets)} "
+                f"{time.time() - started:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            if context is not None:
+                context.close()
+
+
 def scrape_all(
     kols: list[dict[str, str]],
     hours: int,
@@ -1038,6 +1113,17 @@ def scrape_all(
                     })
             finally:
                 context.close()
+            rescan_page_render_failures(
+                browser,
+                cookies,
+                results,
+                hours,
+                limit,
+                scrolls,
+                page_wait_ms,
+                scroll_wait_ms,
+                search_fallback,
+            )
         finally:
             browser.close()
     return results
@@ -1079,6 +1165,15 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "scroll_rounds": scroll_rounds,
         "early_stops": early_stops,
         "page_retries": page_retries,
+        "fresh_context_retries": sum(
+            int(item.get("diagnostics", {}).get("fresh_context_retry") or 0)
+            for item in results
+        ),
+        "fresh_context_recovered": sum(
+            1
+            for item in results
+            if item.get("diagnostics", {}).get("fresh_context_recovered") is True
+        ),
         "renamed": sum(1 for item in results if item.get("diagnostics", {}).get("renamed_to")),
         "unavailable": sum(
             1 for item in results if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
