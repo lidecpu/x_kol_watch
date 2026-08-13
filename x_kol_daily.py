@@ -65,6 +65,7 @@ US_TREASURY_YIELD_URL = (
     "?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
 )
 STRATEGY_PURCHASES_URL = "https://www.strategy.com/purchases"
+BITMINE_INVESTOR_RELATIONS_URL = "https://www.bitminetech.io/investor-relations"
 STABLECOIN_TIMEOUT_SECONDS = 15
 MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
@@ -134,6 +135,35 @@ class NextDataParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.in_next_data:
             self.chunks.append(data)
+
+
+class HTMLTextLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_parts: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self.current_href = ""
+        self.current_link_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self.current_href = str(dict(attrs).get("href") or "")
+            self.current_link_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.current_href:
+            link_text = " ".join("".join(self.current_link_parts).split())
+            self.links.append((link_text, self.current_href))
+            self.current_href = ""
+            self.current_link_parts = []
+
+    def handle_data(self, data: str) -> None:
+        self.text_parts.append(data)
+        if self.current_href:
+            self.current_link_parts.append(data)
+
+    def text(self) -> str:
+        return " ".join("".join(self.text_parts).split())
 
 
 def cn_now() -> dt.datetime:
@@ -339,6 +369,76 @@ def fetch_strategy_btc() -> dict[str, Any]:
     if not records:
         raise ValueError("missing complete Strategy purchase record")
     return max(records, key=lambda item: item["record_date"])
+
+
+def fetch_bitmine_eth() -> dict[str, Any]:
+    request = urllib.request.Request(
+        BITMINE_INVESTOR_RELATIONS_URL,
+        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        investor_page = response.read().decode("utf-8", "replace")
+    investor_parser = HTMLTextLinkParser()
+    investor_parser.feed(investor_page)
+    release_url = next((
+        urllib.parse.urljoin(BITMINE_INVESTOR_RELATIONS_URL, href)
+        for text, href in investor_parser.links
+        if "ETH Holdings Reach" in text and href
+    ), "")
+    if not release_url:
+        raise ValueError("missing BitMine ETH holdings release")
+
+    request = urllib.request.Request(
+        release_url,
+        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        release_page = response.read().decode("utf-8", "replace")
+    release_parser = HTMLTextLinkParser()
+    release_parser.feed(release_page)
+    text = release_parser.text()
+
+    patterns = {
+        "holdings": r"crypto holdings are comprised of ([\d,]+) ETH\b",
+        "change": r"past week, we acquired ([\d,]+)\s+ETH\b",
+        "supply_percent": r"ETH holdings are ([\d.]+)% of the ETH supply",
+        "staked": r"total staked ETH stands at ([\d,]+)",
+    }
+    matches = {key: re.search(pattern, text, re.IGNORECASE) for key, pattern in patterns.items()}
+    date_match = re.search(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s+"
+        r"(\d{1,2}),\s+(\d{4})\s+/PRNewswire/",
+        text,
+        re.IGNORECASE,
+    )
+    if any(match is None for match in matches.values()) or date_match is None:
+        raise ValueError("incomplete BitMine ETH holdings release")
+    try:
+        record_date = dt.datetime.strptime(
+            f"{date_match.group(1)} {date_match.group(2)} {date_match.group(3)}",
+            "%b %d %Y",
+        ).date()
+        holdings = int(matches["holdings"].group(1).replace(",", ""))
+        change = int(matches["change"].group(1).replace(",", ""))
+        supply_percent = float(matches["supply_percent"].group(1))
+        staked = int(matches["staked"].group(1).replace(",", ""))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("invalid BitMine ETH holdings release") from exc
+    if (
+        holdings <= 0
+        or change < 0
+        or not 0 < supply_percent <= 100
+        or staked <= 0
+        or staked > holdings
+    ):
+        raise ValueError("out-of-range BitMine ETH holdings release")
+    return {
+        "record_date": record_date,
+        "holdings": holdings,
+        "change": change,
+        "supply_percent": supply_percent,
+        "staked": staked,
+    }
 
 
 def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
@@ -619,6 +719,7 @@ def fetch_stablecoin_summary() -> str:
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
     strategy_btc: dict[str, Any] = {}
+    bitmine_eth: dict[str, Any] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
     derivatives_snapshot: float | None = None
@@ -672,6 +773,10 @@ def fetch_stablecoin_summary() -> str:
         strategy_btc = fetch_strategy_btc()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
         print(f"[strategy-btc-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        bitmine_eth = fetch_bitmine_eth()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        print(f"[bitmine-eth-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         supply = fetch_stablecoin_supply()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -807,9 +912,19 @@ def fetch_stablecoin_summary() -> str:
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
         ])
+    bitmine_lines: list[str] = []
+    if bitmine_eth:
+        record_date = bitmine_eth["record_date"].strftime("%m-%d")
+        bitmine_lines.extend([
+            "BitMine（BMNR）",
+            f"ETH持仓 {bitmine_eth['holdings'] / 1e4:.2f}万枚 | "
+            f"持仓变化 {bitmine_eth['change'] / 1e4:+.2f}万枚（{record_date}披露）",
+            f"供应占比 {compact_percent(bitmine_eth['supply_percent'])} | "
+            f"已质押 {bitmine_eth['staked'] / 1e4:.2f}万枚",
+        ])
     summary = "\n".join(
         market_summary_with_separators(
-            market_lines + stablecoin_lines + strategy_lines + treasury_lines
+            market_lines + stablecoin_lines + strategy_lines + bitmine_lines + treasury_lines
         )
     )
     if summary:
