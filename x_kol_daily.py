@@ -51,6 +51,12 @@ DEFILLAMA_DEX_VOLUME_URL = (
     "https://api.llama.fi/overview/dexs"
     "?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true"
 )
+US_TREASURY_DEBT_URL = (
+    "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
+    "v2/accounting/od/debt_to_penny"
+    "?fields=record_date,tot_pub_debt_out_amt&sort=-record_date&format=json"
+    "&page%5Bnumber%5D=1&page%5Bsize%5D=2"
+)
 STABLECOIN_TIMEOUT_SECONDS = 15
 MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
@@ -202,6 +208,27 @@ def fetch_eth_staking_metrics() -> dict[str, float]:
     if total <= 0 or not 0 <= percent <= 100 or apr < 0:
         raise ValueError("out-of-range Ethereum staking metrics")
     return {"total": total, "percent": percent, "apr": apr}
+
+
+def fetch_us_treasury_debt() -> dict[str, Any]:
+    payload = fetch_market_json(US_TREASURY_DEBT_URL)
+    rows = payload.get("data", [])
+    if not isinstance(rows, list) or len(rows) < 2:
+        raise ValueError("missing US Treasury debt records")
+    current_row, previous_row = rows[:2]
+    try:
+        current = float(current_row["tot_pub_debt_out_amt"])
+        previous = float(previous_row["tot_pub_debt_out_amt"])
+        record_date = dt.date.fromisoformat(str(current_row["record_date"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid US Treasury debt record") from exc
+    if not math.isfinite(current) or not math.isfinite(previous) or current <= 0 or previous <= 0:
+        raise ValueError("out-of-range US Treasury debt record")
+    return {
+        "current": current,
+        "delta": current - previous,
+        "record_date": record_date,
+    }
 
 
 def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
@@ -440,6 +467,7 @@ def fetch_stablecoin_summary() -> str:
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
     eth_staking: dict[str, float] = {}
+    us_treasury_debt: dict[str, Any] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
     derivatives_snapshot: float | None = None
@@ -479,6 +507,11 @@ def fetch_stablecoin_summary() -> str:
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
         market_fetch_failed = True
         print(f"[eth-staking-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        us_treasury_debt = fetch_us_treasury_debt()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        market_fetch_failed = True
+        print(f"[us-treasury-debt-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     try:
         supply = fetch_stablecoin_supply()
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
@@ -537,6 +570,13 @@ def fetch_stablecoin_summary() -> str:
         else:
             futures_text += "（昨日基准待积累）"
         market_lines.extend(["市场合约（亿美元）", futures_text])
+    if us_treasury_debt:
+        record_date = us_treasury_debt["record_date"].strftime("%m-%d")
+        market_lines.extend([
+            "美国国债",
+            f"债务总额 {us_treasury_debt['current'] / 1e12:.2f}万亿美元（截至 {record_date}）",
+            f"较上一发布日 {signed_yi(us_treasury_debt['delta'])}美元",
+        ])
     if eth_staking:
         staking_lines = [f"质押量 {eth_staking['total'] / 1e4:.2f}万枚"]
         if "delta" in eth_staking:
