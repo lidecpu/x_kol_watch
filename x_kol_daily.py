@@ -74,8 +74,14 @@ MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
+X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
+RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 MAX_PAGE_RECOVERIES = 2
+PAGE_RECOVERY_DELAYS_SECONDS = (10.0, 30.0)
+POST_PAGE_FAILURE_COOLDOWN_SECONDS = 45.0
+FRESH_CONTEXT_COOLDOWN_SECONDS = 60.0
+FRESH_CONTEXT_BETWEEN_RETRIES_SECONDS = 30.0
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
@@ -1106,7 +1112,8 @@ EXPAND_TWEETS_JS = r"""
 PAGE_HEALTH_JS = r"""
 () => {
   const path = (location.pathname || '').toLowerCase();
-  const text = (document.body?.innerText || '').slice(0, 5000).toLowerCase();
+  const rawText = (document.body?.innerText || '').slice(0, 5000);
+  const text = rawText.toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
   return {
@@ -1115,13 +1122,18 @@ PAGE_HEALTH_JS = r"""
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
       (!hasMain && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
-        '超过频率限制', '出错了，请尝试重新加载'
+        'verify you are human', 'unusual activity', 'automated requests',
+        'temporarily limited', '超过频率限制', '出错了，请尝试重新加载',
+        '请验证您是人类', '异常活动', '自动请求', '暂时受到限制'
       ])),
     accountUnavailable: has([
       "this account doesn't exist", 'account suspended',
       '此账号不存在', '账号已被冻结'
     ]),
-    hasMain
+    hasMain,
+    path,
+    title: (document.title || '').slice(0, 160),
+    textSample: rawText.replace(/\s+/g, ' ').trim().slice(0, 300)
   };
 }
 """
@@ -1146,7 +1158,31 @@ statusId => {
 """
 
 
-def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
+def record_page_health(
+    diagnostics: dict[str, Any] | None,
+    phase: str,
+    health: dict[str, Any],
+) -> None:
+    if diagnostics is None:
+        return
+    diagnostics["page_health"] = {
+        "phase": phase,
+        "path": str(health.get("path") or "")[:200],
+        "title": str(health.get("title") or "")[:160],
+        "text_sample": str(health.get("textSample") or "")[:300],
+        "login_required": bool(health.get("loginRequired")),
+        "error_page": bool(health.get("errorPage")),
+        "account_unavailable": bool(health.get("accountUnavailable")),
+        "has_main": bool(health.get("hasMain")),
+    }
+
+
+def ensure_x_page_healthy(
+    page: Any,
+    account_page: bool = False,
+    diagnostics: dict[str, Any] | None = None,
+    phase: str = "page",
+) -> None:
     health = page.evaluate(PAGE_HEALTH_JS)
     if not health.get("hasMain") and not any(
         health.get(key) for key in ("loginRequired", "errorPage", "accountUnavailable")
@@ -1155,13 +1191,79 @@ def ensure_x_page_healthy(page: Any, account_page: bool = False) -> None:
         page.wait_for_timeout(2500)
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
+        record_page_health(diagnostics, phase, health)
         raise RuntimeError("X authentication required")
     if health.get("errorPage"):
-        raise RuntimeError("X returned an error or rate-limit page")
+        record_page_health(diagnostics, phase, health)
+        raise RuntimeError(X_RATE_LIMIT_ERROR)
     if account_page and health.get("accountUnavailable"):
+        record_page_health(diagnostics, phase, health)
         raise RuntimeError(ACCOUNT_UNAVAILABLE_ERROR)
     if not health.get("hasMain"):
+        record_page_health(diagnostics, phase, health)
         raise RuntimeError(PAGE_RENDER_ERROR)
+
+
+def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
+    context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+    context.route("**/*", route_static_assets)
+    context.add_cookies(cookies)
+    return context
+
+
+def scrape_handle_url(
+    page: Any,
+    handle: str,
+    url: str,
+    account_page: bool,
+    cutoff_ms: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    diagnostics: dict[str, Any] | None,
+    merged: dict[str, dict[str, Any]],
+) -> None:
+    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+    page.wait_for_timeout(page_wait_ms)
+    ensure_x_page_healthy(
+        page,
+        account_page=account_page,
+        diagnostics=diagnostics,
+        phase="profile" if account_page else "search_fallback",
+    )
+    unchanged_rounds = 0
+    visible_article_keys: set[str] = set()
+    for round_index in range(scrolls + 1):
+        expanded = int(page.evaluate(EXPAND_TWEETS_JS) or 0)
+        if expanded:
+            page.wait_for_timeout(250)
+        payload = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
+        rows = payload.get("rows", [])
+        current_article_keys = {str(key) for key in payload.get("articleKeys", []) if key}
+        new_article_keys = current_article_keys - visible_article_keys
+        visible_article_keys.update(current_article_keys)
+        for row in rows:
+            key = str(row.get("url") or f"{handle}:{row.get('created_at')}:{row.get('text','')[:80]}")
+            merged[key] = row
+        if diagnostics is not None:
+            diagnostics["scroll_rounds"] += 1
+        if account_page and diagnostics is not None:
+            diagnostics["profile_tweets"] = len(merged)
+        if len(merged) >= limit:
+            break
+        if not new_article_keys:
+            unchanged_rounds += 1
+        else:
+            unchanged_rounds = 0
+        if unchanged_rounds >= 2 and round_index + 1 >= MIN_SCROLL_ROUNDS:
+            if diagnostics is not None:
+                diagnostics["early_stops"] += 1
+            break
+        if round_index >= scrolls:
+            break
+        page.mouse.wheel(0, 1800)
+        page.wait_for_timeout(scroll_wait_ms)
 
 
 def scrape_handle(
@@ -1196,41 +1298,32 @@ def scrape_handle(
             diagnostics["search_fallback_used"] = True
         if len(merged) >= limit:
             break
-        page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-        page.wait_for_timeout(page_wait_ms)
-        ensure_x_page_healthy(page, account_page=url_index == 0)
-        unchanged_rounds = 0
-        visible_article_keys: set[str] = set()
-        for round_index in range(scrolls + 1):
-            expanded = int(page.evaluate(EXPAND_TWEETS_JS) or 0)
-            if expanded:
-                page.wait_for_timeout(250)
-            payload = page.evaluate(EXTRACT_JS, {"handle": handle, "cutoffMs": cutoff_ms, "maxItems": limit * 2})
-            rows = payload.get("rows", [])
-            current_article_keys = {str(key) for key in payload.get("articleKeys", []) if key}
-            new_article_keys = current_article_keys - visible_article_keys
-            visible_article_keys.update(current_article_keys)
-            for row in rows:
-                key = str(row.get("url") or f"{handle}:{row.get('created_at')}:{row.get('text','')[:80]}")
-                merged[key] = row
+        try:
+            scrape_handle_url(
+                page,
+                handle,
+                url,
+                url_index == 0,
+                cutoff_ms,
+                limit,
+                scrolls,
+                page_wait_ms,
+                scroll_wait_ms,
+                diagnostics,
+                merged,
+            )
+        except Exception as exc:
+            if url_index == 0:
+                raise
             if diagnostics is not None:
-                diagnostics["scroll_rounds"] += 1
-            if url_index == 0 and diagnostics is not None:
-                diagnostics["profile_tweets"] = len(merged)
-            if len(merged) >= limit:
-                break
-            if not new_article_keys:
-                unchanged_rounds += 1
-            else:
-                unchanged_rounds = 0
-            if unchanged_rounds >= 2 and round_index + 1 >= MIN_SCROLL_ROUNDS:
-                if diagnostics is not None:
-                    diagnostics["early_stops"] += 1
-                break
-            if round_index >= scrolls:
-                break
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(scroll_wait_ms)
+                diagnostics["search_fallback_error"] = f"{type(exc).__name__}: {exc}"
+                diagnostics["search_fallback_failed"] = True
+            print(
+                f"[search-fallback-skip] {handle} error={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
     rows = sorted(merged.values(), key=lambda x: x.get("created_at_ms", 0), reverse=True)
     return rows[:limit]
 
@@ -1254,9 +1347,30 @@ def rescan_page_render_failures(
     scroll_wait_ms: int,
     search_fallback: bool,
 ) -> None:
-    for item in results:
-        if item.get("status") != "error" or not str(item.get("error") or "").endswith(PAGE_RENDER_ERROR):
-            continue
+    failed_items = [
+        item
+        for item in results
+        if item.get("status") == "error"
+        and str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
+    ]
+    if not failed_items:
+        return
+    print(
+        f"[x-fresh-context] cooldown={FRESH_CONTEXT_COOLDOWN_SECONDS:.0f}s "
+        f"failures={len(failed_items)}",
+        file=sys.stderr,
+        flush=True,
+    )
+    time.sleep(FRESH_CONTEXT_COOLDOWN_SECONDS)
+    for retry_index, item in enumerate(failed_items):
+        if retry_index > 0:
+            print(
+                f"[x-fresh-context] between-retries cooldown="
+                f"{FRESH_CONTEXT_BETWEEN_RETRIES_SECONDS:.0f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(FRESH_CONTEXT_BETWEEN_RETRIES_SECONDS)
         handle = str(item.get("handle") or "")
         started = time.time()
         retry_diagnostics: dict[str, Any] = {
@@ -1267,16 +1381,19 @@ def rescan_page_render_failures(
         }
         diagnostics = item.setdefault("diagnostics", {})
         diagnostics["fresh_context_retry"] = 1
+        diagnostics["fresh_context_cooldown_seconds"] = FRESH_CONTEXT_COOLDOWN_SECONDS
         print(f"[x-fresh-context] {handle} start", file=sys.stderr, flush=True)
         context = None
         try:
-            context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
-            context.route("**/*", route_static_assets)
-            context.add_cookies(cookies)
+            context = new_x_context(browser, cookies)
             page = context.new_page()
             page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
             page.wait_for_timeout(max(page_wait_ms, 5000))
-            ensure_x_page_healthy(page)
+            ensure_x_page_healthy(
+                page,
+                diagnostics=retry_diagnostics,
+                phase="fresh_context_home",
+            )
             tweets = scrape_handle(
                 page,
                 handle,
@@ -1339,10 +1456,8 @@ def scrape_all(
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
         try:
-            context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
+            context = new_x_context(browser, cookies)
             try:
-                context.route("**/*", route_static_assets)
-                context.add_cookies(cookies)
                 page = context.new_page()
                 page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
                 page.wait_for_timeout(1500)
@@ -1369,6 +1484,7 @@ def scrape_all(
                     page_recovery_attempts = 0
                     recreate_page = False
                     rename_attempted = False
+                    final_page_error = False
                     while True:
                         try:
                             if recreate_page:
@@ -1377,7 +1493,11 @@ def scrape_all(
                                 page = context.new_page()
                                 page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
                                 page.wait_for_timeout(max(page_wait_ms, 5000))
-                                ensure_x_page_healthy(page)
+                                ensure_x_page_healthy(
+                                    page,
+                                    diagnostics=diagnostics,
+                                    phase="recovery_home",
+                                )
                             tweets = scrape_handle(
                                 page,
                                 handle,
@@ -1419,23 +1539,31 @@ def scrape_all(
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                            recoverable_page_error = (
-                                str(exc) == PAGE_RENDER_ERROR
-                                or isinstance(exc, PlaywrightTimeoutError)
+                            recoverable_page_error = str(exc) in RECOVERABLE_X_PAGE_ERRORS or isinstance(
+                                exc,
+                                PlaywrightTimeoutError,
                             )
                             if recoverable_page_error and page_recovery_attempts < MAX_PAGE_RECOVERIES:
                                 page_recovery_attempts += 1
                                 diagnostics["page_retries"] += 1
+                                delay = PAGE_RECOVERY_DELAYS_SECONDS[
+                                    min(page_recovery_attempts, len(PAGE_RECOVERY_DELAYS_SECONDS)) - 1
+                                ]
+                                diagnostics.setdefault("page_retry_delays_seconds", []).append(delay)
                                 recreate_page = True
                                 print(
-                                    f"[x-recover] {handle} recreate page attempt={page_recovery_attempts}/{MAX_PAGE_RECOVERIES}",
+                                    f"[x-recover] {handle} recreate page "
+                                    f"attempt={page_recovery_attempts}/{MAX_PAGE_RECOVERIES} "
+                                    f"delay={delay:.0f}s",
                                     file=sys.stderr,
                                     flush=True,
                                 )
+                                time.sleep(delay)
                                 continue
                             tweets = []
                             status = "error"
                             error = f"{type(exc).__name__}: {exc}"
+                            final_page_error = recoverable_page_error
                         else:
                             status = "ok"
                             error = ""
@@ -1458,6 +1586,25 @@ def scrape_all(
                         "tweets": tweets,
                         "diagnostics": diagnostics,
                     })
+                    recycle_reason = "page_error" if final_page_error else (
+                        "search_fallback_error" if diagnostics.get("search_fallback_failed") else ""
+                    )
+                    if recycle_reason and index < total_kols:
+                        diagnostics["post_error_cooldown_seconds"] = POST_PAGE_FAILURE_COOLDOWN_SECONDS
+                        diagnostics["context_recycled_after_error"] = True
+                        diagnostics["context_recycle_reason"] = recycle_reason
+                        print(
+                            f"[x-cooldown] {handle} reason={recycle_reason} "
+                            f"delay={POST_PAGE_FAILURE_COOLDOWN_SECONDS:.0f}s "
+                            "then recycle context",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        time.sleep(POST_PAGE_FAILURE_COOLDOWN_SECONDS)
+                        replacement_context = new_x_context(browser, cookies)
+                        context.close()
+                        context = replacement_context
+                        page = context.new_page()
             finally:
                 context.close()
             rescan_page_render_failures(
@@ -2375,13 +2522,13 @@ def build_telegram_reports(
         str(item.get("handle") or "").strip()
         for item in results
         if item.get("status") == "error"
-        and str(item.get("error") or "").endswith(PAGE_RENDER_ERROR)
+        and str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
     ]
     scan_issue_handles = [
         str(item.get("handle") or "").strip()
         for item in results
         if item.get("status") == "error"
-        and not str(item.get("error") or "").endswith((ACCOUNT_UNAVAILABLE_ERROR, PAGE_RENDER_ERROR))
+        and not str(item.get("error") or "").endswith((ACCOUNT_UNAVAILABLE_ERROR, *RECOVERABLE_X_PAGE_ERRORS))
     ]
     page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
     scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
