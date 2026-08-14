@@ -41,7 +41,6 @@ TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
 TELEGRAM_RETRY_MAX_SECONDS = 30.0
 TELEGRAM_RETRYABLE_HTTP_CODES = frozenset({429})
-TELEGRAM_FIRST_GROUP_SIZE = 10
 STABLECOIN_API_URL = "https://stablecoins.llama.fi/stablecoins?includePrices=true"
 ETHEREUM_STAKING_URL = "https://ethereum.org/zh/staking/"
 COINGECKO_MARKET_CHART_URL = (
@@ -53,6 +52,12 @@ COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives"
 DEFILLAMA_DEX_VOLUME_URL = (
     "https://api.llama.fi/overview/dexs"
     "?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true"
+)
+COINGLASS_HYPERLIQUID_LIQUIDATION_URL = (
+    "https://www.coinglass.com/zh/hyperliquid-liquidation-map"
+)
+COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL = (
+    "https://www.coinglass.com/zh/pro/futures/hyperliquid-long-short-ratio"
 )
 US_TREASURY_DEBT_URL = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
@@ -72,6 +77,10 @@ MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
+COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 600
+COINGLASS_LIQUIDATION_FAILURE_COOLDOWN_SECONDS = 900
+COINGLASS_LIQUIDATION_LEVEL_LIMIT = 2
+COINGLASS_LIQUIDATION_DISTANCE_LIMIT_PERCENT = 10.0
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
@@ -614,26 +623,24 @@ def save_eth_staking_snapshot(day: str, metrics: dict[str, float]) -> None:
     save_json(MARKET_STATE, state)
 
 
+def parse_cache_timestamp(value: Any) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=CN_TZ)
+
+
 def load_market_summary_cache() -> tuple[str, dt.datetime | None, dt.datetime | None]:
     state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
     cache = state.get("summary_cache", {}) if isinstance(state, dict) else {}
     if not isinstance(cache, dict):
         return "", None, None
     summary = str(cache.get("summary") or "").strip()
-    captured_at = cache.get("captured_at")
-    failed_at = cache.get("failed_at")
-
-    def parse_timestamp(value: Any) -> dt.datetime | None:
-        if not value:
-            return None
-        try:
-            parsed = dt.datetime.fromisoformat(str(value))
-        except (TypeError, ValueError):
-            return None
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=CN_TZ)
-
-    captured = parse_timestamp(captured_at)
-    failed = parse_timestamp(failed_at)
+    captured = parse_cache_timestamp(cache.get("captured_at"))
+    failed = parse_cache_timestamp(cache.get("failed_at"))
     if not summary:
         return "", captured, failed
     return summary, captured, failed
@@ -664,8 +671,64 @@ def save_market_summary_failure() -> None:
     save_json(MARKET_STATE, state)
 
 
+def load_hyperliquid_liquidation_cache() -> tuple[
+    dict[str, Any] | None,
+    dt.datetime | None,
+    dt.datetime | None,
+]:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    cache = state.get("hyperliquid_liquidation", {}) if isinstance(state, dict) else {}
+    if not isinstance(cache, dict):
+        return None, None, None
+    snapshot = cache.get("snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = None
+    return (
+        snapshot,
+        parse_cache_timestamp(cache.get("captured_at")),
+        parse_cache_timestamp(cache.get("failed_at")),
+    )
+
+
+def save_hyperliquid_liquidation_cache(snapshot: dict[str, Any]) -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    state["version"] = 1
+    state["hyperliquid_liquidation"] = {
+        "snapshot": snapshot,
+        "captured_at": cn_now().isoformat(timespec="seconds"),
+    }
+    save_json(MARKET_STATE, state)
+
+
+def save_hyperliquid_liquidation_failure() -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    cache = state.get("hyperliquid_liquidation")
+    if not isinstance(cache, dict):
+        cache = {}
+    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
+    state["version"] = 1
+    state["hyperliquid_liquidation"] = cache
+    save_json(MARKET_STATE, state)
+
+
 def compact_percent(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def compact_usd_price(value: float) -> str:
+    return f"${value:,.0f}" if value >= 100 else f"${value:,.4f}".rstrip("0").rstrip(".")
+
+
+def liquidation_level_text(level: dict[str, Any]) -> str:
+    return (
+        f"{compact_usd_price(float(level['price']))}"
+        f"（{float(level['distance_percent']):+.2f}%｜"
+        f"强度 {float(level['intensity']):,.0f} BTC）"
+    )
 
 
 def signed_yi(value: float) -> str:
@@ -690,6 +753,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
     section_headings = {
         "市场现货（亿美元）",
         "市场合约（亿美元）",
+        "Hyperliquid清算价（BTC）",
         "美国国债",
         "ETH 质押",
         "稳定币",
@@ -699,7 +763,10 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
     for line in lines:
         if line == TELEGRAM_SECTION_SEPARATOR:
             continue
-        if line in section_headings and separated:
+        if (
+            line in section_headings
+            or line.startswith("Hyperliquid清算价（BTC，缓存 ")
+        ) and separated:
             separated.append(TELEGRAM_SECTION_SEPARATOR)
         separated.append(line)
     return separated
@@ -721,6 +788,7 @@ def fetch_stablecoin_summary() -> str:
     dex_volume: dict[str, float] = {}
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
+    hyperliquid_liquidation: dict[str, Any] = {}
     eth_staking: dict[str, float] = {}
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
@@ -754,6 +822,13 @@ def fetch_stablecoin_summary() -> str:
     except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
         market_fetch_failed = True
         print(f"[derivatives-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    try:
+        hyperliquid_liquidation = fetch_hyperliquid_liquidation_snapshot()
+    except Exception as exc:
+        print(
+            f"[coinglass-liquidation-cache-error] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
     try:
         current = fetch_eth_staking_metrics()
         previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
@@ -848,6 +923,53 @@ def fetch_stablecoin_summary() -> str:
         else:
             futures_text += "（昨日基准待积累）"
         market_lines.extend(["市场合约（亿美元）", futures_text])
+    if hyperliquid_liquidation:
+        liquidation_heading = "Hyperliquid清算价（BTC）"
+        if hyperliquid_liquidation.get("_stale"):
+            captured_at = parse_cache_timestamp(hyperliquid_liquidation.get("_captured_at"))
+            if captured_at is not None:
+                liquidation_heading = (
+                    "Hyperliquid清算价（BTC，缓存 "
+                    f"{captured_at.strftime('%m-%d %H:%M')}）"
+                )
+        long_lines = [
+            f"多头 {liquidation_level_text(level)}"
+            for level in hyperliquid_liquidation.get("long_levels", [])
+            if isinstance(level, dict)
+        ]
+        short_lines = [
+            f"空头 {liquidation_level_text(level)}"
+            for level in hyperliquid_liquidation.get("short_levels", [])
+            if isinstance(level, dict)
+        ]
+        if long_lines and short_lines:
+            liquidation_lines = [
+                liquidation_heading,
+                f"现价 {compact_usd_price(float(hyperliquid_liquidation['current_price']))}",
+                *long_lines,
+                *short_lines,
+            ]
+            ratio = hyperliquid_liquidation.get("long_short_ratio")
+            if isinstance(ratio, dict):
+                long_users = int(ratio["long_users"])
+                short_users = int(ratio["short_users"])
+                total_users = long_users + short_users
+                long_percent = long_users / total_users * 100
+                short_percent = short_users / total_users * 100
+                ratio_value = float(ratio["ratio"])
+                if long_users > short_users:
+                    crowding = "多单人数占优"
+                elif short_users > long_users:
+                    crowding = "空单人数占优"
+                else:
+                    crowding = "人数相当"
+                liquidation_lines.extend([
+                    "持仓人数多空比（1天）",
+                    f"多单 {long_users:,}（{long_percent:.2f}%） | "
+                    f"空单 {short_users:,}（{short_percent:.2f}%）",
+                    f"多空比 {ratio_value:.2f}（{crowding}）",
+                ])
+            market_lines.extend(liquidation_lines)
     treasury_lines: list[str] = []
     if us_treasury_debt:
         record_date = us_treasury_debt["record_date"].strftime("%m-%d")
@@ -1138,6 +1260,64 @@ PAGE_HEALTH_JS = r"""
 }
 """
 
+COINGLASS_LIQUIDATION_OPTION_JS = r"""
+() => {
+  const element = document.querySelector('.echarts-for-react');
+  if (!element) return null;
+  const reactKey = Object.keys(element).find(key => key.startsWith('__reactFiber$'));
+  let fiber = reactKey ? element[reactKey] : null;
+  let option = null;
+  for (let index = 0; fiber && index < 18; index += 1, fiber = fiber.return) {
+    const props = fiber.memoizedProps || {};
+    if (props.option && Array.isArray(props.option.series)) {
+      option = props.option;
+      break;
+    }
+  }
+  if (!option) return null;
+  const prices = Array.isArray(option.xAxis) && Array.isArray(option.xAxis[0]?.data)
+    ? option.xAxis[0].data
+    : [];
+  const currentSeries = option.series.find(series => series?.markLine?.data?.length);
+  const currentIndex = Number(currentSeries?.markLine?.data?.[0]?.xAxis);
+  const currentPrice = Number(prices[currentIndex]);
+  const points = name => {
+    const series = option.series.find(item => item?.name === name && item?.type === 'bar');
+    const data = Array.isArray(series?.data) ? series.data : [];
+    return data.map((raw, index) => ({
+      price: Number(prices[index]),
+      intensity: Number(typeof raw === 'number' ? raw : raw?.value)
+    })).filter(point => Number.isFinite(point.price) && point.price > 0 &&
+      Number.isFinite(point.intensity) && point.intensity > 0);
+  };
+  return {
+    symbol: 'BTC',
+    current_price: currentPrice,
+    long_points: points('多单'),
+    short_points: points('空单')
+  };
+}
+"""
+
+COINGLASS_LONG_SHORT_RATIO_JS = r"""
+() => {
+  const nodes = Array.from(document.querySelectorAll('*'));
+  const valueFor = label => {
+    const labelNode = nodes.find(node =>
+      node.children.length === 0 && (node.textContent || '').trim() === label
+    );
+    const valueText = labelNode?.parentElement?.lastElementChild?.textContent || '';
+    return Number(valueText.replace(/,/g, '').trim());
+  };
+  return {
+    interval: 'day',
+    long_users: valueFor('多单人数'),
+    short_users: valueFor('空单人数'),
+    ratio: valueFor('人数多空比')
+  };
+}
+"""
+
 STATUS_AUTHOR_JS = r"""
 statusId => {
   const statusPath = `/status/${statusId}`;
@@ -1209,6 +1389,204 @@ def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     context.route("**/*", route_static_assets)
     context.add_cookies(cookies)
     return context
+
+
+def select_liquidation_levels(
+    points: Any,
+    current_price: float,
+    direction: str,
+) -> list[dict[str, float]]:
+    candidates: list[dict[str, float]] = []
+    if not isinstance(points, list):
+        return candidates
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        try:
+            price = float(point.get("price"))
+            intensity = float(point.get("intensity"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(price) or not math.isfinite(intensity) or price <= 0 or intensity <= 0:
+            continue
+        distance_percent = (price / current_price - 1) * 100
+        if direction == "long" and distance_percent >= 0:
+            continue
+        if direction == "short" and distance_percent <= 0:
+            continue
+        candidates.append({
+            "price": price,
+            "intensity": intensity,
+            "distance_percent": distance_percent,
+        })
+    nearby = [
+        point
+        for point in candidates
+        if abs(point["distance_percent"]) <= COINGLASS_LIQUIDATION_DISTANCE_LIMIT_PERCENT
+    ]
+    ranked = nearby or candidates
+    strongest = sorted(
+        ranked,
+        key=lambda point: point["intensity"],
+        reverse=True,
+    )[:COINGLASS_LIQUIDATION_LEVEL_LIMIT]
+    return sorted(strongest, key=lambda point: abs(point["distance_percent"]))
+
+
+def normalize_hyperliquid_liquidation(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("missing CoinGlass liquidation chart data")
+    try:
+        current_price = float(raw.get("current_price"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid CoinGlass current price") from exc
+    if not math.isfinite(current_price) or current_price <= 0:
+        raise ValueError("out-of-range CoinGlass current price")
+    long_levels = select_liquidation_levels(raw.get("long_points"), current_price, "long")
+    short_levels = select_liquidation_levels(raw.get("short_points"), current_price, "short")
+    if not long_levels or not short_levels:
+        raise ValueError("missing CoinGlass long or short liquidation levels")
+    return {
+        "symbol": "BTC",
+        "current_price": current_price,
+        "long_levels": long_levels,
+        "short_levels": short_levels,
+    }
+
+
+def normalize_hyperliquid_long_short_ratio(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("missing CoinGlass long-short ratio data")
+    try:
+        long_users = int(float(raw.get("long_users")))
+        short_users = int(float(raw.get("short_users")))
+        ratio = float(raw.get("ratio"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid CoinGlass long-short ratio data") from exc
+    if long_users <= 0 or short_users <= 0 or not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("out-of-range CoinGlass long-short ratio data")
+    calculated_ratio = long_users / short_users
+    if abs(ratio - calculated_ratio) > max(0.02, calculated_ratio * 0.02):
+        raise ValueError("inconsistent CoinGlass long-short ratio data")
+    return {
+        "interval": "day",
+        "long_users": long_users,
+        "short_users": short_users,
+        "ratio": ratio,
+    }
+
+
+def fetch_hyperliquid_liquidation_live() -> dict[str, Any]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError("missing playwright for CoinGlass liquidation map") from exc
+
+    chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
+    with sync_playwright() as playwright:
+        launch_kwargs: dict[str, Any] = {
+            "headless": True,
+            "args": ["--disable-gpu", "--no-first-run", "--no-default-browser-check"],
+        }
+        if chrome_path:
+            launch_kwargs["executable_path"] = chrome_path
+        browser = playwright.chromium.launch(**launch_kwargs)
+        try:
+            if sys.platform.startswith("win"):
+                user_agent_platform = "Windows NT 10.0; Win64; x64"
+            elif sys.platform == "darwin":
+                user_agent_platform = "Macintosh; Intel Mac OS X 10_15_7"
+            else:
+                user_agent_platform = "X11; Linux x86_64"
+            user_agent = (
+                f"Mozilla/5.0 ({user_agent_platform}) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{browser.version} Safari/537.36"
+            )
+            context = browser.new_context(
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                user_agent=user_agent,
+                extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
+            )
+            try:
+                page = context.new_page()
+                page.goto(
+                    COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+                deadline = time.monotonic() + 35
+                raw: Any = None
+                while time.monotonic() < deadline:
+                    raw = page.evaluate(COINGLASS_LIQUIDATION_OPTION_JS)
+                    if isinstance(raw, dict) and raw.get("current_price"):
+                        break
+                    page.wait_for_timeout(750)
+                snapshot = normalize_hyperliquid_liquidation(raw)
+                page.goto(
+                    COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
+                    wait_until="domcontentloaded",
+                    timeout=45_000,
+                )
+                deadline = time.monotonic() + 35
+                ratio_raw: Any = None
+                while time.monotonic() < deadline:
+                    ratio_raw = page.evaluate(COINGLASS_LONG_SHORT_RATIO_JS)
+                    if isinstance(ratio_raw, dict) and ratio_raw.get("long_users"):
+                        break
+                    page.wait_for_timeout(750)
+                snapshot["long_short_ratio"] = normalize_hyperliquid_long_short_ratio(ratio_raw)
+                return snapshot
+            finally:
+                context.close()
+        finally:
+            browser.close()
+
+
+def fetch_hyperliquid_liquidation_snapshot() -> dict[str, Any]:
+    cached, captured_at, failed_at = load_hyperliquid_liquidation_cache()
+    now = cn_now()
+
+    def stale_cached_snapshot() -> dict[str, Any]:
+        if cached is None:
+            return {}
+        result = dict(cached)
+        result["_stale"] = True
+        if captured_at is not None:
+            result["_captured_at"] = captured_at.isoformat(timespec="minutes")
+        return result
+
+    if cached is not None and captured_at is not None:
+        cache_age = (now - captured_at).total_seconds()
+        if 0 <= cache_age < COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS:
+            return cached
+    if failed_at is not None:
+        failure_age = (now - failed_at).total_seconds()
+        if 0 <= failure_age < COINGLASS_LIQUIDATION_FAILURE_COOLDOWN_SECONDS:
+            if cached is not None:
+                print("[coinglass-cache] refresh cooldown; using last snapshot", file=sys.stderr)
+                return stale_cached_snapshot()
+            return {}
+    try:
+        snapshot = fetch_hyperliquid_liquidation_live()
+    except Exception as exc:
+        save_hyperliquid_liquidation_failure()
+        print(
+            f"[coinglass-liquidation-error] {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        if cached is not None:
+            print("[coinglass-cache] using last successful snapshot", file=sys.stderr)
+            return stale_cached_snapshot()
+        return {}
+    save_hyperliquid_liquidation_cache(snapshot)
+    print(
+        f"[coinglass-liquidation] BTC current={snapshot['current_price']:.2f} "
+        f"long={len(snapshot['long_levels'])} short={len(snapshot['short_levels'])} "
+        f"ratio={snapshot['long_short_ratio']['ratio']:.4f}",
+        file=sys.stderr,
+    )
+    return snapshot
 
 
 def scrape_handle_url(
@@ -2453,7 +2831,6 @@ def block_text(title: str, sections: list[str], continued: bool = False) -> str:
 
 def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int) -> list[list[dict[str, Any]]]:
     max_items = group_size if group_size > 0 else sum(int(block.get("count") or 0) for block in blocks)
-    first_group_items = min(max_items, TELEGRAM_FIRST_GROUP_SIZE) if group_size > 0 else max_items
     groups: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_count = 0
@@ -2464,7 +2841,7 @@ def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int) -> list[
         sections = list(block["sections"])
         sent = 0
         while sent < len(sections):
-            group_limit = first_group_items if not groups else max_items
+            group_limit = max_items
             if current_count >= group_limit:
                 groups.append(current)
                 current = []
@@ -2538,13 +2915,7 @@ def build_telegram_reports(
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
         mode_suffix = " 重点" if mode == "focus" else ""
         header = f"市场全景 {hours}H{mode_suffix} | 第1/1页 | {now}"
-        stats_line = (
-            f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
-            f"{selected_kol_title} 0 | 总推文 0 | 本页 0"
-        )
-        lines = [header, stats_line]
-        if status_header:
-            lines.append(f"状态 | {status_header}")
+        lines = [header]
         if stablecoin_summary:
             lines.extend(stablecoin_summary.splitlines())
         return ["\n".join(lines) + f"\n\n{empty_text}\n"]
@@ -2556,24 +2927,28 @@ def build_telegram_reports(
         for row in rows
     })
     groups = pack_telegram_blocks(blocks, group_size)
-    reports: list[str] = []
-    for group_index, group in enumerate(groups, 1):
-        mode_suffix = " 重点" if mode == "focus" else ""
+    mode_suffix = " 重点" if mode == "focus" else ""
+    total_pages = len(groups) + 1
+    market_header = f"市场全景 {hours}H{mode_suffix} | 第1/{total_pages}页 | {now}"
+    market_lines = [market_header]
+    if stablecoin_summary:
+        market_lines.extend(stablecoin_summary.splitlines())
+    reports = ["\n".join(market_lines).strip() + "\n"]
+
+    for page_number, group in enumerate(groups, 2):
         group_count = sum(int(part.get("count") or 0) for part in group)
-        header = f"市场全景 {hours}H{mode_suffix} | 第{group_index}/{len(groups)}页 | {now}"
-        stats_line = (
-            f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
-            f"{selected_kol_title} {display_kol_count} | 总推文 {display_total} | 本页 {group_count}"
-        )
+        header = f"KOL推文 {hours}H{mode_suffix} | 第{page_number}/{total_pages}页 | {now}"
+        if page_number == 2:
+            stats_line = (
+                f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
+                f"{selected_kol_title} {display_kol_count} | 总推文 {display_total} | 本页 {group_count}"
+            )
+        else:
+            stats_line = f"总推文 {display_total} | 本页 {group_count}"
         lines = [header, stats_line]
-        if group_index == 1:
-            if status_header:
-                lines.append(f"状态 | {status_header}")
-            if stablecoin_summary:
-                lines.extend(stablecoin_summary.splitlines())
+        if page_number == 2 and status_header:
+            lines.append(f"状态 | {status_header}")
         for part in group:
-            if group_index == 1 and stablecoin_summary and part is group[0]:
-                lines.extend([TELEGRAM_SECTION_SEPARATOR, "KOL 推文"])
             lines.extend(["", str(part.get("text") or "").strip()])
         reports.append("\n".join(lines).strip() + "\n")
     return reports
@@ -2748,6 +3123,8 @@ def telegram_report_row_count(report: str) -> int:
         match = re.search(r"(?:本页:|本页\s+|本组:|本组\s+)(\d+)", line)
         if match:
             return int(match.group(1))
+    if report.startswith("市场全景 "):
+        return 0
     raise RuntimeError("Telegram report header is missing its row count")
 
 
@@ -2773,6 +3150,7 @@ def telegram_report_is_summary_heading(line: str) -> bool:
         "加密市场",
         "市场现货",
         "市场合约",
+        "Hyperliquid清算价",
         "美国国债",
         "ETH 质押",
         "稳定币",
@@ -3031,11 +3409,10 @@ def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
         while insert_at < len(lines) and lines[insert_at].startswith(("KOL扫描 ", "扫描 ", "状态 | ", "账号改名:", "不可用KOL:", "扫描异常:", "页面异常:")):
             insert_at += 1
         summary_lines = market_summary_with_separators(summary.splitlines())
-        lines[insert_at:insert_at] = [
-            *summary_lines,
-            TELEGRAM_SECTION_SEPARATOR,
-            "KOL 推文",
-        ]
+        summary_block = list(summary_lines)
+        if telegram_report_row_count(updated[0]) > 0:
+            summary_block.extend([TELEGRAM_SECTION_SEPARATOR, "KOL 推文"])
+        lines[insert_at:insert_at] = summary_block
     updated[0] = "\n".join(lines).rstrip() + "\n"
     return updated
 
