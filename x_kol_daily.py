@@ -83,11 +83,10 @@ FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars
 BLS_MACRO_RELEASE_FALLBACKS = {
     2026: {
         "非农": ((9, 4, 8, 30), (10, 2, 8, 30), (11, 6, 8, 30), (12, 4, 8, 30)),
-        "PPI": ((9, 10, 8, 30), (10, 15, 8, 30), (11, 13, 8, 30), (12, 15, 8, 30)),
         "CPI": ((9, 11, 8, 30), (10, 14, 8, 30), (11, 10, 8, 30), (12, 10, 8, 30)),
     },
 }
-US_MACRO_CALENDAR_LABELS = frozenset({"非农", "PPI", "CPI", "美联储决议"})
+US_MACRO_CALENDAR_LABELS = frozenset({"非农", "CPI", "美联储决议"})
 US_MACRO_CALENDAR_CACHE_VERSION = 1
 US_MACRO_CALENDAR_CACHE_TTL_SECONDS = 24 * 60 * 60
 US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -429,7 +428,6 @@ def parse_bls_macro_schedule(page: str, now: dt.datetime) -> dict[str, dt.dateti
     parser.feed(page)
     release_names = {
         "Consumer Price Index": "CPI",
-        "Producer Price Index": "PPI",
         "Employment Situation": "非农",
     }
     month_numbers = {
@@ -614,7 +612,7 @@ def fetch_bls_macro_calendar(now: dt.datetime) -> dict[str, dt.datetime]:
         )
     except ValueError:
         calendar = {}
-    if {"非农", "PPI", "CPI"}.issubset(calendar):
+    if {"非农", "CPI"}.issubset(calendar):
         return calendar
     try:
         next_year = parse_bls_macro_schedule(
