@@ -87,6 +87,7 @@ BLS_MACRO_RELEASE_FALLBACKS = {
     },
 }
 US_MACRO_CALENDAR_LABELS = frozenset({"非农", "CPI", "美联储决议"})
+US_MACRO_CALENDAR_DISPLAY_LABELS = {"非农": "非农/失业率"}
 US_MACRO_CALENDAR_CACHE_VERSION = 1
 US_MACRO_CALENDAR_CACHE_TTL_SECONDS = 24 * 60 * 60
 US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
@@ -682,7 +683,11 @@ def us_macro_calendar_lines(calendar: dict[str, dt.datetime]) -> list[str]:
         key=lambda item: item[0],
     )
     lines = ["美国宏观日程"]
-    entries = [f"{label} {release_at.strftime('%m-%d %H:%M')}" for release_at, label in scheduled]
+    entries = [
+        f"{US_MACRO_CALENDAR_DISPLAY_LABELS.get(label, label)} "
+        f"{release_at.strftime('%m-%d %H:%M')}"
+        for release_at, label in scheduled
+    ]
     lines.extend(" | ".join(entries[index:index + 2]) for index in range(0, len(entries), 2))
     return lines if entries else []
 
