@@ -10,7 +10,7 @@
 - 支持在 GitHub Actions 页面手动运行
 - 英文推文自动翻译成中文
 - Telegram 按 KOL 分组发送，长内容自动拆分
-- Telegram 首组显示 USDT、USDC 流通量、全网现货（CEX+DEX）、DEX 现货、估算 CEX 现货和全网合约 24H 成交额及较昨日变化；流通量来自 DefiLlama，全网现货/合约来自 CoinGecko，DEX 现货来自 DefiLlama，CEX 为两者差值估算
+- Telegram 首组显示 USDT、USDC 流通量、全网现货（CEX+DEX）、DEX 现货、估算 CEX 现货、全网合约 24H 成交额及 BTC/ETH 现货 ETF 资金流；ETF 数据来自 Farside Investors
 - 定时任务同一天同模式只发送一次，避免重复发 Telegram
 - 过滤广告、抽奖、短回复、URL 残片、长钱包地址和单独币种词
 
@@ -36,6 +36,18 @@ Secret 只填值本身，不要填 `KEY=value` 整行，也不要把 bot 名称�
 ## 手动运行
 
 进入 GitHub Actions 页面，选择 `X KOL Daily`，点击 `Run workflow` 即可手动触发。默认发送全量版 Telegram 摘要，并继续逐条过滤空内容、明显推广和低信号推文。
+
+本地只生成市场首页、不扫描 KOL：
+
+```text
+python x_kol_daily.py --market-only --telegram-preview
+```
+
+发送单条市场首页时显式使用 `--send`。需要防止同一次操作重复发送时，提供唯一的 `--send-once-key`：
+
+```text
+python x_kol_daily.py --market-only --send --send-once-key "market-YYYYMMDD-purpose"
+```
 
 ## Cloudflare 定时触发
 

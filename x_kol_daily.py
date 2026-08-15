@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,8 @@ COINGLASS_HYPERLIQUID_LIQUIDATION_URL = (
 COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL = (
     "https://www.coinglass.com/zh/pro/futures/hyperliquid-long-short-ratio"
 )
+FARSIDE_BITCOIN_ETF_FLOW_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/"
+FARSIDE_ETHEREUM_ETF_FLOW_URL = "https://farside.co.uk/ethereum-etf-flow-all-data/"
 US_TREASURY_DEBT_URL = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
     "v2/accounting/od/debt_to_penny"
@@ -76,11 +79,17 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
+MARKET_SUMMARY_CACHE_VERSION = 5
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 600
 COINGLASS_LIQUIDATION_FAILURE_COOLDOWN_SECONDS = 900
 COINGLASS_LIQUIDATION_LEVEL_LIMIT = 2
 COINGLASS_LIQUIDATION_DISTANCE_LIMIT_PERCENT = 10.0
+SPOT_ETF_FLOW_CACHE_TTL_SECONDS = 3600
+SPOT_ETF_FLOW_FAILURE_COOLDOWN_SECONDS = 1800
+SPOT_ETF_FLOW_CACHE_VERSION = 4
+SPOT_ETF_FLOW_DISPLAY_DAYS = 3
+SPOT_ETF_FLOW_SUMMARY_DAYS = 5
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
@@ -179,6 +188,43 @@ class HTMLTextLinkParser(HTMLParser):
 
     def text(self) -> str:
         return " ".join("".join(self.text_parts).split())
+
+
+class HTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: list[list[list[str]]] = []
+        self.current_table: list[list[str]] | None = None
+        self.current_row: list[str] | None = None
+        self.current_cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "table" and self.current_table is None:
+            self.current_table = []
+        elif tag == "tr" and self.current_table is not None:
+            self.current_row = []
+        elif tag in {"th", "td"} and self.current_row is not None:
+            self.current_cell = []
+        elif tag == "br" and self.current_cell is not None:
+            self.current_cell.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"th", "td"} and self.current_cell is not None:
+            if self.current_row is not None:
+                self.current_row.append(" ".join("".join(self.current_cell).split()))
+            self.current_cell = None
+        elif tag == "tr" and self.current_row is not None:
+            if self.current_table is not None and self.current_row:
+                self.current_table.append(self.current_row)
+            self.current_row = None
+        elif tag == "table" and self.current_table is not None:
+            if self.current_table:
+                self.tables.append(self.current_table)
+            self.current_table = None
+
+    def handle_data(self, data: str) -> None:
+        if self.current_cell is not None:
+            self.current_cell.append(data)
 
 
 def cn_now() -> dt.datetime:
@@ -456,6 +502,114 @@ def fetch_bitmine_eth() -> dict[str, Any]:
     }
 
 
+def parse_etf_flow_millions(value: str) -> float | None:
+    cleaned = value.replace("\xa0", " ").strip()
+    if cleaned in {"", "-", "–", "—"}:
+        return None
+    negative = cleaned.startswith("(") and cleaned.endswith(")")
+    if negative:
+        cleaned = cleaned[1:-1]
+    cleaned = re.sub(r"[$,\s]", "", cleaned)
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", cleaned):
+        return None
+    result = float(cleaned)
+    if negative:
+        result = -result
+    return result if math.isfinite(result) else None
+
+
+def parse_farside_etf_flow_html(page: str) -> dict[str, Any]:
+    parser = HTMLTableParser()
+    parser.feed(page)
+    month_numbers = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    for table in parser.tables:
+        header_index = next((
+            index
+            for index, row in enumerate(table)
+            if row
+            and row[-1].strip().lower() == "total"
+            and row[0].strip().lower() in {"", "date"}
+        ), None)
+        if header_index is None:
+            continue
+        records: list[dict[str, Any]] = []
+        for row in table[header_index + 1:]:
+            if len(row) < 2:
+                continue
+            label = row[0].strip()
+            total = parse_etf_flow_millions(row[-1])
+            if label.lower() == "total":
+                continue
+            date_match = re.fullmatch(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})", label)
+            if date_match is None or total is None:
+                continue
+            published_fund_values = [
+                parse_etf_flow_millions(value)
+                for value in row[1:-1]
+            ]
+            if not any(value is not None for value in published_fund_values):
+                continue
+            has_published_flow = total != 0 or any(
+                value != 0 for value in published_fund_values if value is not None
+            )
+            month = month_numbers.get(date_match.group(2).lower())
+            if month is None:
+                continue
+            try:
+                record_date = dt.date(
+                    int(date_match.group(3)),
+                    month,
+                    int(date_match.group(1)),
+                )
+            except ValueError:
+                continue
+            records.append({
+                "record_date": record_date.isoformat(),
+                "flow_millions": total,
+                "_has_published_flow": has_published_flow,
+            })
+        records.sort(key=lambda item: item["record_date"], reverse=True)
+        while records and not records[0]["_has_published_flow"]:
+            records.pop(0)
+        for record in records:
+            record.pop("_has_published_flow", None)
+        if len(records) >= SPOT_ETF_FLOW_SUMMARY_DAYS:
+            return {
+                "records": records[:SPOT_ETF_FLOW_SUMMARY_DAYS],
+            }
+    raise ValueError("missing Farside ETF flow table")
+
+
+def fetch_farside_etf_flow(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        page = response.read().decode("utf-8", "replace")
+    return parse_farside_etf_flow_html(page)
+
+
+def fetch_spot_etf_flows_live() -> dict[str, Any]:
+    return {
+        "BTC": fetch_farside_etf_flow(FARSIDE_BITCOIN_ETF_FLOW_URL),
+        "ETH": fetch_farside_etf_flow(FARSIDE_ETHEREUM_ETF_FLOW_URL),
+    }
+
+
 def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     for symbol, coin_id in (("USDT", "tether"), ("USDC", "usd-coin")):
@@ -638,6 +792,8 @@ def load_market_summary_cache() -> tuple[str, dt.datetime | None, dt.datetime | 
     cache = state.get("summary_cache", {}) if isinstance(state, dict) else {}
     if not isinstance(cache, dict):
         return "", None, None
+    if cache.get("version") != MARKET_SUMMARY_CACHE_VERSION:
+        return "", None, None
     summary = str(cache.get("summary") or "").strip()
     captured = parse_cache_timestamp(cache.get("captured_at"))
     failed = parse_cache_timestamp(cache.get("failed_at"))
@@ -652,6 +808,7 @@ def save_market_summary_cache(summary: str) -> None:
         state = {"version": 1, "snapshots": {}}
     state["version"] = 1
     state["summary_cache"] = {
+        "version": MARKET_SUMMARY_CACHE_VERSION,
         "summary": summary,
         "captured_at": cn_now().isoformat(timespec="seconds"),
     }
@@ -663,8 +820,9 @@ def save_market_summary_failure() -> None:
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     cache = state.get("summary_cache")
-    if not isinstance(cache, dict):
+    if not isinstance(cache, dict) or cache.get("version") != MARKET_SUMMARY_CACHE_VERSION:
         cache = {}
+    cache["version"] = MARKET_SUMMARY_CACHE_VERSION
     cache["failed_at"] = cn_now().isoformat(timespec="seconds")
     state["version"] = 1
     state["summary_cache"] = cache
@@ -715,6 +873,89 @@ def save_hyperliquid_liquidation_failure() -> None:
     save_json(MARKET_STATE, state)
 
 
+def load_spot_etf_flow_cache() -> tuple[
+    dict[str, Any] | None,
+    dt.datetime | None,
+    dt.datetime | None,
+]:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    cache = state.get("spot_etf_flows", {}) if isinstance(state, dict) else {}
+    if not isinstance(cache, dict):
+        return None, None, None
+    if cache.get("version") != SPOT_ETF_FLOW_CACHE_VERSION:
+        return None, None, None
+    snapshot = cache.get("snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = None
+    return (
+        snapshot,
+        parse_cache_timestamp(cache.get("captured_at")),
+        parse_cache_timestamp(cache.get("failed_at")),
+    )
+
+
+def save_spot_etf_flow_cache(snapshot: dict[str, Any]) -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    state["version"] = 1
+    state["spot_etf_flows"] = {
+        "version": SPOT_ETF_FLOW_CACHE_VERSION,
+        "snapshot": snapshot,
+        "captured_at": cn_now().isoformat(timespec="seconds"),
+    }
+    save_json(MARKET_STATE, state)
+
+
+def save_spot_etf_flow_failure() -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    cache = state.get("spot_etf_flows")
+    if not isinstance(cache, dict) or cache.get("version") != SPOT_ETF_FLOW_CACHE_VERSION:
+        cache = {}
+    cache["version"] = SPOT_ETF_FLOW_CACHE_VERSION
+    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
+    state["version"] = 1
+    state["spot_etf_flows"] = cache
+    save_json(MARKET_STATE, state)
+
+
+def fetch_spot_etf_flow_snapshot() -> dict[str, Any]:
+    cached, captured_at, failed_at = load_spot_etf_flow_cache()
+    now = cn_now()
+
+    def stale_cached_snapshot() -> dict[str, Any]:
+        if cached is None:
+            return {}
+        result = dict(cached)
+        result["_stale"] = True
+        if captured_at is not None:
+            result["_captured_at"] = captured_at.isoformat(timespec="seconds")
+        return result
+
+    if cached is not None and captured_at is not None:
+        cache_age = (now - captured_at).total_seconds()
+        if 0 <= cache_age < SPOT_ETF_FLOW_CACHE_TTL_SECONDS:
+            return cached
+    if failed_at is not None and cached is not None:
+        failure_age = (now - failed_at).total_seconds()
+        if 0 <= failure_age < SPOT_ETF_FLOW_FAILURE_COOLDOWN_SECONDS:
+            print("[spot-etf-cache] refresh cooldown; using last snapshot", file=sys.stderr)
+            return stale_cached_snapshot()
+    try:
+        snapshot = fetch_spot_etf_flows_live()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        save_spot_etf_flow_failure()
+        print(f"[spot-etf-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+        if cached is not None:
+            print("[spot-etf-cache] using last successful snapshot", file=sys.stderr)
+            return stale_cached_snapshot()
+        return {}
+    save_spot_etf_flow_cache(snapshot)
+    return snapshot
+
+
 def compact_percent(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".") + "%"
 
@@ -733,6 +974,51 @@ def liquidation_level_text(level: dict[str, Any]) -> str:
 
 def signed_yi(value: float) -> str:
     return f"{'+' if value >= 0 else ''}{value / 1e8:.2f}亿"
+
+
+def signed_etf_yi(value_millions: float) -> str:
+    value = value_millions / 100
+    if value > 0:
+        return f"+{value:.2f}"
+    if value < 0:
+        return f"{value:.2f}"
+    return "0.00"
+
+
+def spot_etf_summary_lines(snapshot: dict[str, Any]) -> list[str]:
+    heading = "现货ETF资金流（亿美元）"
+    if snapshot.get("_stale"):
+        captured_at = parse_cache_timestamp(snapshot.get("_captured_at"))
+        if captured_at is not None:
+            heading = f"现货ETF资金流（亿美元，缓存 {captured_at.strftime('%m-%d %H:%M')}）"
+    lines = [heading]
+    five_day_parts: list[str] = []
+    for symbol in ("BTC", "ETH"):
+        asset = snapshot.get(symbol)
+        if not isinstance(asset, dict):
+            return []
+        records = asset.get("records")
+        if not isinstance(records, list) or len(records) < SPOT_ETF_FLOW_SUMMARY_DAYS:
+            return []
+        daily_parts: list[str] = []
+        five_day_total = 0.0
+        for index, record in enumerate(records[:SPOT_ETF_FLOW_SUMMARY_DAYS]):
+            if not isinstance(record, dict):
+                return []
+            try:
+                record_date = dt.date.fromisoformat(str(record["record_date"]))
+                flow = float(record["flow_millions"])
+            except (KeyError, TypeError, ValueError):
+                return []
+            if not math.isfinite(flow):
+                return []
+            if index < SPOT_ETF_FLOW_DISPLAY_DAYS:
+                daily_parts.append(f"{record_date.strftime('%m-%d')} {signed_etf_yi(flow)}")
+            five_day_total += flow
+        lines.append(f"{symbol} " + " | ".join(daily_parts))
+        five_day_parts.append(f"{symbol} {signed_etf_yi(five_day_total)}")
+    lines.append("5日合计 " + " | ".join(five_day_parts))
+    return lines
 
 
 def chain_delta_text(delta: float, net: bool = False) -> str:
@@ -757,6 +1043,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         "美国国债",
         "ETH 质押",
         "稳定币",
+        "现货ETF资金流（亿美元）",
         "Strategy（微策略）",
     }
     separated: list[str] = []
@@ -766,6 +1053,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         if (
             line in section_headings
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
+            or line.startswith("现货ETF资金流（亿美元，缓存 ")
         ) and separated:
             separated.append(TELEGRAM_SECTION_SEPARATOR)
         separated.append(line)
@@ -779,7 +1067,7 @@ def fetch_stablecoin_summary() -> str:
         cache_age = (now - cached_at).total_seconds()
         if 0 <= cache_age < MARKET_SUMMARY_CACHE_TTL_SECONDS:
             return cached_summary
-    if failed_at is not None:
+    if failed_at is not None and cached_summary:
         failure_age = (now - failed_at).total_seconds()
         if 0 <= failure_age < MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS:
             print("[market-cache] refresh cooldown active", file=sys.stderr)
@@ -792,6 +1080,8 @@ def fetch_stablecoin_summary() -> str:
     eth_staking: dict[str, float] = {}
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
+    spot_etf_flows: dict[str, Any] = {}
+    etf_lines: list[str] = []
     strategy_btc: dict[str, Any] = {}
     bitmine_eth: dict[str, Any] = {}
     supply: dict[str, dict[str, float]] = {}
@@ -799,75 +1089,92 @@ def fetch_stablecoin_summary() -> str:
     derivatives_snapshot: float | None = None
     eth_staking_snapshot: dict[str, float] | None = None
     market_fetch_failed = False
+    market_errors = (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError)
+    previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
     try:
-        dex_volume = fetch_dex_volume()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        previous_derivatives = previous_derivatives_volume(previous_day)
+        previous_eth_staking = previous_eth_staking_total(previous_day)
+    except market_errors as exc:
         market_fetch_failed = True
-        print(f"[dex-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        global_volume = fetch_global_volume()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[global-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        current = fetch_derivatives_volume()
-        previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
-        previous = previous_derivatives_volume(previous_day)
+        previous_derivatives = None
+        previous_eth_staking = None
+        print(f"[market-snapshot-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    source_jobs = {
+        "dex_volume": (fetch_dex_volume, market_errors, "dex-volume", True),
+        "global_volume": (fetch_global_volume, market_errors, "global-volume", True),
+        "derivatives_current": (fetch_derivatives_volume, market_errors, "derivatives-volume", True),
+        "eth_staking_current": (fetch_eth_staking_metrics, market_errors, "eth-staking", True),
+        "us_treasury_debt": (fetch_us_treasury_debt, market_errors, "us-treasury-debt", True),
+        "us_treasury_yields": (
+            fetch_us_treasury_yields,
+            (*market_errors, ET.ParseError),
+            "us-treasury-yield",
+            True,
+        ),
+        "strategy_btc": (fetch_strategy_btc, market_errors, "strategy-btc", False),
+        "bitmine_eth": (
+            fetch_bitmine_eth,
+            (OSError, ValueError, TypeError, KeyError, AttributeError),
+            "bitmine-eth",
+            False,
+        ),
+        "supply": (fetch_stablecoin_supply, market_errors, "stablecoin-supply", True),
+        "volumes": (fetch_stablecoin_volumes, market_errors, "stablecoin-volume", True),
+    }
+    fetched: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            name: executor.submit(job[0])
+            for name, job in source_jobs.items()
+        }
+        try:
+            hyperliquid_liquidation = fetch_hyperliquid_liquidation_snapshot()
+        except Exception as exc:
+            print(
+                f"[coinglass-liquidation-cache-error] {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+        try:
+            spot_etf_flows = fetch_spot_etf_flow_snapshot()
+            etf_lines = spot_etf_summary_lines(spot_etf_flows)
+            if not etf_lines:
+                raise ValueError("incomplete spot ETF flow snapshot")
+        except Exception as exc:
+            market_fetch_failed = True
+            print(f"[spot-etf-cache-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+        for name, future in futures.items():
+            _, errors, label, required = source_jobs[name]
+            try:
+                fetched[name] = future.result()
+            except errors as exc:
+                if required:
+                    market_fetch_failed = True
+                print(f"[{label}-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    dex_volume = fetched.get("dex_volume", {})
+    global_volume = fetched.get("global_volume", {})
+    strategy_btc = fetched.get("strategy_btc", {})
+    bitmine_eth = fetched.get("bitmine_eth", {})
+    supply = fetched.get("supply", {})
+    volumes = fetched.get("volumes", {})
+    us_treasury_debt = fetched.get("us_treasury_debt", {})
+    us_treasury_yields = fetched.get("us_treasury_yields", {})
+    if "derivatives_current" in fetched:
+        current = float(fetched["derivatives_current"])
         derivatives_volume = {"current": current}
-        if previous is not None:
-            delta = current - previous
+        if previous_derivatives is not None:
+            delta = current - previous_derivatives
             derivatives_volume["delta"] = delta
-            derivatives_volume["percent"] = delta / previous * 100 if previous else 0.0
+            derivatives_volume["percent"] = (
+                delta / previous_derivatives * 100 if previous_derivatives else 0.0
+            )
         derivatives_snapshot = current
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[derivatives-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        hyperliquid_liquidation = fetch_hyperliquid_liquidation_snapshot()
-    except Exception as exc:
-        print(
-            f"[coinglass-liquidation-cache-error] {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-    try:
-        current = fetch_eth_staking_metrics()
-        previous_day = (cn_now().date() - dt.timedelta(days=1)).isoformat()
-        previous = previous_eth_staking_total(previous_day)
-        eth_staking = dict(current)
-        if previous is not None:
-            eth_staking["delta"] = current["total"] - previous
-        eth_staking_snapshot = current
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[eth-staking-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        us_treasury_debt = fetch_us_treasury_debt()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[us-treasury-debt-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        us_treasury_yields = fetch_us_treasury_yields()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError) as exc:
-        market_fetch_failed = True
-        print(f"[us-treasury-yield-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        strategy_btc = fetch_strategy_btc()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        print(f"[strategy-btc-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        bitmine_eth = fetch_bitmine_eth()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-        print(f"[bitmine-eth-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        supply = fetch_stablecoin_supply()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[stablecoin-supply-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    try:
-        volumes = fetch_stablecoin_volumes()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-        market_fetch_failed = True
-        print(f"[stablecoin-volume-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    if "eth_staking_current" in fetched:
+        current_staking = dict(fetched["eth_staking_current"])
+        eth_staking = current_staking
+        if previous_eth_staking is not None:
+            eth_staking["delta"] = current_staking["total"] - previous_eth_staking
+        eth_staking_snapshot = current_staking
 
     if market_fetch_failed:
         save_market_summary_failure()
@@ -1052,7 +1359,12 @@ def fetch_stablecoin_summary() -> str:
         ])
     summary = "\n".join(
         market_summary_with_separators(
-            market_lines + stablecoin_lines + strategy_lines + bitmine_lines + treasury_lines
+            market_lines
+            + stablecoin_lines
+            + etf_lines
+            + strategy_lines
+            + bitmine_lines
+            + treasury_lines
         )
     )
     if summary:
@@ -2859,6 +3171,21 @@ def pack_telegram_blocks(blocks: list[dict[str, Any]], group_size: int) -> list[
     return groups or [[]]
 
 
+def build_market_report(
+    hours: int,
+    stablecoin_summary: str,
+    total_pages: int = 1,
+    mode: str = "full",
+    generated_at: str = "",
+) -> str:
+    mode_suffix = " 重点" if mode == "focus" else ""
+    now = generated_at or cn_now().strftime("%m-%d %H:%M")
+    lines = [f"市场全景 {hours}H{mode_suffix} | 第1/{total_pages}页 | {now}"]
+    if stablecoin_summary:
+        lines.extend(stablecoin_summary.splitlines())
+    return "\n".join(lines).strip() + "\n"
+
+
 def build_telegram_reports(
     results: list[dict[str, Any]],
     hours: int,
@@ -2913,12 +3240,13 @@ def build_telegram_reports(
     status_header = " | ".join(status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
-        mode_suffix = " 重点" if mode == "focus" else ""
-        header = f"市场全景 {hours}H{mode_suffix} | 第1/1页 | {now}"
-        lines = [header]
-        if stablecoin_summary:
-            lines.extend(stablecoin_summary.splitlines())
-        return ["\n".join(lines) + f"\n\n{empty_text}\n"]
+        market_report = build_market_report(
+            hours,
+            stablecoin_summary,
+            mode=mode,
+            generated_at=now,
+        )
+        return [market_report.rstrip() + f"\n\n{empty_text}\n"]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
@@ -2927,13 +3255,15 @@ def build_telegram_reports(
         for row in rows
     })
     groups = pack_telegram_blocks(blocks, group_size)
-    mode_suffix = " 重点" if mode == "focus" else ""
     total_pages = len(groups) + 1
-    market_header = f"市场全景 {hours}H{mode_suffix} | 第1/{total_pages}页 | {now}"
-    market_lines = [market_header]
-    if stablecoin_summary:
-        market_lines.extend(stablecoin_summary.splitlines())
-    reports = ["\n".join(market_lines).strip() + "\n"]
+    reports = [build_market_report(
+        hours,
+        stablecoin_summary,
+        total_pages=total_pages,
+        mode=mode,
+        generated_at=now,
+    )]
+    mode_suffix = " 重点" if mode == "focus" else ""
 
     for page_number, group in enumerate(groups, 2):
         group_count = sum(int(part.get("count") or 0) for part in group)
@@ -3154,6 +3484,7 @@ def telegram_report_is_summary_heading(line: str) -> bool:
         "美国国债",
         "ETH 质押",
         "稳定币",
+        "现货ETF资金流",
         "Strategy（微策略）",
         "稳定币 | ",
         "稳定币流通量 | ",
@@ -3434,12 +3765,14 @@ def telegram_report_chunks(reports: list[str]) -> list[dict[str, Any]]:
 
 
 def scheduled_send_key(args: argparse.Namespace) -> str:
+    override = str(getattr(args, "send_once_key", "") or "").strip()
+    if not override:
+        override = os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip()
+    if override:
+        return override
     event_name = os.environ.get("GITHUB_EVENT_NAME", "").strip()
     if event_name not in {"schedule", "workflow_dispatch"}:
         return ""
-    override = os.environ.get("X_KOL_SEND_ONCE_KEY", "").strip()
-    if override:
-        return override
     if event_name == "workflow_dispatch":
         run_id = os.environ.get("GITHUB_RUN_ID", "").strip()
         if not run_id:
@@ -3558,6 +3891,8 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true", help="show browser")
     ap.add_argument("--send", action="store_true", help="send report to Telegram")
     ap.add_argument("--no-send", action="store_true", help="do not send Telegram after a live scan")
+    ap.add_argument("--market-only", action="store_true", help="build only the market overview; never scan KOLs")
+    ap.add_argument("--send-once-key", default="", help="explicit idempotency key for Telegram sending")
     ap.add_argument("--no-translate", action="store_true")
     ap.add_argument("--translate-cache", action="store_true", help="translate missing English tweets in cache only")
     ap.add_argument(
@@ -3581,6 +3916,17 @@ def main() -> int:
     live_scan_send = not args.no_send
 
     load_dotenv(ROOT / ".env")
+    if args.market_only:
+        stablecoin_summary = fetch_stablecoin_summary()
+        if not stablecoin_summary:
+            raise RuntimeError("market overview is unavailable")
+        report = build_market_report(args.hours, stablecoin_summary)
+        if args.telegram_preview or not args.send or args.no_send:
+            print(report)
+        if args.send and not args.no_send:
+            stats = telegram_send_reports_once([report], args)
+            print(f"sent groups={stats['groups']} rows={stats['rows']}")
+        return 0
     if args.cache_recent > 0:
         results = cached_results(args.cache_recent, args.hours, args.handles)
         stablecoin_summary = fetch_stablecoin_summary() if args.telegram_preview or (args.send and not args.no_send) else ""
