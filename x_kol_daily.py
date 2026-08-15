@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import hashlib
 import http.client
@@ -37,7 +38,9 @@ TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 MARKET_STATE = CACHE_DIR / "market.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
-TELEGRAM_SECTION_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+TELEGRAM_SECTION_SEPARATOR_WIDTH = 51
+TELEGRAM_SECTION_SEPARATOR = "━" * TELEGRAM_SECTION_SEPARATOR_WIDTH
+TELEGRAM_VISUAL_GAP = "\u200b"
 TELEGRAM_SEND_RETRIES = 3
 TELEGRAM_RETRY_BASE_SECONDS = 2.0
 TELEGRAM_RETRY_MAX_SECONDS = 30.0
@@ -60,6 +63,8 @@ COINGLASS_HYPERLIQUID_LIQUIDATION_URL = (
 COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL = (
     "https://www.coinglass.com/zh/pro/futures/hyperliquid-long-short-ratio"
 )
+COINGLASS_MARKET_OVERVIEW_URL = "https://www.coinglass.com/zh"
+COINGLASS_BALANCE_URL = "https://www.coinglass.com/zh/Balance"
 FARSIDE_BITCOIN_ETF_FLOW_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/"
 FARSIDE_ETHEREUM_ETF_FLOW_URL = "https://farside.co.uk/ethereum-etf-flow-all-data/"
 US_TREASURY_DEBT_URL = (
@@ -79,10 +84,12 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 5
+MARKET_SUMMARY_CACHE_VERSION = 12
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
-COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS = 600
-COINGLASS_LIQUIDATION_FAILURE_COOLDOWN_SECONDS = 900
+COINGLASS_CACHE_TTL_SECONDS = 600
+COINGLASS_FAILURE_COOLDOWN_SECONDS = 900
+COINGLASS_CACHE_VERSION = 4
+COINGLASS_PAGE_WAIT_SECONDS = 20
 COINGLASS_LIQUIDATION_LEVEL_LIMIT = 2
 COINGLASS_LIQUIDATION_DISTANCE_LIMIT_PERCENT = 10.0
 SPOT_ETF_FLOW_CACHE_TTL_SECONDS = 3600
@@ -829,14 +836,16 @@ def save_market_summary_failure() -> None:
     save_json(MARKET_STATE, state)
 
 
-def load_hyperliquid_liquidation_cache() -> tuple[
+def load_coinglass_cache() -> tuple[
     dict[str, Any] | None,
     dt.datetime | None,
     dt.datetime | None,
 ]:
     state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
-    cache = state.get("hyperliquid_liquidation", {}) if isinstance(state, dict) else {}
+    cache = state.get("coinglass", {}) if isinstance(state, dict) else {}
     if not isinstance(cache, dict):
+        return None, None, None
+    if cache.get("version") != COINGLASS_CACHE_VERSION:
         return None, None, None
     snapshot = cache.get("snapshot")
     if not isinstance(snapshot, dict):
@@ -848,28 +857,32 @@ def load_hyperliquid_liquidation_cache() -> tuple[
     )
 
 
-def save_hyperliquid_liquidation_cache(snapshot: dict[str, Any]) -> None:
+def save_coinglass_cache(snapshot: dict[str, Any]) -> None:
     state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     state["version"] = 1
-    state["hyperliquid_liquidation"] = {
+    state["coinglass"] = {
+        "version": COINGLASS_CACHE_VERSION,
         "snapshot": snapshot,
         "captured_at": cn_now().isoformat(timespec="seconds"),
     }
+    state.pop("hyperliquid_liquidation", None)
+    state.pop("coinglass_market_structure", None)
     save_json(MARKET_STATE, state)
 
 
-def save_hyperliquid_liquidation_failure() -> None:
+def save_coinglass_failure() -> None:
     state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
-    cache = state.get("hyperliquid_liquidation")
-    if not isinstance(cache, dict):
+    cache = state.get("coinglass")
+    if not isinstance(cache, dict) or cache.get("version") != COINGLASS_CACHE_VERSION:
         cache = {}
+    cache["version"] = COINGLASS_CACHE_VERSION
     cache["failed_at"] = cn_now().isoformat(timespec="seconds")
     state["version"] = 1
-    state["hyperliquid_liquidation"] = cache
+    state["coinglass"] = cache
     save_json(MARKET_STATE, state)
 
 
@@ -1035,6 +1048,25 @@ def visible_yi_change(value: float) -> bool:
     return f"{abs(value) / 1e8:.2f}" != "0.00"
 
 
+def compact_btc_change(value: float) -> str:
+    if abs(value) >= 1e4:
+        return f"{value / 1e4:+.2f}万枚"
+    return f"{value:+,.0f}枚"
+
+
+def coinglass_cache_suffix(snapshot: dict[str, Any]) -> str:
+    if not snapshot.get("_stale"):
+        return ""
+    captured_at = parse_cache_timestamp(snapshot.get("_captured_at"))
+    if captured_at is not None:
+        return f"（CoinGlass缓存 {captured_at.strftime('%m-%d %H:%M')}）"
+    return "（CoinGlass缓存）"
+
+
+def is_telegram_section_separator(line: str) -> bool:
+    return bool(re.fullmatch(r"━{16,}", line))
+
+
 def market_summary_with_separators(lines: list[str]) -> list[str]:
     section_headings = {
         "市场现货（亿美元）",
@@ -1047,8 +1079,9 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         "Strategy（微策略）",
     }
     separated: list[str] = []
-    for line in lines:
-        if line == TELEGRAM_SECTION_SEPARATOR:
+    for raw_line in lines:
+        line = raw_line.replace("（CoinGecko）", "")
+        if is_telegram_section_separator(line):
             continue
         if (
             line in section_headings
@@ -1076,7 +1109,9 @@ def fetch_stablecoin_summary() -> str:
     dex_volume: dict[str, float] = {}
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
+    coinglass_snapshot: dict[str, Any] = {}
     hyperliquid_liquidation: dict[str, Any] = {}
+    coinglass_market_structure: dict[str, Any] = {}
     eth_staking: dict[str, float] = {}
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
@@ -1128,10 +1163,20 @@ def fetch_stablecoin_summary() -> str:
             for name, job in source_jobs.items()
         }
         try:
-            hyperliquid_liquidation = fetch_hyperliquid_liquidation_snapshot()
+            coinglass_snapshot = fetch_coinglass_snapshot()
+            hyperliquid_liquidation = coinglass_snapshot
+            market_structure = coinglass_snapshot.get("market_structure")
+            if isinstance(market_structure, dict):
+                coinglass_market_structure = dict(market_structure)
+                if coinglass_snapshot.get("_stale"):
+                    coinglass_market_structure["_stale"] = True
+                    if coinglass_snapshot.get("_captured_at"):
+                        coinglass_market_structure["_captured_at"] = (
+                            coinglass_snapshot["_captured_at"]
+                        )
         except Exception as exc:
             print(
-                f"[coinglass-liquidation-cache-error] {type(exc).__name__}: {exc}",
+                f"[coinglass-cache-error] {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
         try:
@@ -1197,9 +1242,24 @@ def fetch_stablecoin_summary() -> str:
             "加密市场",
             f"总市值 {global_volume['market_cap'] / 1e12:.2f}万亿美元 | "
             f"24H {global_volume['market_cap_percent']:+.2f}%",
-            f"占比 BTC {global_volume['btc_dominance']:.2f}% | "
-            f"ETH {global_volume['eth_dominance']:.2f}%",
         ])
+        if coinglass_market_structure:
+            stale_suffix = coinglass_cache_suffix(coinglass_market_structure)
+            market_lines.extend([
+                f"BTC占比 {coinglass_market_structure['btc_dominance']:.2f}% | "
+                f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}% | "
+                f"ETH占比 {global_volume['eth_dominance']:.2f}%",
+                f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
+                f"24H {compact_btc_change(coinglass_market_structure['exchange_balance_change_24h'])} | "
+                f"7D {compact_btc_change(coinglass_market_structure['exchange_balance_change_7d'])} | "
+                f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}"
+                f"{stale_suffix}",
+            ])
+        else:
+            market_lines.append(
+                f"BTC占比 {global_volume['btc_dominance']:.2f}% | "
+                f"ETH占比 {global_volume['eth_dominance']:.2f}%"
+            )
         spot_lines.append(
             f"全网 {global_volume['current'] / 1e8:.2f}亿 | "
             f"{signed_yi(global_volume['delta'])}（{global_volume['percent']:+.2f}%）"
@@ -1334,7 +1394,10 @@ def fetch_stablecoin_summary() -> str:
                 f"{signed_yi(item['delta'])}（{item['percent']:+.2f}%）"
             )
         if fields:
-            stablecoin_sections.extend([symbol, *fields])
+            fields[0] = f"{symbol}{fields[0]}"
+            if stablecoin_sections:
+                stablecoin_sections.append(TELEGRAM_VISUAL_GAP)
+            stablecoin_sections.extend(fields)
     if stablecoin_sections:
         stablecoin_lines.extend(["稳定币", *stablecoin_sections])
     strategy_lines: list[str] = []
@@ -1630,6 +1693,45 @@ COINGLASS_LONG_SHORT_RATIO_JS = r"""
 }
 """
 
+COINGLASS_MARKET_STRUCTURE_JS = r"""
+() => {
+  const leafTexts = href => {
+    const link = document.querySelector(`a.card-link[href="${href}"]`);
+    if (!link) return [];
+    return Array.from(link.querySelectorAll('*'))
+      .filter(node => node.children.length === 0)
+      .map(node => (node.textContent || '').trim())
+      .filter(Boolean);
+  };
+  const dominance = leafTexts('/zh/pro/i/MarketCap');
+  return {
+    dominance_change: dominance[1] || '',
+    dominance: dominance[2] || ''
+  };
+}
+"""
+
+COINGLASS_BALANCE_TOTAL_JS = r"""
+() => {
+  const rows = Array.from(document.querySelectorAll('table tr'));
+  const total = rows.find(row =>
+    Array.from(row.querySelectorAll('td')).some(cell =>
+      (cell.textContent || '').trim() === '总计'
+    )
+  );
+  if (!total) return null;
+  const cells = Array.from(total.querySelectorAll('td'))
+    .map(cell => (cell.textContent || '').trim());
+  if (cells.length < 6) return null;
+  return {
+    balance: cells[cells.length - 4],
+    balance_change_24h: cells[cells.length - 3],
+    balance_change_7d: cells[cells.length - 2],
+    balance_change_30d: cells[cells.length - 1]
+  };
+}
+"""
+
 STATUS_AUTHOR_JS = r"""
 statusId => {
   const statusPath = `/status/${statusId}`;
@@ -1788,75 +1890,153 @@ def normalize_hyperliquid_long_short_ratio(raw: Any) -> dict[str, Any]:
     }
 
 
-def fetch_hyperliquid_liquidation_live() -> dict[str, Any]:
+def normalize_coinglass_market_structure(raw: Any) -> dict[str, float]:
+    if not isinstance(raw, dict):
+        raise ValueError("missing CoinGlass market structure data")
+
+    def parse_number(value: Any, suffix: str = "") -> float:
+        text = str(value or "").strip().replace(",", "")
+        if suffix and text.endswith(suffix):
+            text = text[:-len(suffix)].strip()
+        return float(text)
+
     try:
-        from playwright.sync_api import sync_playwright
+        dominance = parse_number(raw.get("dominance"), "%")
+        dominance_change = parse_number(raw.get("dominance_change"), "%")
+        balance_text = str(raw.get("balance") or "").strip()
+        balance_multiplier = 1e4 if balance_text.endswith("万") else 1.0
+        balance = parse_number(balance_text, "万") * balance_multiplier
+        balance_change_24h = parse_number(raw.get("balance_change_24h"))
+        balance_change_7d = parse_number(raw.get("balance_change_7d"))
+        balance_change_30d = parse_number(raw.get("balance_change_30d"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid CoinGlass market structure data") from exc
+    balance_changes = (balance_change_24h, balance_change_7d, balance_change_30d)
+    values = (dominance, dominance_change, balance, *balance_changes)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("non-finite CoinGlass market structure data")
+    if (
+        not 0 <= dominance <= 100
+        or balance <= 0
+        or any(abs(change) > balance for change in balance_changes)
+    ):
+        raise ValueError("out-of-range CoinGlass market structure data")
+    return {
+        "btc_dominance": dominance,
+        "btc_dominance_change_24h": dominance_change,
+        "exchange_balance": balance,
+        "exchange_balance_change_24h": balance_change_24h,
+        "exchange_balance_change_7d": balance_change_7d,
+        "exchange_balance_change_30d": balance_change_30d,
+    }
+
+
+def fetch_coinglass_live() -> dict[str, Any]:
+    try:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright
     except Exception as exc:
-        raise RuntimeError("missing playwright for CoinGlass liquidation map") from exc
+        raise RuntimeError("missing playwright for CoinGlass pages") from exc
 
-    chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
-    with sync_playwright() as playwright:
-        launch_kwargs: dict[str, Any] = {
-            "headless": True,
-            "args": ["--disable-gpu", "--no-first-run", "--no-default-browser-check"],
-        }
-        if chrome_path:
-            launch_kwargs["executable_path"] = chrome_path
-        browser = playwright.chromium.launch(**launch_kwargs)
-        try:
-            if sys.platform.startswith("win"):
-                user_agent_platform = "Windows NT 10.0; Win64; x64"
-            elif sys.platform == "darwin":
-                user_agent_platform = "Macintosh; Intel Mac OS X 10_15_7"
-            else:
-                user_agent_platform = "X11; Linux x86_64"
-            user_agent = (
-                f"Mozilla/5.0 ({user_agent_platform}) AppleWebKit/537.36 "
-                f"(KHTML, like Gecko) Chrome/{browser.version} Safari/537.36"
-            )
-            context = browser.new_context(
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-                user_agent=user_agent,
-                extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-            )
+    async def collect_snapshot() -> dict[str, Any]:
+        chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
+        async with async_playwright() as playwright:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-first-run", "--no-default-browser-check"],
+            }
+            if chrome_path:
+                launch_kwargs["executable_path"] = chrome_path
+            browser = await playwright.chromium.launch(**launch_kwargs)
             try:
-                page = context.new_page()
-                page.goto(
-                    COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
+                if sys.platform.startswith("win"):
+                    user_agent_platform = "Windows NT 10.0; Win64; x64"
+                elif sys.platform == "darwin":
+                    user_agent_platform = "Macintosh; Intel Mac OS X 10_15_7"
+                else:
+                    user_agent_platform = "X11; Linux x86_64"
+                user_agent = (
+                    f"Mozilla/5.0 ({user_agent_platform}) AppleWebKit/537.36 "
+                    f"(KHTML, like Gecko) Chrome/{browser.version} Safari/537.36"
                 )
-                deadline = time.monotonic() + 35
-                raw: Any = None
-                while time.monotonic() < deadline:
-                    raw = page.evaluate(COINGLASS_LIQUIDATION_OPTION_JS)
-                    if isinstance(raw, dict) and raw.get("current_price"):
-                        break
-                    page.wait_for_timeout(750)
-                snapshot = normalize_hyperliquid_liquidation(raw)
-                page.goto(
-                    COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
+                context = await browser.new_context(
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    user_agent=user_agent,
+                    extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
                 )
-                deadline = time.monotonic() + 35
-                ratio_raw: Any = None
-                while time.monotonic() < deadline:
-                    ratio_raw = page.evaluate(COINGLASS_LONG_SHORT_RATIO_JS)
-                    if isinstance(ratio_raw, dict) and ratio_raw.get("long_users"):
-                        break
-                    page.wait_for_timeout(750)
-                snapshot["long_short_ratio"] = normalize_hyperliquid_long_short_ratio(ratio_raw)
-                return snapshot
+                try:
+                    async def route_assets(route: Any) -> None:
+                        if route.request.resource_type in {"image", "media", "font"}:
+                            await route.abort()
+                        else:
+                            await route.continue_()
+
+                    await context.route("**/*", route_assets)
+
+                    async def read_page(url: str, script: str, ready_key: str) -> Any:
+                        page = await context.new_page()
+                        deadline = time.monotonic() + COINGLASS_PAGE_WAIT_SECONDS
+                        try:
+                            try:
+                                await page.goto(
+                                    url,
+                                    wait_until="domcontentloaded",
+                                    timeout=15_000,
+                                )
+                            except PlaywrightTimeoutError:
+                                pass
+                            raw: Any = None
+                            while time.monotonic() < deadline:
+                                raw = await page.evaluate(script)
+                                if isinstance(raw, dict) and raw.get(ready_key):
+                                    return raw
+                                await page.wait_for_timeout(500)
+                            raise ValueError(f"CoinGlass page data timeout: {ready_key}")
+                        finally:
+                            await page.close()
+
+                    liquidation_raw, ratio_raw, market_raw, balance_raw = await asyncio.gather(
+                        read_page(
+                            COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
+                            COINGLASS_LIQUIDATION_OPTION_JS,
+                            "current_price",
+                        ),
+                        read_page(
+                            COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
+                            COINGLASS_LONG_SHORT_RATIO_JS,
+                            "long_users",
+                        ),
+                        read_page(
+                            COINGLASS_MARKET_OVERVIEW_URL,
+                            COINGLASS_MARKET_STRUCTURE_JS,
+                            "dominance",
+                        ),
+                        read_page(
+                            COINGLASS_BALANCE_URL,
+                            COINGLASS_BALANCE_TOTAL_JS,
+                            "balance",
+                        ),
+                    )
+                    snapshot = normalize_hyperliquid_liquidation(liquidation_raw)
+                    snapshot["long_short_ratio"] = normalize_hyperliquid_long_short_ratio(
+                        ratio_raw
+                    )
+                    snapshot["market_structure"] = normalize_coinglass_market_structure({
+                        **market_raw,
+                        **balance_raw,
+                    })
+                    return snapshot
+                finally:
+                    await context.close()
             finally:
-                context.close()
-        finally:
-            browser.close()
+                await browser.close()
+
+    return asyncio.run(collect_snapshot())
 
 
-def fetch_hyperliquid_liquidation_snapshot() -> dict[str, Any]:
-    cached, captured_at, failed_at = load_hyperliquid_liquidation_cache()
+def fetch_coinglass_snapshot() -> dict[str, Any]:
+    cached, captured_at, failed_at = load_coinglass_cache()
     now = cn_now()
 
     def stale_cached_snapshot() -> dict[str, Any]:
@@ -1870,32 +2050,37 @@ def fetch_hyperliquid_liquidation_snapshot() -> dict[str, Any]:
 
     if cached is not None and captured_at is not None:
         cache_age = (now - captured_at).total_seconds()
-        if 0 <= cache_age < COINGLASS_LIQUIDATION_CACHE_TTL_SECONDS:
+        if 0 <= cache_age < COINGLASS_CACHE_TTL_SECONDS:
             return cached
     if failed_at is not None:
         failure_age = (now - failed_at).total_seconds()
-        if 0 <= failure_age < COINGLASS_LIQUIDATION_FAILURE_COOLDOWN_SECONDS:
+        if 0 <= failure_age < COINGLASS_FAILURE_COOLDOWN_SECONDS:
             if cached is not None:
                 print("[coinglass-cache] refresh cooldown; using last snapshot", file=sys.stderr)
                 return stale_cached_snapshot()
             return {}
+    started_at = time.monotonic()
     try:
-        snapshot = fetch_hyperliquid_liquidation_live()
+        snapshot = fetch_coinglass_live()
     except Exception as exc:
-        save_hyperliquid_liquidation_failure()
+        save_coinglass_failure()
         print(
-            f"[coinglass-liquidation-error] {type(exc).__name__}: {exc}",
+            f"[coinglass-error] {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         if cached is not None:
             print("[coinglass-cache] using last successful snapshot", file=sys.stderr)
             return stale_cached_snapshot()
         return {}
-    save_hyperliquid_liquidation_cache(snapshot)
+    save_coinglass_cache(snapshot)
+    market_structure = snapshot["market_structure"]
     print(
-        f"[coinglass-liquidation] BTC current={snapshot['current_price']:.2f} "
+        f"[coinglass] BTC current={snapshot['current_price']:.2f} "
         f"long={len(snapshot['long_levels'])} short={len(snapshot['short_levels'])} "
-        f"ratio={snapshot['long_short_ratio']['ratio']:.4f}",
+        f"ratio={snapshot['long_short_ratio']['ratio']:.4f} "
+        f"dominance={market_structure['btc_dominance']:.2f}% "
+        f"balance={market_structure['exchange_balance']:.2f} "
+        f"elapsed={time.monotonic() - started_at:.1f}s",
         file=sys.stderr,
     )
     return snapshot
@@ -3180,9 +3365,13 @@ def build_market_report(
 ) -> str:
     mode_suffix = " 重点" if mode == "focus" else ""
     now = generated_at or cn_now().strftime("%m-%d %H:%M")
-    lines = [f"市场全景 {hours}H{mode_suffix} | 第1/{total_pages}页 | {now}"]
+    if total_pages > 1:
+        header = f"市场全景 {hours}H{mode_suffix} | 第1/{total_pages}页 | {now}"
+    else:
+        header = f"市场全景 {hours}H{mode_suffix} | {now}"
+    lines = [header]
     if stablecoin_summary:
-        lines.extend(stablecoin_summary.splitlines())
+        lines.extend(market_summary_with_separators(stablecoin_summary.splitlines()))
     return "\n".join(lines).strip() + "\n"
 
 
@@ -3502,7 +3691,7 @@ def telegram_report_without_market_summary(report: str) -> str:
     kept = lines[:1]
     in_summary = False
     for line in lines[1:metadata_end]:
-        if line == TELEGRAM_SECTION_SEPARATOR:
+        if is_telegram_section_separator(line):
             continue
         if telegram_report_is_summary_heading(line):
             in_summary = True
@@ -3522,7 +3711,7 @@ def telegram_report_summary_lines(report: str) -> list[str]:
             break
         if line == "KOL 推文":
             break
-        if line == TELEGRAM_SECTION_SEPARATOR:
+        if is_telegram_section_separator(line):
             continue
         if telegram_report_is_summary_heading(line):
             summary.append(line)
@@ -3584,7 +3773,13 @@ def telegram_report_legacy_summary_line(report: str) -> str:
         parts.append(line.replace("全网24H成交", "全网合约24H成交"))
     for symbol in ("USDT", "USDC"):
         fields = []
-        for line in sections.get(symbol, []):
+        symbol_lines = list(sections.get(symbol, []))
+        symbol_lines.extend(
+            line.removeprefix(symbol)
+            for line in sections.get("稳定币", [])
+            if line.startswith(symbol)
+        )
+        for line in symbol_lines:
             if not line.startswith(("流通量 ", "流通 ", "24H现货成交 ", "现货成交 ", "现货24H成交 ")):
                 continue
             line = line.replace("流通量 ", "流通")
@@ -3725,7 +3920,7 @@ def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
     kept = [lines[0]]
     in_summary = False
     for line in lines[1:metadata_end]:
-        if line == TELEGRAM_SECTION_SEPARATOR:
+        if is_telegram_section_separator(line):
             continue
         if telegram_report_is_summary_heading(line):
             in_summary = True
