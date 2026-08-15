@@ -37,6 +37,7 @@ TRANSLATION_CACHE = CACHE_DIR / "translations.json"
 TWEET_STORE = CACHE_DIR / "tweets.json"
 SENT_STATE = CACHE_DIR / "sent.json"
 MARKET_STATE = CACHE_DIR / "market.json"
+US_MACRO_STATE = CACHE_DIR / "us_macro_calendar.json"
 TELEGRAM_MESSAGE_LIMIT = 3900
 TELEGRAM_SECTION_SEPARATOR_WIDTH = 51
 TELEGRAM_SECTION_SEPARATOR = "━" * TELEGRAM_SECTION_SEPARATOR_WIDTH
@@ -77,6 +78,19 @@ US_TREASURY_YIELD_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml"
     "?data=daily_treasury_yield_curve&field_tdr_date_value={year}"
 )
+BLS_RELEASE_SCHEDULE_URL = "https://www.bls.gov/schedule/{year}/home.htm"
+FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+BLS_MACRO_RELEASE_FALLBACKS = {
+    2026: {
+        "非农": ((9, 4, 8, 30), (10, 2, 8, 30), (11, 6, 8, 30), (12, 4, 8, 30)),
+        "PPI": ((9, 10, 8, 30), (10, 15, 8, 30), (11, 13, 8, 30), (12, 15, 8, 30)),
+        "CPI": ((9, 11, 8, 30), (10, 14, 8, 30), (11, 10, 8, 30), (12, 10, 8, 30)),
+    },
+}
+US_MACRO_CALENDAR_LABELS = frozenset({"非农", "PPI", "CPI", "美联储决议"})
+US_MACRO_CALENDAR_CACHE_VERSION = 1
+US_MACRO_CALENDAR_CACHE_TTL_SECONDS = 24 * 60 * 60
+US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
 STRATEGY_PURCHASES_URL = "https://www.strategy.com/purchases"
 BITMINE_INVESTOR_RELATIONS_URL = "https://www.bitminetech.io/investor-relations"
 STABLECOIN_TIMEOUT_SECONDS = 15
@@ -390,6 +404,289 @@ def fetch_us_treasury_yields() -> dict[str, Any]:
     if not records:
         raise ValueError("missing US Treasury yield records")
     return max(records, key=lambda item: item["record_date"])
+
+
+def us_eastern_release_time(release_date: dt.date, hour: int, minute: int) -> dt.datetime:
+    first_march = dt.date(release_date.year, 3, 1)
+    second_sunday_march = first_march + dt.timedelta(
+        days=(6 - first_march.weekday()) % 7 + 7
+    )
+    first_november = dt.date(release_date.year, 11, 1)
+    first_sunday_november = first_november + dt.timedelta(
+        days=(6 - first_november.weekday()) % 7
+    )
+    offset_hours = -4 if second_sunday_march <= release_date < first_sunday_november else -5
+    eastern = dt.timezone(dt.timedelta(hours=offset_hours))
+    return dt.datetime.combine(
+        release_date,
+        dt.time(hour, minute),
+        tzinfo=eastern,
+    ).astimezone(CN_TZ)
+
+
+def parse_bls_macro_schedule(page: str, now: dt.datetime) -> dict[str, dt.datetime]:
+    parser = HTMLTableParser()
+    parser.feed(page)
+    release_names = {
+        "Consumer Price Index": "CPI",
+        "Producer Price Index": "PPI",
+        "Employment Situation": "非农",
+    }
+    month_numbers = {
+        name: number
+        for number, name in enumerate((
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        ), 1)
+    }
+    upcoming: dict[str, dt.datetime] = {}
+    for table in parser.tables:
+        for row in table:
+            if len(row) < 3:
+                continue
+            release_name = " ".join(row[2:])
+            label = next((
+                short_name
+                for prefix, short_name in release_names.items()
+                if release_name.startswith(prefix)
+            ), "")
+            if not label:
+                continue
+            date_match = re.search(
+                r"(January|February|March|April|May|June|July|August|"
+                r"September|October|November|December)\s+(\d{1,2}),\s+(\d{4})",
+                row[0],
+            )
+            time_match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", row[1], re.IGNORECASE)
+            if date_match is None or time_match is None:
+                continue
+            hour = int(time_match.group(1)) % 12
+            if time_match.group(3).upper() == "PM":
+                hour += 12
+            release_date = dt.date(
+                int(date_match.group(3)),
+                month_numbers[date_match.group(1)],
+                int(date_match.group(2)),
+            )
+            release_at = us_eastern_release_time(release_date, hour, int(time_match.group(2)))
+            if release_at < now:
+                continue
+            existing = upcoming.get(label)
+            if existing is None or release_at < existing:
+                upcoming[label] = release_at
+    if not upcoming:
+        raise ValueError("missing upcoming BLS macro releases")
+    return upcoming
+
+
+def bls_macro_schedule_fallback(now: dt.datetime) -> dict[str, dt.datetime]:
+    upcoming: dict[str, dt.datetime] = {}
+    for year, releases in BLS_MACRO_RELEASE_FALLBACKS.items():
+        for label, entries in releases.items():
+            candidates = [
+                us_eastern_release_time(dt.date(year, month, day), hour, minute)
+                for month, day, hour, minute in entries
+            ]
+            future = [release_at for release_at in candidates if release_at >= now]
+            if future:
+                upcoming[label] = min(future)
+    return upcoming
+
+
+def parse_fomc_calendar(page: str, now: dt.datetime) -> dt.datetime:
+    parser = HTMLTextLinkParser()
+    parser.feed(page)
+    text = parser.text()
+    month_pattern = (
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+    )
+    month_numbers = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    upcoming: list[dt.datetime] = []
+    for year in (now.year, now.year + 1):
+        marker = re.search(rf"\b{year}\s+FOMC Meetings\b", text)
+        if marker is None:
+            continue
+        next_marker = re.search(r"\b\d{4}\s+FOMC Meetings\b", text[marker.end():])
+        section_end = marker.end() + next_marker.start() if next_marker else len(text)
+        section = text[marker.end():section_end]
+        for match in re.finditer(
+            rf"\b({month_pattern})(?:/({month_pattern}))?\s+(\d{{1,2}})-(\d{{1,2}})",
+            section,
+        ):
+            start_month = month_numbers[match.group(1)[:3].lower()]
+            end_month = month_numbers[(match.group(2) or match.group(1))[:3].lower()]
+            decision_year = year + (1 if end_month < start_month else 0)
+            try:
+                decision_date = dt.date(decision_year, end_month, int(match.group(4)))
+            except ValueError:
+                continue
+            decision_at = us_eastern_release_time(decision_date, 14, 0)
+            if decision_at >= now:
+                upcoming.append(decision_at)
+    if not upcoming:
+        raise ValueError("missing upcoming FOMC decision")
+    return min(upcoming)
+
+
+def fetch_us_macro_page(url: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def future_macro_calendar(
+    calendar: dict[str, dt.datetime],
+    now: dt.datetime,
+) -> dict[str, dt.datetime]:
+    return {
+        label: release_at
+        for label, release_at in calendar.items()
+        if label in US_MACRO_CALENDAR_LABELS
+        and isinstance(release_at, dt.datetime)
+        and release_at >= now
+    }
+
+
+def load_us_macro_calendar_cache() -> tuple[
+    dict[str, dt.datetime],
+    dt.datetime | None,
+    dt.datetime | None,
+]:
+    state = load_json(US_MACRO_STATE, {})
+    if not isinstance(state, dict) or state.get("version") != US_MACRO_CALENDAR_CACHE_VERSION:
+        return {}, None, None
+    raw_snapshot = state.get("snapshot")
+    snapshot: dict[str, dt.datetime] = {}
+    if isinstance(raw_snapshot, dict):
+        for label, value in raw_snapshot.items():
+            if label not in US_MACRO_CALENDAR_LABELS:
+                continue
+            parsed = parse_cache_timestamp(value)
+            if parsed is not None:
+                snapshot[label] = parsed.astimezone(CN_TZ)
+    return (
+        snapshot,
+        parse_cache_timestamp(state.get("captured_at")),
+        parse_cache_timestamp(state.get("failed_at")),
+    )
+
+
+def save_us_macro_calendar_cache(
+    calendar: dict[str, dt.datetime],
+    success: bool,
+) -> None:
+    state = load_json(US_MACRO_STATE, {})
+    if not isinstance(state, dict) or state.get("version") != US_MACRO_CALENDAR_CACHE_VERSION:
+        state = {"version": US_MACRO_CALENDAR_CACHE_VERSION}
+    state["snapshot"] = {
+        label: release_at.astimezone(CN_TZ).isoformat(timespec="minutes")
+        for label, release_at in calendar.items()
+        if label in US_MACRO_CALENDAR_LABELS and isinstance(release_at, dt.datetime)
+    }
+    if success:
+        state["captured_at"] = cn_now().isoformat(timespec="seconds")
+        state.pop("failed_at", None)
+    else:
+        state["failed_at"] = cn_now().isoformat(timespec="seconds")
+    save_json(US_MACRO_STATE, state)
+
+
+def fetch_bls_macro_calendar(now: dt.datetime) -> dict[str, dt.datetime]:
+    try:
+        calendar = parse_bls_macro_schedule(
+            fetch_us_macro_page(BLS_RELEASE_SCHEDULE_URL.format(year=now.year)),
+            now,
+        )
+    except ValueError:
+        calendar = {}
+    if {"非农", "PPI", "CPI"}.issubset(calendar):
+        return calendar
+    try:
+        next_year = parse_bls_macro_schedule(
+            fetch_us_macro_page(BLS_RELEASE_SCHEDULE_URL.format(year=now.year + 1)),
+            now,
+        )
+    except (OSError, ValueError, TypeError):
+        next_year = {}
+    for label, release_at in next_year.items():
+        current = calendar.get(label)
+        if current is None or release_at < current:
+            calendar[label] = release_at
+    if not calendar:
+        raise ValueError("missing upcoming BLS macro releases")
+    return calendar
+
+
+def fetch_us_macro_calendar() -> dict[str, dt.datetime]:
+    now = cn_now()
+    cached, captured_at, failed_at = load_us_macro_calendar_cache()
+    calendar = bls_macro_schedule_fallback(now)
+    calendar.update(future_macro_calendar(cached, now))
+    if (
+        captured_at is not None
+        and US_MACRO_CALENDAR_LABELS.issubset(calendar)
+        and 0 <= (now - captured_at).total_seconds() < US_MACRO_CALENDAR_CACHE_TTL_SECONDS
+    ):
+        return calendar
+    if (
+        failed_at is not None
+        and calendar
+        and 0 <= (now - failed_at).total_seconds() < US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS
+    ):
+        print("[us-macro-cache] refresh cooldown active", file=sys.stderr)
+        return calendar
+
+    errors: list[Exception] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        bls_future = executor.submit(fetch_bls_macro_calendar, now)
+        fomc_future = executor.submit(
+            lambda: parse_fomc_calendar(fetch_us_macro_page(FOMC_CALENDAR_URL), now)
+        )
+        try:
+            calendar.update(bls_future.result())
+        except (OSError, ValueError, TypeError) as exc:
+            errors.append(exc)
+        try:
+            calendar["美联储决议"] = fomc_future.result()
+        except (OSError, ValueError, TypeError) as exc:
+            errors.append(exc)
+    calendar = future_macro_calendar(calendar, now)
+    if not calendar:
+        raise errors[0] if errors else ValueError("missing US macro calendar")
+    save_us_macro_calendar_cache(calendar, success=not errors)
+    if errors:
+        print("[us-macro-cache] using cached or fallback schedule", file=sys.stderr)
+    return calendar
+
+
+def us_macro_calendar_lines(calendar: dict[str, dt.datetime]) -> list[str]:
+    scheduled = sorted(
+        (
+            (release_at, label)
+            for label, release_at in calendar.items()
+            if isinstance(release_at, dt.datetime)
+        ),
+        key=lambda item: item[0],
+    )
+    lines = ["美国宏观日程"]
+    entries = [f"{label} {release_at.strftime('%m-%d %H:%M')}" for release_at, label in scheduled]
+    lines.extend(" | ".join(entries[index:index + 2]) for index in range(0, len(entries), 2))
+    return lines if entries else []
 
 
 def fetch_strategy_btc() -> dict[str, Any]:
@@ -1077,6 +1374,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         "稳定币",
         "现货ETF资金流（亿美元）",
         "Strategy（微策略）",
+        "美国宏观日程",
     }
     separated: list[str] = []
     for raw_line in lines:
@@ -1119,6 +1417,7 @@ def fetch_stablecoin_summary() -> str:
     etf_lines: list[str] = []
     strategy_btc: dict[str, Any] = {}
     bitmine_eth: dict[str, Any] = {}
+    us_macro_calendar: dict[str, dt.datetime] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
     derivatives_snapshot: float | None = None
@@ -1146,18 +1445,24 @@ def fetch_stablecoin_summary() -> str:
             "us-treasury-yield",
             True,
         ),
+        "supply": (fetch_stablecoin_supply, market_errors, "stablecoin-supply", True),
+        "volumes": (fetch_stablecoin_volumes, market_errors, "stablecoin-volume", True),
         "strategy_btc": (fetch_strategy_btc, market_errors, "strategy-btc", False),
+        "us_macro_calendar": (
+            fetch_us_macro_calendar,
+            market_errors,
+            "us-macro-calendar",
+            False,
+        ),
         "bitmine_eth": (
             fetch_bitmine_eth,
             (OSError, ValueError, TypeError, KeyError, AttributeError),
             "bitmine-eth",
             False,
         ),
-        "supply": (fetch_stablecoin_supply, market_errors, "stablecoin-supply", True),
-        "volumes": (fetch_stablecoin_volumes, market_errors, "stablecoin-volume", True),
     }
     fetched: dict[str, Any] = {}
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {
             name: executor.submit(job[0])
             for name, job in source_jobs.items()
@@ -1200,6 +1505,7 @@ def fetch_stablecoin_summary() -> str:
     global_volume = fetched.get("global_volume", {})
     strategy_btc = fetched.get("strategy_btc", {})
     bitmine_eth = fetched.get("bitmine_eth", {})
+    us_macro_calendar = fetched.get("us_macro_calendar", {})
     supply = fetched.get("supply", {})
     volumes = fetched.get("volumes", {})
     us_treasury_debt = fetched.get("us_treasury_debt", {})
@@ -1410,6 +1716,7 @@ def fetch_stablecoin_summary() -> str:
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
         ])
+    macro_lines = us_macro_calendar_lines(us_macro_calendar)
     bitmine_lines: list[str] = []
     if bitmine_eth:
         record_date = bitmine_eth["record_date"].strftime("%m-%d")
@@ -1427,6 +1734,7 @@ def fetch_stablecoin_summary() -> str:
             + etf_lines
             + strategy_lines
             + bitmine_lines
+            + macro_lines
             + treasury_lines
         )
     )
@@ -3675,6 +3983,7 @@ def telegram_report_is_summary_heading(line: str) -> bool:
         "稳定币",
         "现货ETF资金流",
         "Strategy（微策略）",
+        "美国宏观日程",
         "稳定币 | ",
         "稳定币流通量 | ",
         "口径：",
