@@ -3893,15 +3893,19 @@ def build_telegram_reports(
 
     for page_number, group in enumerate(groups, 2):
         group_count = sum(int(part.get("count") or 0) for part in group)
-        header = f"KOL推文 {hours}H{mode_suffix} | 第{page_number}/{total_pages}页 | {now}"
         if page_number == 2:
+            header = f"KOL推文 {hours}H{mode_suffix} | 第{page_number}/{total_pages}页 | {now}"
             stats_line = (
                 f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
                 f"{selected_kol_title} {display_kol_count} | 总推文 {display_total} | 本页 {group_count}"
             )
+            lines = [header, stats_line]
         else:
-            stats_line = f"总推文 {display_total} | 本页 {group_count}"
-        lines = [header, stats_line]
+            header = (
+                f"KOL推文 {hours}H{mode_suffix} | 第{page_number}/{total_pages}页 | "
+                f"总推文 {display_total} | 本页 {group_count} | {now}"
+            )
+            lines = [header]
         if page_number == 2 and status_header:
             lines.append(f"状态 | {status_header}")
         for part in group:
