@@ -119,6 +119,7 @@ ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 MAX_PAGE_RECOVERIES = 2
 PAGE_RECOVERY_DELAYS_SECONDS = (10.0, 30.0)
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
+RECOVERY_MIN_ATTEMPT_SECONDS = 12.0
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
@@ -2612,6 +2613,9 @@ def rescan_page_render_failures(
     ]
     if not pending_items:
         return
+    for item in pending_items:
+        diagnostics = item.setdefault("diagnostics", {})
+        diagnostics.setdefault("recovery_original_error", str(item.get("error") or ""))
     print(
         f"[x-deferred-recovery] queued={len(pending_items)} "
         f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
@@ -2621,9 +2625,14 @@ def rescan_page_render_failures(
     for recovery_round in range(1, MAX_PAGE_RECOVERIES + 1):
         if not pending_items:
             break
-        delay = PAGE_RECOVERY_DELAYS_SECONDS[
+        configured_delay = PAGE_RECOVERY_DELAYS_SECONDS[
             min(recovery_round - 1, len(PAGE_RECOVERY_DELAYS_SECONDS) - 1)
         ]
+        reserved_attempt_seconds = RECOVERY_MIN_ATTEMPT_SECONDS * len(pending_items)
+        delay = min(
+            configured_delay,
+            max(0.0, recovery_budget.remaining_seconds - reserved_attempt_seconds),
+        )
         try:
             recovery_budget.sleep(delay)
         except RecoveryBudgetExceeded:
@@ -2633,7 +2642,8 @@ def rescan_page_render_failures(
             break
         print(
             f"[x-deferred-recovery] round={recovery_round}/{MAX_PAGE_RECOVERIES} "
-            f"accounts={len(pending_items)} delay={delay:.0f}s "
+            f"accounts={len(pending_items)} delay={delay:.1f}s "
+            f"configured_delay={configured_delay:.0f}s "
             f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
             file=sys.stderr,
             flush=True,
@@ -2707,7 +2717,6 @@ def rescan_page_render_failures(
             except Exception as exc:
                 diagnostics["fresh_context_recovered"] = False
                 diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
-                item["error"] = f"{type(exc).__name__}: {exc}"
                 if isinstance(exc, RecoveryBudgetExceeded):
                     diagnostics["recovery_attempt_timed_out"] = True
                 if recovery_round < MAX_PAGE_RECOVERIES:
@@ -2884,19 +2893,36 @@ def scrape_all(
                         page = context.new_page()
             finally:
                 context.close()
-            recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
-            rescan_page_render_failures(
-                browser,
-                cookies,
-                results,
-                hours,
-                limit,
-                scrolls,
-                page_wait_ms,
-                scroll_wait_ms,
-                search_fallback,
-                recovery_budget,
+            has_deferred_recovery = any(
+                item.get("status") == "error"
+                and (
+                    item.get("diagnostics", {}).get("deferred_recovery")
+                    or str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
+                )
+                for item in results
             )
+            if has_deferred_recovery:
+                recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
+                browser.close()
+                browser = p.chromium.launch(**launch_kwargs)
+                print(
+                    f"[x-deferred-recovery] browser restarted "
+                    f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                rescan_page_render_failures(
+                    browser,
+                    cookies,
+                    results,
+                    hours,
+                    limit,
+                    scrolls,
+                    page_wait_ms,
+                    scroll_wait_ms,
+                    search_fallback,
+                    recovery_budget,
+                )
         finally:
             browser.close()
     if recovery_budget is not None:
