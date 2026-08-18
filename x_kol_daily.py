@@ -116,12 +116,14 @@ PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
 RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
-MAX_PAGE_RECOVERIES = 2
-PAGE_RECOVERY_DELAYS_SECONDS = (10.0, 30.0)
+GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
-RECOVERY_MIN_ATTEMPT_SECONDS = 12.0
+RECOVERY_QUIET_SECONDS = 60.0
+MAX_PLANNED_X_PAGE_LOADS_PER_RUN = 88
+MAX_SEARCH_FALLBACK_SCROLLS = 2
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
+UNAVAILABLE_RECHECK_INTERVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
 LEGACY_TRANSLATION_LIMIT = 4500
 TRANSLATION_VERSION = 2
@@ -1860,6 +1862,48 @@ def apply_handle_aliases(kols: list[dict[str, str]]) -> list[dict[str, str]]:
     return resolved
 
 
+def apply_unavailable_recheck_policy(
+    kols: list[dict[str, str]],
+    force_recheck: bool = False,
+) -> list[dict[str, str]]:
+    if force_recheck:
+        return kols
+    store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
+    statuses = store.get("kol_status", {})
+    if not isinstance(statuses, dict):
+        raise RuntimeError("invalid kol_status in tweets.json")
+    today = cn_now().date()
+    for kol in kols:
+        identity = canonical_handle(kol.get("configured_handle") or kol.get("handle"))
+        status = statuses.get(identity.lower(), {}) if identity else {}
+        if not isinstance(status, dict):
+            continue
+        if status.get("unavailable_reason") != "suspended":
+            continue
+        if int(status.get("unavailable_days") or 0) < UNAVAILABLE_REMOVAL_DAYS:
+            continue
+        next_recheck_text = str(status.get("next_recheck_date") or "")
+        try:
+            next_recheck_date = dt.date.fromisoformat(next_recheck_text)
+        except ValueError:
+            last_unavailable_text = str(status.get("last_unavailable_date") or "")
+            try:
+                last_unavailable_date = dt.date.fromisoformat(last_unavailable_text)
+            except ValueError:
+                last_unavailable_date = today
+            next_recheck_date = last_unavailable_date + dt.timedelta(
+                days=UNAVAILABLE_RECHECK_INTERVAL_DAYS
+            )
+        if today >= next_recheck_date:
+            continue
+        kol["auto_recheck_paused"] = True
+        kol["unavailable_days"] = int(status.get("unavailable_days") or 0)
+        kol["next_recheck_date"] = next_recheck_date.isoformat()
+        kol["unavailable_reason"] = "suspended"
+        kol["auto_action"] = "recheck_until_reactivated"
+    return kols
+
+
 def cookies_from_env() -> list[dict[str, Any]]:
     auth = os.environ.get("X_AUTH", "").strip()
     ct0 = os.environ.get("X_CT0", "").strip()
@@ -1958,6 +2002,18 @@ PAGE_HEALTH_JS = r"""
   const text = rawText.toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
+  const unavailableStateTexts = Array.from(document.querySelectorAll(
+    '[data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
+  )).map(node => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
+  const stateMatches = values => unavailableStateTexts.some(stateText =>
+    values.some(value => stateText === value || stateText.startsWith(value))
+  );
+  const accountMissing = stateMatches([
+    "this account doesn't exist", '此账号不存在'
+  ]);
+  const accountSuspended = stateMatches([
+    'account suspended', '账号已被冻结'
+  ]);
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
@@ -1968,10 +2024,8 @@ PAGE_HEALTH_JS = r"""
         'temporarily limited', '超过频率限制', '出错了，请尝试重新加载',
         '请验证您是人类', '异常活动', '自动请求', '暂时受到限制'
       ])),
-    accountUnavailable: has([
-      "this account doesn't exist", 'account suspended',
-      '此账号不存在', '账号已被冻结'
-    ]),
+    accountUnavailable: accountMissing || accountSuspended,
+    accountUnavailableReason: accountSuspended ? 'suspended' : accountMissing ? 'missing' : '',
     hasMain,
     path,
     title: (document.title || '').slice(0, 160),
@@ -2112,6 +2166,9 @@ def record_page_health(
         "login_required": bool(health.get("loginRequired")),
         "error_page": bool(health.get("errorPage")),
         "account_unavailable": bool(health.get("accountUnavailable")),
+        "account_unavailable_reason": str(
+            health.get("accountUnavailableReason") or ""
+        )[:40],
         "has_main": bool(health.get("hasMain")),
     }
 
@@ -2582,6 +2639,47 @@ def scrape_handle(
     return rows[:limit]
 
 
+def scrape_handle_search_fallback(
+    page: Any,
+    handle: str,
+    hours: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    clean_handle = handle.lstrip("@")
+    cutoff_ms = int(
+        (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp()
+        * 1000
+    )
+    diagnostics["search_fallback_used"] = True
+    merged: dict[str, dict[str, Any]] = {}
+    url = "https://x.com/search?" + urllib.parse.urlencode(
+        {"q": f"from:{clean_handle}", "src": "typed_query", "f": "live"}
+    )
+    scrape_handle_url(
+        page,
+        handle,
+        url,
+        False,
+        cutoff_ms,
+        limit,
+        scrolls,
+        page_wait_ms,
+        scroll_wait_ms,
+        diagnostics,
+        merged,
+    )
+    rows = sorted(
+        merged.values(),
+        key=lambda item: item.get("created_at_ms", 0),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
 def fmt_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     minutes, sec = divmod(seconds, 60)
@@ -2596,10 +2694,8 @@ def rescan_page_render_failures(
     results: list[dict[str, Any]],
     hours: int,
     limit: int,
-    scrolls: int,
     page_wait_ms: int,
     scroll_wait_ms: int,
-    search_fallback: bool,
     recovery_budget: RecoveryBudget,
 ) -> None:
     pending_items = [
@@ -2618,37 +2714,68 @@ def rescan_page_render_failures(
         diagnostics.setdefault("recovery_original_error", str(item.get("error") or ""))
     print(
         f"[x-deferred-recovery] queued={len(pending_items)} "
+        "mode=shared-profile-only "
         f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
         file=sys.stderr,
         flush=True,
     )
-    for recovery_round in range(1, MAX_PAGE_RECOVERIES + 1):
-        if not pending_items:
-            break
-        configured_delay = PAGE_RECOVERY_DELAYS_SECONDS[
-            min(recovery_round - 1, len(PAGE_RECOVERY_DELAYS_SECONDS) - 1)
-        ]
-        reserved_attempt_seconds = RECOVERY_MIN_ATTEMPT_SECONDS * len(pending_items)
-        delay = min(
-            configured_delay,
-            max(0.0, recovery_budget.remaining_seconds - reserved_attempt_seconds),
+    context = None
+    home_diagnostics: dict[str, Any] = {}
+    try:
+        deadline_monotonic = recovery_budget.deadline()
+        context = new_x_context(browser, cookies)
+        page = context.new_page()
+        page.goto(
+            "https://x.com/home",
+            wait_until="domcontentloaded",
+            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
         )
-        try:
-            recovery_budget.sleep(delay)
-        except RecoveryBudgetExceeded:
-            for item in pending_items:
-                diagnostics = item.setdefault("diagnostics", {})
+        recovery_wait_for_timeout(
+            page,
+            max(page_wait_ms, 5000),
+            deadline_monotonic,
+        )
+        ensure_x_page_healthy(
+            page,
+            diagnostics=home_diagnostics,
+            phase="recovery_home_probe",
+            deadline_monotonic=deadline_monotonic,
+        )
+    except Exception as exc:
+        probe_error = f"{type(exc).__name__}: {exc}"
+        for item in pending_items:
+            diagnostics = item.setdefault("diagnostics", {})
+            diagnostics["fresh_context_recovered"] = False
+            diagnostics["recovery_home_probe_error"] = probe_error
+            diagnostics["recovery_home_probe_diagnostics"] = home_diagnostics
+            diagnostics["recovery_budget_spent_seconds"] = round(
+                recovery_budget.spent_seconds,
+                3,
+            )
+            if isinstance(exc, RecoveryBudgetExceeded):
                 diagnostics["recovery_budget_exhausted"] = True
-            break
         print(
-            f"[x-deferred-recovery] round={recovery_round}/{MAX_PAGE_RECOVERIES} "
-            f"accounts={len(pending_items)} delay={delay:.1f}s "
-            f"configured_delay={configured_delay:.0f}s "
+            f"[x-deferred-recovery] home probe failed "
+            f"error={probe_error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if context is not None:
+            context.close()
+            context = None
+        return
+    else:
+        for item in pending_items:
+            diagnostics = item.setdefault("diagnostics", {})
+            diagnostics["recovery_home_probe_healthy"] = True
+        print(
+            f"[x-deferred-recovery] home probe healthy "
             f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
             file=sys.stderr,
             flush=True,
         )
-        next_pending: list[dict[str, Any]] = []
+
+    try:
         for item_index, item in enumerate(pending_items):
             handle = str(item.get("handle") or "")
             started = time.time()
@@ -2659,68 +2786,53 @@ def rescan_page_render_failures(
                 "early_stops": 0,
             }
             diagnostics = item.setdefault("diagnostics", {})
+            remaining_accounts = len(pending_items) - item_index
+            attempt_seconds = recovery_budget.remaining_seconds / remaining_accounts
+            if attempt_seconds <= 0:
+                for pending_item in pending_items[item_index:]:
+                    pending_diagnostics = pending_item.setdefault("diagnostics", {})
+                    pending_diagnostics["recovery_budget_exhausted"] = True
+                    pending_diagnostics["recovery_budget_spent_seconds"] = round(
+                        recovery_budget.spent_seconds,
+                        3,
+                    )
+                break
             diagnostics["fresh_context_retry"] = int(
                 diagnostics.get("fresh_context_retry") or 0
             ) + 1
             diagnostics["page_retries"] = int(diagnostics.get("page_retries") or 0) + 1
             diagnostics["recovery_budget_limit_seconds"] = recovery_budget.limit_seconds
-            diagnostics.setdefault("recovery_round_delays_seconds", []).append(delay)
-            remaining_accounts = len(pending_items) - item_index
-            attempt_seconds = recovery_budget.remaining_seconds / remaining_accounts
-            if attempt_seconds <= 0:
-                diagnostics["recovery_budget_exhausted"] = True
-                next_pending.extend(pending_items[item_index:])
-                break
-            deadline_monotonic = min(
-                recovery_budget.deadline(),
-                time.monotonic() + attempt_seconds,
-            )
+            diagnostics["recovery_quiet_seconds"] = RECOVERY_QUIET_SECONDS
+            diagnostics["recovery_profile_only"] = True
             print(
                 f"[x-deferred-recovery] {handle} start "
-                f"round={recovery_round}/{MAX_PAGE_RECOVERIES} "
-                f"attempt_budget={attempt_seconds:.1f}s",
+                f"mode=profile-only attempt_budget={attempt_seconds:.1f}s",
                 file=sys.stderr,
                 flush=True,
             )
-            context = None
             try:
-                context = new_x_context(browser, cookies)
-                page = context.new_page()
-                page.goto(
-                    "https://x.com/home",
-                    wait_until="domcontentloaded",
-                    timeout=recovery_timeout_ms(45_000, deadline_monotonic),
-                )
-                recovery_wait_for_timeout(
-                    page,
-                    max(page_wait_ms, 5000),
-                    deadline_monotonic,
-                )
-                ensure_x_page_healthy(
-                    page,
-                    diagnostics=retry_diagnostics,
-                    phase="fresh_context_home",
-                    deadline_monotonic=deadline_monotonic,
+                deadline_monotonic = min(
+                    recovery_budget.deadline(),
+                    time.monotonic() + attempt_seconds,
                 )
                 tweets = scrape_handle(
                     page,
                     handle,
                     hours,
                     limit,
-                    scrolls,
+                    0,
                     page_wait_ms,
                     scroll_wait_ms,
-                    search_fallback,
+                    False,
                     retry_diagnostics,
                     deadline_monotonic,
                 )
             except Exception as exc:
                 diagnostics["fresh_context_recovered"] = False
                 diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
+                diagnostics["fresh_context_diagnostics"] = retry_diagnostics
                 if isinstance(exc, RecoveryBudgetExceeded):
                     diagnostics["recovery_attempt_timed_out"] = True
-                if recovery_round < MAX_PAGE_RECOVERIES:
-                    next_pending.append(item)
                 print(
                     f"[x-deferred-recovery] {handle} failed "
                     f"{time.time() - started:.1f}s error={type(exc).__name__}: {exc}",
@@ -2740,13 +2852,13 @@ def rescan_page_render_failures(
                     flush=True,
                 )
             finally:
-                if context is not None:
-                    context.close()
                 diagnostics["recovery_budget_spent_seconds"] = round(
                     recovery_budget.spent_seconds,
                     3,
                 )
-        pending_items = next_pending
+    finally:
+        if context is not None:
+            context.close()
 
 
 def scrape_all(
@@ -2787,9 +2899,36 @@ def scrape_all(
                     flush=True,
                 )
                 total_kols = len(kols)
+                planned_profile_loads = sum(
+                    1 for kol in kols if not kol.get("auto_recheck_paused")
+                )
                 durations: list[float] = []
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
+                    if kol.get("auto_recheck_paused"):
+                        next_recheck_date = str(kol.get("next_recheck_date") or "")
+                        print(
+                            f"[scan {index}/{total_kols}] {handle} paused "
+                            f"next_recheck={next_recheck_date}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        results.append({
+                            **kol,
+                            "status": "paused",
+                            "error": "",
+                            "tweets": [],
+                            "diagnostics": {
+                                "profile_tweets": 0,
+                                "search_fallback_used": False,
+                                "scroll_rounds": 0,
+                                "early_stops": 0,
+                                "page_retries": 0,
+                                "rename_checks": 0,
+                                "auto_recheck_paused": True,
+                            },
+                        })
+                        continue
                     started = time.time()
                     print(f"[scan {index}/{total_kols}] {handle} start", file=sys.stderr, flush=True)
                     diagnostics: dict[str, Any] = {
@@ -2812,7 +2951,7 @@ def scrape_all(
                                 scrolls,
                                 page_wait_ms,
                                 scroll_wait_ms,
-                                search_fallback,
+                                False,
                                 diagnostics,
                             )
                         except Exception as exc:
@@ -2857,6 +2996,26 @@ def scrape_all(
                             status = "ok"
                             error = ""
                         break
+                    search_fallback_error = str(
+                        diagnostics.get("search_fallback_error") or ""
+                    )
+                    search_fallback_page_error = bool(
+                        diagnostics.get("search_fallback_failed")
+                        and search_fallback_error.endswith(RECOVERABLE_X_PAGE_ERRORS)
+                    )
+                    global_page_failure = final_page_error or search_fallback_page_error
+                    global_page_reason = (
+                        "page_error"
+                        if final_page_error
+                        else "search_fallback_error"
+                        if search_fallback_page_error
+                        else ""
+                    )
+                    if search_fallback_page_error and status == "ok":
+                        status = "error"
+                        error = search_fallback_error
+                        tweets = []
+                        diagnostics["deferred_recovery"] = True
                     elapsed = time.time() - started
                     durations.append(elapsed)
                     avg = sum(durations) / len(durations)
@@ -2875,15 +3034,65 @@ def scrape_all(
                         "tweets": tweets,
                         "diagnostics": diagnostics,
                     })
-                    recycle_reason = "page_error" if final_page_error else (
-                        "search_fallback_error" if diagnostics.get("search_fallback_failed") else ""
+                    if global_page_failure:
+                        remaining_kols = kols[index:]
+                        diagnostics["global_page_breaker_triggered"] = True
+                        diagnostics["global_page_breaker_reason"] = global_page_reason
+                        for pending_kol in remaining_kols:
+                            if pending_kol.get("auto_recheck_paused"):
+                                results.append({
+                                    **pending_kol,
+                                    "status": "paused",
+                                    "error": "",
+                                    "tweets": [],
+                                    "diagnostics": {
+                                        "profile_tweets": 0,
+                                        "search_fallback_used": False,
+                                        "scroll_rounds": 0,
+                                        "early_stops": 0,
+                                        "page_retries": 0,
+                                        "rename_checks": 0,
+                                        "auto_recheck_paused": True,
+                                    },
+                                })
+                                continue
+                            results.append({
+                                **pending_kol,
+                                "status": "error",
+                                "error": f"RuntimeError: {GLOBAL_PAGE_DEFERRED_ERROR}",
+                                "tweets": [],
+                                "diagnostics": {
+                                    "profile_tweets": 0,
+                                    "search_fallback_used": False,
+                                    "scroll_rounds": 0,
+                                    "early_stops": 0,
+                                    "page_retries": 0,
+                                    "rename_checks": 0,
+                                    "deferred_recovery": True,
+                                    "global_page_deferred": True,
+                                    "global_page_trigger_handle": handle,
+                                    "global_page_trigger_reason": global_page_reason,
+                                },
+                            })
+                        print(
+                            f"[x-global-page-breaker] trigger={handle} "
+                            f"reason={global_page_reason} "
+                            f"queued={1 + len(remaining_kols)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        break
+                    recycle_reason = (
+                        "search_fallback_error"
+                        if diagnostics.get("search_fallback_failed")
+                        else ""
                     )
                     if recycle_reason and index < total_kols:
                         diagnostics["context_recycled_after_error"] = True
                         diagnostics["context_recycle_reason"] = recycle_reason
                         print(
                             f"[x-context-recycle] {handle} reason={recycle_reason} "
-                            "deferred_recovery=true",
+                            "continuing=true",
                             file=sys.stderr,
                             flush=True,
                         )
@@ -2891,6 +3100,102 @@ def scrape_all(
                         context.close()
                         context = replacement_context
                         page = context.new_page()
+                profile_page_failure = any(
+                    item.get("diagnostics", {}).get("global_page_breaker_triggered")
+                    for item in results
+                )
+                if search_fallback and not profile_page_failure:
+                    fallback_items = [
+                        item
+                        for item in results
+                        if item.get("status") == "ok" and not item.get("tweets")
+                    ]
+                    fallback_limit = max(
+                        0,
+                        MAX_PLANNED_X_PAGE_LOADS_PER_RUN
+                        - planned_profile_loads
+                        - 1,
+                    )
+                    if fallback_items:
+                        rotation_step = max(1, fallback_limit)
+                        rotation_offset = (
+                            cn_now().toordinal() * rotation_step
+                        ) % len(fallback_items)
+                        fallback_items = (
+                            fallback_items[rotation_offset:]
+                            + fallback_items[:rotation_offset]
+                        )
+                    selected_fallbacks = fallback_items[:fallback_limit]
+                    deferred_fallbacks = fallback_items[fallback_limit:]
+                    for item in deferred_fallbacks:
+                        item.setdefault("diagnostics", {})[
+                            "search_fallback_deferred"
+                        ] = True
+                    fallback_scrolls = min(scrolls, MAX_SEARCH_FALLBACK_SCROLLS)
+                    print(
+                        f"[search-fallback-plan] candidates={len(fallback_items)} "
+                        f"selected={len(selected_fallbacks)} "
+                        f"deferred={len(deferred_fallbacks)} "
+                        f"page_budget={MAX_PLANNED_X_PAGE_LOADS_PER_RUN} "
+                        f"scrolls={fallback_scrolls}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    total_fallbacks = len(selected_fallbacks)
+                    for fallback_index, item in enumerate(selected_fallbacks, 1):
+                        handle = str(item.get("handle") or "")
+                        diagnostics = item.setdefault("diagnostics", {})
+                        started = time.time()
+                        print(
+                            f"[search-fallback {fallback_index}/{total_fallbacks}] "
+                            f"{handle} start",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        try:
+                            tweets = scrape_handle_search_fallback(
+                                page,
+                                handle,
+                                hours,
+                                limit,
+                                fallback_scrolls,
+                                page_wait_ms,
+                                scroll_wait_ms,
+                                diagnostics,
+                            )
+                        except Exception as exc:
+                            fallback_error = f"{type(exc).__name__}: {exc}"
+                            diagnostics["search_fallback_error"] = fallback_error
+                            diagnostics["search_fallback_failed"] = True
+                            recoverable_page_error = (
+                                str(exc) in RECOVERABLE_X_PAGE_ERRORS
+                                or isinstance(exc, PlaywrightTimeoutError)
+                            )
+                            print(
+                                f"[search-fallback {fallback_index}/{total_fallbacks}] "
+                                f"{handle} failed {time.time() - started:.1f}s "
+                                f"error={fallback_error}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            if recoverable_page_error:
+                                diagnostics["search_fallback_breaker_triggered"] = True
+                                print(
+                                    f"[x-search-fallback-breaker] trigger={handle} "
+                                    f"remaining={total_fallbacks - fallback_index}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                break
+                            continue
+                        item["tweets"] = tweets
+                        print(
+                            f"[search-fallback {fallback_index}/{total_fallbacks}] "
+                            f"{handle} ok tweets={len(tweets)} "
+                            f"{time.time() - started:.1f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
             finally:
                 context.close()
             has_deferred_recovery = any(
@@ -2902,11 +3207,18 @@ def scrape_all(
                 for item in results
             )
             if has_deferred_recovery:
-                recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
                 browser.close()
+                recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
+                print(
+                    f"[x-deferred-recovery] quiet start "
+                    f"seconds={RECOVERY_QUIET_SECONDS:.0f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                recovery_budget.sleep(RECOVERY_QUIET_SECONDS)
                 browser = p.chromium.launch(**launch_kwargs)
                 print(
-                    f"[x-deferred-recovery] browser restarted "
+                    f"[x-deferred-recovery] quiet complete; browser restarted "
                     f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
                     file=sys.stderr,
                     flush=True,
@@ -2917,10 +3229,8 @@ def scrape_all(
                     results,
                     hours,
                     limit,
-                    scrolls,
                     page_wait_ms,
                     scroll_wait_ms,
-                    search_fallback,
                     recovery_budget,
                 )
         finally:
@@ -2937,6 +3247,8 @@ def scrape_all(
 
 def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
     errors = sum(1 for item in results if item.get("status") == "error")
+    paused = sum(1 for item in results if item.get("status") == "paused")
+    success = sum(1 for item in results if item.get("status") == "ok")
     active = sum(1 for item in results if item.get("tweets"))
     fallback_used = sum(
         1
@@ -2947,6 +3259,11 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         1
         for item in results
         if item.get("diagnostics", {}).get("search_fallback_used") and item.get("tweets")
+    )
+    fallback_deferred = sum(
+        1
+        for item in results
+        if item.get("diagnostics", {}).get("search_fallback_deferred")
     )
     scroll_rounds = sum(
         int(item.get("diagnostics", {}).get("scroll_rounds") or 0)
@@ -2962,12 +3279,18 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
     )
     return {
         "total": len(results),
-        "success": len(results) - errors,
+        "success": success,
         "errors": errors,
+        "paused": paused,
         "active": active,
-        "no_recent": len(results) - errors - active,
+        "no_recent": sum(
+            1
+            for item in results
+            if item.get("status") == "ok" and not item.get("tweets")
+        ),
         "fallback_used": fallback_used,
         "fallback_hits": fallback_hits,
+        "fallback_deferred": fallback_deferred,
         "scroll_rounds": scroll_rounds,
         "early_stops": early_stops,
         "page_retries": page_retries,
@@ -3103,7 +3426,6 @@ def update_kol_status(results: list[dict[str, Any]]) -> None:
     if not isinstance(statuses, dict):
         raise RuntimeError("invalid kol_status in tweets.json")
     today = cn_now().date()
-    yesterday = (today - dt.timedelta(days=1)).isoformat()
     changed = False
     for item in results:
         identity = canonical_handle(item.get("configured_handle") or item.get("handle"))
@@ -3120,25 +3442,58 @@ def update_kol_status(results: list[dict[str, Any]]) -> None:
         previous = statuses.get(key, {})
         if not isinstance(previous, dict):
             previous = {}
-        if previous.get("last_unavailable_date") == today.isoformat():
-            days = max(1, int(previous.get("unavailable_days") or 0))
-        elif previous.get("last_unavailable_date") == yesterday:
-            days = min(UNAVAILABLE_REMOVAL_DAYS, int(previous.get("unavailable_days") or 0) + 1)
-        else:
-            days = 1
+        unavailable_reason = str(
+            item.get("diagnostics", {})
+            .get("page_health", {})
+            .get("account_unavailable_reason")
+            or previous.get("unavailable_reason")
+            or "unknown"
+        )
+        first_unavailable_text = str(previous.get("first_unavailable_date") or "")
+        try:
+            first_unavailable_date = dt.date.fromisoformat(first_unavailable_text)
+        except ValueError:
+            last_unavailable_text = str(previous.get("last_unavailable_date") or "")
+            try:
+                last_unavailable_date = dt.date.fromisoformat(last_unavailable_text)
+            except ValueError:
+                last_unavailable_date = today
+            previous_days = max(1, int(previous.get("unavailable_days") or 1))
+            first_unavailable_date = last_unavailable_date - dt.timedelta(
+                days=previous_days - 1
+            )
+        days = max(1, (today - first_unavailable_date).days + 1)
         pending_removal = days >= UNAVAILABLE_REMOVAL_DAYS
+        recheck_interval = (
+            UNAVAILABLE_RECHECK_INTERVAL_DAYS
+            if unavailable_reason == "suspended" and pending_removal
+            else 1
+        )
+        next_recheck_date = today + dt.timedelta(days=recheck_interval)
+        auto_action = (
+            "resolve_rename_then_recheck"
+            if unavailable_reason == "missing"
+            else "recheck_until_reactivated"
+        )
         current = {
             "handle": identity,
             "current_handle": canonical_handle(item.get("handle")),
             "unavailable_days": days,
+            "first_unavailable_date": first_unavailable_date.isoformat(),
             "last_unavailable_date": today.isoformat(),
+            "next_recheck_date": next_recheck_date.isoformat(),
             "pending_removal": pending_removal,
+            "unavailable_reason": unavailable_reason,
+            "auto_action": auto_action,
         }
         if statuses.get(key) != current:
             statuses[key] = current
             changed = True
         item["unavailable_days"] = days
+        item["next_recheck_date"] = next_recheck_date.isoformat()
         item["pending_removal"] = pending_removal
+        item["unavailable_reason"] = unavailable_reason
+        item["auto_action"] = auto_action
     if changed:
         store["kol_status"] = statuses
         save_json(TWEET_STORE, store)
@@ -3826,43 +4181,83 @@ def build_telegram_reports(
     stablecoin_summary: str = "",
 ) -> list[str]:
     active = [x for x in results if x.get("tweets")]
+    summary = scan_summary(results)
     rows = telegram_rows(active, per_kol, include_low_signal)
     if mode == "focus":
         rows = focus_rows(rows, tweet_chars, focus_limit, focus_per_kol)
     now = cn_now().strftime("%m-%d %H:%M")
     selected_kol_title = "重点KOL" if mode == "focus" else "展示KOL"
     active_kol_label = f"{len(active)}/{len(results)}"
-    scan_error_count = sum(1 for item in results if item.get("status") == "error")
-    scan_kol_label = f"{len(results) - scan_error_count}/{len(results)}"
+    scan_error_count = summary["errors"]
+    scan_kol_label = f"{summary['success']}/{len(results)}"
     renamed_handles = [
         f"{item['configured_handle']}->{item['handle']}"
         for item in results
         if item.get("configured_handle")
         and str(item.get("configured_handle")).lower() != str(item.get("handle")).lower()
     ]
-    unavailable_handles = [
-        f"{str(item.get('handle') or '').strip()}({int(item.get('unavailable_days') or 1)}/"
-        f"{UNAVAILABLE_REMOVAL_DAYS}{'，待人工删除' if item.get('pending_removal') else ''})"
-        for item in results
-        if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
-    ]
+    unavailable_handles = []
+    for item in results:
+        if not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR):
+            continue
+        reason = str(item.get("unavailable_reason") or "")
+        action = "自动查改名" if reason == "missing" else "自动复查"
+        unavailable_handles.append(
+            f"{str(item.get('handle') or '').strip()}"
+            f"({int(item.get('unavailable_days') or 1)}/"
+            f"{UNAVAILABLE_REMOVAL_DAYS}，{action})"
+        )
     unavailable_line = f"不可用KOL:{'、'.join(unavailable_handles)}" if unavailable_handles else ""
     renamed_line = f"账号改名:{'、'.join(renamed_handles)}" if renamed_handles else ""
+    paused_handles = []
+    for item in results:
+        if item.get("status") != "paused":
+            continue
+        next_recheck_date = str(item.get("next_recheck_date") or "")
+        display_date = next_recheck_date[5:] if len(next_recheck_date) == 10 else next_recheck_date
+        paused_handles.append(
+            f"{str(item.get('handle') or '').strip()}（下次复查 {display_date}）"
+        )
+    paused_line = f"封号暂停:{'、'.join(paused_handles)}" if paused_handles else ""
+    fallback_used = summary["fallback_used"]
+    fallback_deferred = summary["fallback_deferred"]
+    fallback_total = fallback_used + fallback_deferred
+    fallback_line = ""
+    if fallback_total:
+        fallback_line = f"搜索回退:{fallback_used}/{fallback_total}"
+        if fallback_deferred:
+            fallback_line += f"（延后{fallback_deferred}）"
     page_issue_handles = [
         str(item.get("handle") or "").strip()
         for item in results
         if item.get("status") == "error"
-        and str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
+        and (
+            item.get("diagnostics", {}).get("deferred_recovery")
+            or str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
+        )
     ]
     scan_issue_handles = [
         str(item.get("handle") or "").strip()
         for item in results
         if item.get("status") == "error"
-        and not str(item.get("error") or "").endswith((ACCOUNT_UNAVAILABLE_ERROR, *RECOVERABLE_X_PAGE_ERRORS))
+        and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+        and not item.get("diagnostics", {}).get("deferred_recovery")
+        and not str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
     ]
     page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
     scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
-    status_lines = [line for line in (renamed_line, unavailable_line, page_issue_line, scan_issue_line) if line]
+    status_lines = [
+        line
+        for line in (
+            renamed_line,
+            unavailable_line,
+            paused_line,
+            fallback_line,
+            page_issue_line,
+            scan_issue_line,
+        )
+        if line
+    ]
     status_header = " | ".join(status_lines)
     if not rows:
         empty_text = "最近 24 小时有推文，但没有内容通过当前筛选。" if active else "最近 24 小时没有抓到可读推文。"
@@ -3872,7 +4267,8 @@ def build_telegram_reports(
             mode=mode,
             generated_at=now,
         )
-        return [market_report.rstrip() + f"\n\n{empty_text}\n"]
+        status_text = f"状态 | {status_header}\n\n" if status_header else ""
+        return [market_report.rstrip() + f"\n\n{status_text}{empty_text}\n"]
 
     blocks = telegram_kol_blocks(rows, tweet_chars, style)
     display_total = sum(int(block.get("count") or 0) for block in blocks)
@@ -4271,9 +4667,9 @@ def telegram_legacy_report(report: str, include_summary: bool) -> str:
             statuses.extend(
                 status
                 for status in line.removeprefix("状态 | ").split(" | ")
-                if status.startswith(("账号改名:", "不可用KOL:"))
+                if status.startswith(("账号改名:", "不可用KOL:", "封号暂停:"))
             )
-        elif line.startswith(("账号改名:", "不可用KOL:")):
+        elif line.startswith(("账号改名:", "不可用KOL:", "封号暂停:")):
             statuses.append(line)
     return "\n".join([header, *summary, *statuses, *lines[metadata_end:]]) + "\n"
 
@@ -4374,7 +4770,7 @@ def apply_stablecoin_summary(reports: list[str], summary: str) -> list[str]:
     lines = kept
     if summary:
         insert_at = 1
-        while insert_at < len(lines) and lines[insert_at].startswith(("KOL扫描 ", "扫描 ", "状态 | ", "账号改名:", "不可用KOL:", "扫描异常:", "页面异常:")):
+        while insert_at < len(lines) and lines[insert_at].startswith(("KOL扫描 ", "扫描 ", "状态 | ", "账号改名:", "不可用KOL:", "封号暂停:", "搜索回退:", "扫描异常:", "页面异常:")):
             insert_at += 1
         summary_lines = market_summary_with_separators(summary.splitlines())
         summary_block = list(summary_lines)
@@ -4626,6 +5022,10 @@ def main() -> int:
             raise RuntimeError(f"no matching handles: {args.handles}")
     if args.max_kols > 0:
         kols = kols[:args.max_kols]
+    kols = apply_unavailable_recheck_policy(
+        kols,
+        force_recheck=bool(args.handles.strip()),
+    )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
