@@ -113,6 +113,15 @@ jobs:
               echo '```'
               echo
             fi
+            scan_unavailable="$(grep -F '[scan-unavailable]' run.log || true)"
+            if [ -n "$scan_unavailable" ]; then
+              echo "#### Unavailable accounts"
+              echo
+              echo '```text'
+              echo "$scan_unavailable"
+              echo '```'
+              echo
+            fi
             echo "#### Log tail"
             echo
             echo '```text'

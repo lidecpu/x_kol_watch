@@ -3246,7 +3246,17 @@ def scrape_all(
 
 
 def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
-    errors = sum(1 for item in results if item.get("status") == "error")
+    unavailable = sum(
+        1
+        for item in results
+        if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+    )
+    errors = sum(
+        1
+        for item in results
+        if item.get("status") == "error"
+        and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+    )
     paused = sum(1 for item in results if item.get("status") == "paused")
     success = sum(1 for item in results if item.get("status") == "ok")
     active = sum(1 for item in results if item.get("tweets"))
@@ -3304,9 +3314,7 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
             if item.get("diagnostics", {}).get("fresh_context_recovered") is True
         ),
         "renamed": sum(1 for item in results if item.get("diagnostics", {}).get("renamed_to")),
-        "unavailable": sum(
-            1 for item in results if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
-        ),
+        "unavailable": unavailable,
         "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
 
@@ -5044,8 +5052,13 @@ def main() -> int:
     print(json.dumps({"scan": summary}, ensure_ascii=False))
     for item in results:
         if item.get("status") == "error":
+            category = (
+                "scan-unavailable"
+                if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+                else "scan-error"
+            )
             print(
-                f"[scan-error] {item.get('handle', '')} {item.get('error', '')}",
+                f"[{category}] {item.get('handle', '')} {item.get('error', '')}",
                 file=sys.stderr,
             )
 
