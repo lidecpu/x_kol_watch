@@ -4197,7 +4197,7 @@ def build_telegram_reports(
     selected_kol_title = "重点KOL" if mode == "focus" else "展示KOL"
     active_kol_label = f"{len(active)}/{len(results)}"
     scan_error_count = summary["errors"]
-    scan_kol_label = f"{summary['success']}/{len(results)}"
+    unavailable_kol_count = summary["unavailable"] + summary["paused"]
     renamed_handles = [
         f"{item['configured_handle']}->{item['handle']}"
         for item in results
@@ -4300,7 +4300,8 @@ def build_telegram_reports(
         if page_number == 2:
             header = f"KOL推文 {hours}H{mode_suffix} | 第{page_number}/{total_pages}页 | {now}"
             stats_line = (
-                f"KOL扫描 {scan_kol_label}（失败{scan_error_count}） | 活跃 {active_kol_label} | "
+                f"KOL扫描 正常{summary['success']} | 不可用{unavailable_kol_count} | "
+                f"失败{scan_error_count} | 活跃{active_kol_label} | "
                 f"{selected_kol_title} {display_kol_count} | 总推文 {display_total} | 本页 {group_count}"
             )
             lines = [header, stats_line]
@@ -4653,16 +4654,19 @@ def telegram_legacy_report(report: str, include_summary: bool) -> str:
     )
     timestamp_match = re.search(r" \| (\d{2}-\d{2} \d{2}:\d{2})(?: \|.*)?$", header)
     stats_match = re.match(
-        r"(?:KOL扫描|扫描) (\d+/\d+)（失败(\d+)） \| (活跃 (\d+/\d+)) \| "
+        r"(?:KOL扫描|扫描) 正常(\d+) \| 不可用(\d+) \| 失败(\d+) \| 活跃(\d+)/(\d+) \| "
         r"((?:展示KOL|重点KOL)) (\d+) \| (?:总推文|推文) (\d+) \| (?:本页|本组) (\d+)$",
         stats_line,
     )
     if timestamp_match and stats_match:
         header = (
-            f"{header[:timestamp_match.start()]} | 扫描KOL:{stats_match.group(1)} | "
-            f"扫描失败:{stats_match.group(2)} | 活跃KOL:{stats_match.group(4)} | "
-            f"{stats_match.group(5)}:{stats_match.group(6)} | 推文:{stats_match.group(7)} | "
-            f"本组:{stats_match.group(8)} | {timestamp_match.group(1)}"
+            f"{header[:timestamp_match.start()]} | "
+            f"扫描KOL:{stats_match.group(1)}/{stats_match.group(5)} | "
+            f"扫描失败:{stats_match.group(3)} | "
+            f"活跃KOL:{stats_match.group(4)}/{stats_match.group(5)} | "
+            f"{stats_match.group(6)}:{stats_match.group(7)} | "
+            f"推文:{stats_match.group(8)} | 本组:{stats_match.group(9)} | "
+            f"{timestamp_match.group(1)}"
         )
     summary = []
     if include_summary:
@@ -4711,7 +4715,7 @@ def telegram_previous_label_report(report: str) -> str:
         lines[0],
     )
     stats_match = re.fullmatch(
-        r"KOL扫描 (\d+/\d+)（失败(\d+)） \| 活跃 (\d+/\d+) \| "
+        r"KOL扫描 正常(\d+) \| 不可用(\d+) \| 失败(\d+) \| 活跃(\d+)/(\d+) \| "
         r"((?:展示KOL|重点KOL)) (\d+) \| 总推文 (\d+) \| 本页 (\d+)",
         lines[1],
     )
@@ -4723,9 +4727,11 @@ def telegram_previous_label_report(report: str) -> str:
         f"组:{header_match.group(3)}/{header_match.group(4)} | {header_match.group(5)}"
     )
     lines[1] = (
-        f"扫描 {stats_match.group(1)}（失败{stats_match.group(2)}） | "
-        f"活跃 {stats_match.group(3)} | {stats_match.group(4)} {stats_match.group(5)} | "
-        f"推文 {stats_match.group(6)} | 本组 {stats_match.group(7)}"
+        f"扫描 {stats_match.group(1)}/{stats_match.group(5)}"
+        f"（失败{stats_match.group(3)}） | "
+        f"活跃 {stats_match.group(4)}/{stats_match.group(5)} | "
+        f"{stats_match.group(6)} {stats_match.group(7)} | "
+        f"推文 {stats_match.group(8)} | 本组 {stats_match.group(9)}"
     )
     suffix = "\n" if report.endswith("\n") else ""
     return "\n".join(lines) + suffix
