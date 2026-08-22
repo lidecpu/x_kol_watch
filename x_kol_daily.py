@@ -361,23 +361,52 @@ def fetch_eth_staking_metrics() -> dict[str, float]:
     with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
         page = response.read().decode("utf-8", "replace")
 
-    def metric_value(label: str) -> str:
-        pattern = (
-            r"<code\b[^>]*>\s*([^<]+?)\s*</code>"
-            r"\s*<div\b[^>]*>(?:(?!<code\b)[\s\S])*?"
-            + re.escape(label)
-        )
-        match = re.search(pattern, page, re.IGNORECASE)
-        if not match:
-            raise ValueError(f"missing Ethereum staking metric: {label}")
-        return re.sub(r"\s+", " ", match.group(1)).strip()
+    def metric_value(*labels: str) -> str:
+        for label in labels:
+            pattern = (
+                r"<code\b[^>]*>\s*([^<]+?)\s*</code>"
+                r"\s*<div\b[^>]*>(?:(?!<code\b)[\s\S])*?"
+                + re.escape(label)
+            )
+            match = re.search(pattern, page, re.IGNORECASE)
+            if match:
+                return re.sub(r"\s+", " ", match.group(1)).strip()
 
+        parser = HTMLTextLinkParser()
+        parser.feed(page)
+        visible_text = parser.text()
+        number = r"[\d,]+(?:\.\d+)?(?:[KMB])?"
+        for label in labels:
+            for fallback_pattern in (
+                rf"({number})\s*[%％]?\s*(?:ETH\s*)?{re.escape(label)}",
+                rf"{re.escape(label)}\s*({number})",
+            ):
+                fallback_match = re.search(fallback_pattern, visible_text, re.IGNORECASE)
+                if fallback_match:
+                    return fallback_match.group(1)
+        raise ValueError(f"missing Ethereum staking metric: {labels[0]}")
+
+    def metric_number(value: str) -> float:
+        cleaned = value.replace(",", "").strip()
+        multiplier = 1.0
+        if cleaned[-1:].upper() in {"K", "M", "B"}:
+            multiplier = {"K": 1e3, "M": 1e6, "B": 1e9}[cleaned[-1].upper()]
+            cleaned = cleaned[:-1]
+        return float(cleaned) * multiplier
+
+    raw_total = metric_value("质押的 ETH 总量", "Total ETH staked").rstrip("%")
+    raw_percent = metric_value(
+        "已质押的 ETH 百分比", "Percent of ETH staked"
+    ).rstrip("%")
+    raw_apr = metric_value("当前 APR", "Current APR").rstrip("%")
     try:
-        total = float(metric_value("质押的 ETH 总量").replace(",", ""))
-        percent = float(metric_value("已质押的 ETH 百分比").rstrip("%"))
-        apr = float(metric_value("当前 APR").rstrip("%"))
+        total = metric_number(raw_total)
+        percent = metric_number(raw_percent)
+        apr = metric_number(raw_apr)
     except (TypeError, ValueError) as exc:
-        raise ValueError("invalid Ethereum staking metrics") from exc
+        raise ValueError(
+            f"invalid Ethereum staking metrics: {raw_total!r}, {raw_percent!r}, {raw_apr!r}"
+        ) from exc
     if not all(math.isfinite(value) for value in (total, percent, apr)):
         raise ValueError("non-finite Ethereum staking metrics")
     if total <= 0 or not 0 <= percent <= 100 or apr < 0:
@@ -1372,9 +1401,9 @@ def spot_etf_summary_lines(snapshot: dict[str, Any]) -> list[str]:
 
 def chain_delta_text(delta: float, net: bool = False) -> str:
     if delta > 0:
-        action = "净增发" if net else "增发"
+        action = "净增" if net else "增加"
     elif delta < 0:
-        action = "净销毁" if net else "销毁"
+        action = "净减" if net else "减少"
     else:
         action = "无变化"
     return f"{action} {signed_yi(delta)}"
@@ -1430,8 +1459,116 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
     return separated
 
 
+def refresh_cached_summary_etf(
+    summary: str,
+    summary_captured_at: dt.datetime | None,
+) -> str:
+    snapshot, captured_at, _ = load_spot_etf_flow_cache()
+    if snapshot is None or captured_at is None:
+        return summary
+    if summary_captured_at is not None and captured_at <= summary_captured_at:
+        return summary
+    etf_lines = spot_etf_summary_lines(snapshot)
+    if not etf_lines:
+        return summary
+    lines = summary.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line == "现货ETF资金流（亿美元）"
+            or line.startswith("现货ETF资金流（亿美元，缓存 ")
+        ),
+        None,
+    )
+    if start is None:
+        return summary
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if is_telegram_section_separator(lines[index])
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[:start] + etf_lines + lines[end:]).strip()
+
+
+def normalize_stablecoin_summary_labels(summary: str) -> str:
+    return (
+        summary.replace("链变化 ", "链上流通量变化 ")
+        .replace("净增发", "净增")
+        .replace("净销毁", "净减")
+    )
+
+
+def summary_blocks(summary: str) -> list[list[str]]:
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in summary.splitlines():
+        if is_telegram_section_separator(line):
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def summary_block_key(block: list[str]) -> str:
+    if not block:
+        return ""
+    key = re.sub(r"（缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "", block[0])
+    key = re.sub(r"（亿美元，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（亿美元）", key)
+    key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
+    return key
+
+
+def merge_partial_market_summary(
+    current_summary: str,
+    cached_summary: str,
+    cached_at: dt.datetime | None,
+) -> str:
+    current_blocks = summary_blocks(current_summary)
+    cached_blocks = summary_blocks(cached_summary)
+    if not cached_blocks:
+        return current_summary
+    current_by_key = {
+        summary_block_key(block): block
+        for block in current_blocks
+        if summary_block_key(block)
+    }
+    cached_suffix = ""
+    if cached_at is not None:
+        cached_suffix = f"（缓存 {cached_at.strftime('%m-%d %H:%M')}）"
+    merged: list[list[str]] = []
+    used: set[str] = set()
+    for cached_block in cached_blocks:
+        key = summary_block_key(cached_block)
+        block = current_by_key.get(key)
+        if block is None:
+            block = list(cached_block)
+            if cached_suffix and block:
+                block[0] = f"{block[0]}{cached_suffix}"
+        else:
+            used.add(key)
+        merged.append(block)
+    for current_block in current_blocks:
+        if summary_block_key(current_block) not in used and summary_block_key(current_block) not in {
+            summary_block_key(block) for block in cached_blocks
+        }:
+            merged.append(current_block)
+    return f"\n{TELEGRAM_SECTION_SEPARATOR}\n".join(
+        "\n".join(block).strip() for block in merged if block
+    ).strip()
+
+
 def fetch_stablecoin_summary() -> str:
     cached_summary, cached_at, failed_at = load_market_summary_cache()
+    cached_summary = normalize_stablecoin_summary_labels(cached_summary)
+    cached_summary = refresh_cached_summary_etf(cached_summary, cached_at)
     now = cn_now()
     if cached_at is not None:
         cache_age = (now - cached_at).total_seconds()
@@ -1566,14 +1703,6 @@ def fetch_stablecoin_summary() -> str:
             eth_staking["delta"] = current_staking["total"] - previous_eth_staking
         eth_staking_snapshot = current_staking
 
-    if market_fetch_failed:
-        save_market_summary_failure()
-        if cached_summary:
-            print("[market-cache] using last complete snapshot", file=sys.stderr)
-            return cached_summary
-        print("[market-cache] no complete snapshot available", file=sys.stderr)
-        return ""
-
     today = cn_now().date().isoformat()
     if derivatives_snapshot is not None:
         save_derivatives_snapshot(today, derivatives_snapshot)
@@ -1582,25 +1711,30 @@ def fetch_stablecoin_summary() -> str:
 
     market_lines: list[str] = []
     spot_lines: list[str] = []
-    if global_volume:
-        market_lines.extend([
-            "加密市场",
-            f"总市值 {global_volume['market_cap'] / 1e12:.2f}万亿美元 | "
-            f"24H {global_volume['market_cap_percent']:+.2f}%",
-        ])
+    if global_volume or coinglass_market_structure:
+        market_lines.append("加密市场")
+        if global_volume:
+            market_lines.append(
+                f"总市值 {global_volume['market_cap'] / 1e12:.2f}万亿美元 | "
+                f"24H {global_volume['market_cap_percent']:+.2f}%"
+            )
         if coinglass_market_structure:
             stale_suffix = coinglass_cache_suffix(coinglass_market_structure)
-            market_lines.extend([
+            dominance_line = (
                 f"BTC占比 {coinglass_market_structure['btc_dominance']:.2f}% | "
-                f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}% | "
-                f"ETH占比 {global_volume['eth_dominance']:.2f}%",
+                f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}%"
+            )
+            if global_volume:
+                dominance_line += f" | ETH占比 {global_volume['eth_dominance']:.2f}%"
+            market_lines.extend([
+                dominance_line,
                 f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
                 f"24H {compact_btc_change(coinglass_market_structure['exchange_balance_change_24h'])} | "
                 f"7D {compact_btc_change(coinglass_market_structure['exchange_balance_change_7d'])} | "
                 f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}"
                 f"{stale_suffix}",
             ])
-        else:
+        elif global_volume:
             market_lines.append(
                 f"BTC占比 {global_volume['btc_dominance']:.2f}% | "
                 f"ETH占比 {global_volume['eth_dominance']:.2f}%"
@@ -1731,7 +1865,7 @@ def fetch_stablecoin_summary() -> str:
                     if visible_yi_change(other_delta):
                         chain_fields.append(f"其他链{chain_delta_text(other_delta, net=True)}")
             if chain_fields:
-                fields.append("链变化 " + " | ".join(chain_fields))
+                fields.append("链上流通量变化 " + " | ".join(chain_fields))
         if symbol in volumes:
             item = volumes[symbol]
             fields.append(
@@ -1777,6 +1911,14 @@ def fetch_stablecoin_summary() -> str:
             + treasury_lines
         )
     )
+    if market_fetch_failed:
+        if cached_summary:
+            summary = merge_partial_market_summary(summary, cached_summary, cached_at)
+            print("[market-cache] merged current modules with cached failures", file=sys.stderr)
+        elif not summary:
+            print("[market-cache] no current or cached market data", file=sys.stderr)
+            return ""
+        return summary
     if summary:
         save_market_summary_cache(summary)
     return summary
@@ -1950,21 +2092,22 @@ EXTRACT_JS = r"""
     const timeEl = art.querySelector('time');
     const datetime = timeEl ? timeEl.getAttribute('datetime') : '';
     const ms = datetime ? Date.parse(datetime) : NaN;
-    let link = '';
-    for (const a of Array.from(art.querySelectorAll('a[href*="/status/"]'))) {
-      const href = a.getAttribute('href') || '';
-      if (href.includes('/status/')) { link = href; break; }
+    const timeLink = timeEl ? timeEl.closest('a[href*="/status/"]') : null;
+    let link = timeLink ? (timeLink.getAttribute('href') || '') : '';
+    if (!link) {
+      for (const a of Array.from(art.querySelectorAll('a[href*="/status/"]'))) {
+        const href = a.getAttribute('href') || '';
+        if (href.includes('/status/')) { link = href; break; }
+      }
     }
     if (link.startsWith('/')) link = 'https://x.com' + link;
     const articleKey = link || datetime || clean(art.innerText || art.textContent || '').slice(0, 120);
     if (articleKey) articleKeys.add(articleKey);
     if (!Number.isFinite(ms) || ms < cutoffMs) continue;
-    const text = Array.from(art.querySelectorAll('[data-testid="tweetText"]'))
-      .map(n => clean(n.innerText || n.textContent || ''))
-      .filter(Boolean)
-      .join('\n');
+    const textNode = art.querySelector('[data-testid="tweetText"]');
+    const text = clean(textNode ? (textNode.innerText || textNode.textContent || '') : '');
     if (!text) continue;
-    const externalUrls = Array.from(art.querySelectorAll('a[href]'))
+    const externalUrls = Array.from(textNode.querySelectorAll('a[href]'))
       .map(a => a.href || '')
       .filter(href => /^https?:\/\//i.test(href) &&
         !/^https?:\/\/(?:[^/]+\.)?(?:x\.com|twitter\.com)\//i.test(href));
@@ -3769,6 +3912,18 @@ def clean_report_text(text: str) -> str:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
+    text = re.sub(
+        r"\s*[-—]{20,}\s*#\s*Bitget.*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"\s*#\s*Bitget\s*来了就是\s*VIP[！!].*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     text = URL_RE.sub("", text)
     text = re.sub(r"\b(?:x\.com|twitter\.com)\s*/\s*\S+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"地址[:：]\s*\S+(?:\s*…)?", "", text, flags=re.IGNORECASE)
