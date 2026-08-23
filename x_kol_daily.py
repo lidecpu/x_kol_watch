@@ -1766,8 +1766,6 @@ def fetch_stablecoin_summary() -> str:
                 f" | {signed_yi(derivatives_volume['delta'])}"
                 f"（{derivatives_volume['percent']:+.2f}%）"
             )
-        else:
-            futures_text += "（昨日基准待积累）"
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if hyperliquid_liquidation:
         liquidation_heading = "Hyperliquid清算价（BTC）"
@@ -1835,9 +1833,6 @@ def fetch_stablecoin_summary() -> str:
         staking_lines = [f"质押量 {eth_staking['total'] / 1e4:.2f}万枚"]
         if "delta" in eth_staking and f"{abs(eth_staking['delta']) / 1e4:.2f}" != "0.00":
             staking_lines[0] += f" | 较昨日 {eth_staking['delta'] / 1e4:+.2f}万枚"
-        else:
-            if "delta" not in eth_staking:
-                staking_lines[0] += "（昨日基准待积累）"
         staking_lines.append(
             f"比例 {compact_percent(eth_staking['percent'])} | APR {compact_percent(eth_staking['apr'])}"
         )
@@ -2336,6 +2331,50 @@ def recovery_wait_for_timeout(
         raise RecoveryBudgetExceeded("X recovery budget exhausted")
 
 
+def wait_for_x_page_ready(
+    page: Any,
+    wait_ms: int,
+    deadline_monotonic: float | None,
+) -> None:
+    """Wait only until X exposes a usable state, up to the configured cap."""
+    bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
+    started = time.monotonic()
+    while True:
+        health = page.evaluate(PAGE_HEALTH_JS)
+        if health.get("hasMain") or any(
+            health.get(key)
+            for key in ("loginRequired", "errorPage", "accountUnavailable")
+        ):
+            return
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        remaining_ms = bounded_ms - elapsed_ms
+        if remaining_ms <= 0:
+            return
+        page.wait_for_timeout(min(200, remaining_ms))
+
+
+def wait_for_x_scroll_content(
+    page: Any,
+    wait_ms: int,
+    previous_article_count: int,
+    deadline_monotonic: float | None,
+) -> None:
+    """Wait for lazy-loaded articles, returning early when the DOM advances."""
+    bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
+    started = time.monotonic()
+    while True:
+        article_count = int(
+            page.evaluate("() => document.querySelectorAll('article').length") or 0
+        )
+        if article_count > previous_article_count:
+            return
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        remaining_ms = bounded_ms - elapsed_ms
+        if remaining_ms <= 0:
+            return
+        page.wait_for_timeout(min(150, remaining_ms))
+
+
 def ensure_x_page_healthy(
     page: Any,
     account_page: bool = False,
@@ -2675,7 +2714,7 @@ def scrape_handle_url(
         wait_until="domcontentloaded",
         timeout=recovery_timeout_ms(45_000, deadline_monotonic),
     )
-    recovery_wait_for_timeout(page, page_wait_ms, deadline_monotonic)
+    wait_for_x_page_ready(page, page_wait_ms, deadline_monotonic)
     ensure_x_page_healthy(
         page,
         account_page=account_page,
@@ -2715,7 +2754,12 @@ def scrape_handle_url(
         if round_index >= scrolls:
             break
         page.mouse.wheel(0, 1800)
-        recovery_wait_for_timeout(page, scroll_wait_ms, deadline_monotonic)
+        wait_for_x_scroll_content(
+            page,
+            scroll_wait_ms,
+            len(current_article_keys),
+            deadline_monotonic,
+        )
 
 
 def scrape_handle(
