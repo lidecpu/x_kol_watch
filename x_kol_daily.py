@@ -54,6 +54,9 @@ COINGECKO_MARKET_CHART_URL = (
 )
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives"
+COIN_METRICS_ASSET_METRICS_URL = (
+    "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+)
 DEFILLAMA_DEX_VOLUME_URL = (
     "https://api.llama.fi/overview/dexs"
     "?excludeTotalDataChart=true&excludeTotalDataChartBreakdown=true"
@@ -98,7 +101,7 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 12
+MARKET_SUMMARY_CACHE_VERSION = 18
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_CACHE_TTL_SECONDS = 600
 COINGLASS_FAILURE_COOLDOWN_SECONDS = 900
@@ -119,12 +122,16 @@ ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
 RECOVERY_QUIET_SECONDS = 60.0
+SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS = 180.0
 MAX_PLANNED_X_PAGE_LOADS_PER_RUN = 88
 MAX_SEARCH_FALLBACK_SCROLLS = 2
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
 UNAVAILABLE_RECHECK_INTERVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
+TRANSLATION_HTTP_TIMEOUT_SECONDS = 12
+TRANSLATION_WORKERS = 4
+TRANSLATION_TOTAL_BUDGET_SECONDS = 120.0
 LEGACY_TRANSLATION_LIMIT = 4500
 TRANSLATION_VERSION = 2
 TRANSLATION_CHUNK_LIMIT = 4000
@@ -801,7 +808,9 @@ def fetch_strategy_btc() -> dict[str, Any]:
             records.append(record)
     if not records:
         raise ValueError("missing complete Strategy purchase record")
-    return max(records, key=lambda item: item["record_date"])
+    latest = max(records, key=lambda item: item["record_date"])
+    latest["verified_date"] = cn_now().date()
+    return latest
 
 
 def fetch_bitmine_eth() -> dict[str, Any]:
@@ -1042,6 +1051,73 @@ def fetch_global_volume() -> dict[str, float]:
         "market_cap_percent": market_cap_percent,
         "btc_dominance": btc_dominance,
         "eth_dominance": eth_dominance,
+    }
+
+
+def fetch_chain_activity() -> dict[str, Any]:
+    query = urllib.parse.urlencode({
+        "assets": "btc,eth",
+        "metrics": "TxCnt",
+        "frequency": "1d",
+        "limit_per_asset": "8",
+        "paging_from": "end",
+        "ignore_forbidden_errors": "true",
+        "ignore_unsupported_errors": "true",
+    })
+    payload = fetch_market_json(f"{COIN_METRICS_ASSET_METRICS_URL}?{query}")
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    by_asset: dict[str, dict[dt.date, dict[str, float]]] = {
+        asset: {} for asset in ("btc", "eth")
+    }
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        asset = str(row.get("asset") or "").lower()
+        if asset not in by_asset:
+            continue
+        try:
+            record_date = dt.date.fromisoformat(str(row.get("time") or "")[:10])
+            transactions = float(row.get("TxCnt"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(transactions) or transactions <= 0:
+            continue
+        by_asset[asset][record_date] = {
+            "transactions": transactions,
+        }
+    common_dates = set.intersection(*(set(records) for records in by_asset.values()))
+    if len(common_dates) < 8:
+        raise ValueError("missing Coin Metrics chain activity history")
+    recent_dates = sorted(common_dates)[-8:]
+    previous_dates = recent_dates[:-1]
+    previous_date, record_date = recent_dates[-2:]
+    today = dt.datetime.now(dt.timezone.utc).date()
+    if not 0 <= (today - record_date).days <= 3:
+        raise ValueError("stale Coin Metrics chain activity")
+    return {
+        "record_date": record_date,
+        "assets": {
+            asset: {
+                **by_asset[asset][record_date],
+                "percent": (
+                    by_asset[asset][record_date]["transactions"]
+                    / by_asset[asset][previous_date]["transactions"]
+                    - 1
+                ) * 100,
+                "seven_day_average_percent": (
+                    by_asset[asset][record_date]["transactions"]
+                    / (
+                        sum(
+                            by_asset[asset][date]["transactions"]
+                            for date in previous_dates
+                        )
+                        / len(previous_dates)
+                    )
+                    - 1
+                ) * 100,
+            }
+            for asset in ("btc", "eth")
+        },
     }
 
 
@@ -1419,15 +1495,6 @@ def compact_btc_change(value: float) -> str:
     return f"{value:+,.0f}枚"
 
 
-def coinglass_cache_suffix(snapshot: dict[str, Any]) -> str:
-    if not snapshot.get("_stale"):
-        return ""
-    captured_at = parse_cache_timestamp(snapshot.get("_captured_at"))
-    if captured_at is not None:
-        return f"（CoinGlass缓存 {captured_at.strftime('%m-%d %H:%M')}）"
-    return "（CoinGlass缓存）"
-
-
 def is_telegram_section_separator(line: str) -> bool:
     return bool(re.fullmatch(r"━{16,}", line))
 
@@ -1451,6 +1518,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
+            or line.startswith("链上确认交易（截至 ")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
         ) and separated:
@@ -1583,6 +1651,7 @@ def fetch_stablecoin_summary() -> str:
     dex_volume: dict[str, float] = {}
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
+    chain_activity: dict[str, Any] = {}
     coinglass_snapshot: dict[str, Any] = {}
     hyperliquid_liquidation: dict[str, Any] = {}
     coinglass_market_structure: dict[str, Any] = {}
@@ -1612,6 +1681,12 @@ def fetch_stablecoin_summary() -> str:
     source_jobs = {
         "dex_volume": (fetch_dex_volume, market_errors, "dex-volume", True),
         "global_volume": (fetch_global_volume, market_errors, "global-volume", True),
+        "chain_activity": (
+            fetch_chain_activity,
+            market_errors,
+            "chain-activity",
+            False,
+        ),
         "derivatives_current": (fetch_derivatives_volume, market_errors, "derivatives-volume", True),
         "eth_staking_current": (fetch_eth_staking_metrics, market_errors, "eth-staking", True),
         "us_treasury_debt": (fetch_us_treasury_debt, market_errors, "us-treasury-debt", True),
@@ -1679,6 +1754,7 @@ def fetch_stablecoin_summary() -> str:
 
     dex_volume = fetched.get("dex_volume", {})
     global_volume = fetched.get("global_volume", {})
+    chain_activity = fetched.get("chain_activity", {})
     strategy_btc = fetched.get("strategy_btc", {})
     bitmine_eth = fetched.get("bitmine_eth", {})
     us_macro_calendar = fetched.get("us_macro_calendar", {})
@@ -1719,7 +1795,6 @@ def fetch_stablecoin_summary() -> str:
                 f"24H {global_volume['market_cap_percent']:+.2f}%"
             )
         if coinglass_market_structure:
-            stale_suffix = coinglass_cache_suffix(coinglass_market_structure)
             dominance_line = (
                 f"BTC占比 {coinglass_market_structure['btc_dominance']:.2f}% | "
                 f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}%"
@@ -1731,8 +1806,7 @@ def fetch_stablecoin_summary() -> str:
                 f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
                 f"24H {compact_btc_change(coinglass_market_structure['exchange_balance_change_24h'])} | "
                 f"7D {compact_btc_change(coinglass_market_structure['exchange_balance_change_7d'])} | "
-                f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}"
-                f"{stale_suffix}",
+                f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}",
             ])
         elif global_volume:
             market_lines.append(
@@ -1767,6 +1841,18 @@ def fetch_stablecoin_summary() -> str:
                 f"（{derivatives_volume['percent']:+.2f}%）"
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
+    if chain_activity:
+        record_date = chain_activity["record_date"].strftime("%m-%d")
+        assets = chain_activity["assets"]
+        market_lines.extend([
+            f"链上确认交易（截至 {record_date}）",
+            f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
+            f"24H {assets['btc']['percent']:+.2f}% | "
+            f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
+            f"ETH {assets['eth']['transactions'] / 1e4:.2f}万笔 | "
+            f"24H {assets['eth']['percent']:+.2f}% | "
+            f"较前7日均 {assets['eth']['seven_day_average_percent']:+.2f}%",
+        ])
     if hyperliquid_liquidation:
         liquidation_heading = "Hyperliquid清算价（BTC）"
         if hyperliquid_liquidation.get("_stale"):
@@ -1877,10 +1963,11 @@ def fetch_stablecoin_summary() -> str:
     strategy_lines: list[str] = []
     if strategy_btc:
         record_date = strategy_btc["record_date"].strftime("%m-%d")
+        verified_date = strategy_btc["verified_date"].strftime("%m-%d")
         strategy_lines.extend([
             "Strategy（微策略）",
-            f"BTC持仓 {strategy_btc['holdings']:,}枚 | "
-            f"持仓变化 {strategy_btc['change']:+,}枚（{record_date}披露）",
+            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 官网核验 {verified_date}",
+            f"上次变化 {strategy_btc['change']:+,}枚（{record_date}）",
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
         ])
@@ -2241,9 +2328,18 @@ COINGLASS_MARKET_STRUCTURE_JS = r"""
       .filter(Boolean);
   };
   const dominance = leafTexts('/zh/pro/i/MarketCap');
+  const hasLabel = dominance.some(text =>
+    text.includes('BTC') && text.includes('市值占比')
+  );
+  const percentages = dominance.filter(text =>
+    /^[+-]?\d+(?:\.\d+)?%$/.test(text.replace(/,/g, ''))
+  );
+  if (!hasLabel || percentages.length !== 2) {
+    return {dominance_change: '', dominance: ''};
+  }
   return {
-    dominance_change: dominance[1] || '',
-    dominance: dominance[2] || ''
+    dominance_change: percentages[0],
+    dominance: percentages[1]
   };
 }
 """
@@ -2552,7 +2648,12 @@ def fetch_coinglass_live() -> dict[str, Any]:
         async with async_playwright() as playwright:
             launch_kwargs: dict[str, Any] = {
                 "headless": True,
-                "args": ["--disable-gpu", "--no-first-run", "--no-default-browser-check"],
+                "args": [
+                    "--disable-gpu",
+                    "--disable-logging",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
             }
             if chrome_path:
                 launch_kwargs["executable_path"] = chrome_path
@@ -2835,6 +2936,7 @@ def scrape_handle_search_fallback(
     page_wait_ms: int,
     scroll_wait_ms: int,
     diagnostics: dict[str, Any],
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
     clean_handle = handle.lstrip("@")
     cutoff_ms = int(
@@ -2858,6 +2960,7 @@ def scrape_handle_search_fallback(
         scroll_wait_ms,
         diagnostics,
         merged,
+        deadline_monotonic,
     )
     rows = sorted(
         merged.values(),
@@ -3057,7 +3160,7 @@ def scrape_all(
     page_wait_ms: int,
     scroll_wait_ms: int,
     search_fallback: bool,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except Exception as exc:
@@ -3066,9 +3169,16 @@ def scrape_all(
     cookies = cookies_from_env()
     chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
     results: list[dict[str, Any]] = []
+    phase_timings: dict[str, float] = {}
+    scan_started = time.monotonic()
     recovery_budget: RecoveryBudget | None = None
     with sync_playwright() as p:
-        launch_args = ["--disable-gpu", "--no-first-run", "--no-default-browser-check"]
+        launch_args = [
+            "--disable-gpu",
+            "--disable-logging",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
         launch_kwargs: dict[str, Any] = {"headless": headless, "args": launch_args}
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
@@ -3090,6 +3200,7 @@ def scrape_all(
                     1 for kol in kols if not kol.get("auto_recheck_paused")
                 )
                 durations: list[float] = []
+                profile_started = time.monotonic()
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
                     if kol.get("auto_recheck_paused"):
@@ -3287,10 +3398,12 @@ def scrape_all(
                         context.close()
                         context = replacement_context
                         page = context.new_page()
+                phase_timings["x_profiles"] = time.monotonic() - profile_started
                 profile_page_failure = any(
                     item.get("diagnostics", {}).get("global_page_breaker_triggered")
                     for item in results
                 )
+                fallback_started = time.monotonic()
                 if search_fallback and not profile_page_failure:
                     fallback_items = [
                         item
@@ -3329,9 +3442,24 @@ def scrape_all(
                         flush=True,
                     )
                     total_fallbacks = len(selected_fallbacks)
+                    fallback_budget = RecoveryBudget(
+                        SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS
+                    )
                     for fallback_index, item in enumerate(selected_fallbacks, 1):
                         handle = str(item.get("handle") or "")
                         diagnostics = item.setdefault("diagnostics", {})
+                        if fallback_budget.remaining_seconds < 2.0:
+                            for pending_item in selected_fallbacks[fallback_index - 1:]:
+                                pending_item.setdefault("diagnostics", {})[
+                                    "search_fallback_deferred"
+                                ] = True
+                            print(
+                                f"[search-fallback-budget] exhausted "
+                                f"remaining={total_fallbacks - fallback_index + 1}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            break
                         started = time.time()
                         print(
                             f"[search-fallback {fallback_index}/{total_fallbacks}] "
@@ -3349,11 +3477,29 @@ def scrape_all(
                                 page_wait_ms,
                                 scroll_wait_ms,
                                 diagnostics,
+                                fallback_budget.deadline(),
                             )
                         except Exception as exc:
                             fallback_error = f"{type(exc).__name__}: {exc}"
                             diagnostics["search_fallback_error"] = fallback_error
                             diagnostics["search_fallback_failed"] = True
+                            budget_exhausted = (
+                                isinstance(exc, RecoveryBudgetExceeded)
+                                or fallback_budget.remaining_seconds < 1.0
+                            )
+                            if budget_exhausted:
+                                diagnostics["search_fallback_budget_exhausted"] = True
+                                for pending_item in selected_fallbacks[fallback_index:]:
+                                    pending_item.setdefault("diagnostics", {})[
+                                        "search_fallback_deferred"
+                                    ] = True
+                                print(
+                                    f"[search-fallback-budget] exhausted "
+                                    f"remaining={total_fallbacks - fallback_index}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                                break
                             recoverable_page_error = (
                                 str(exc) in RECOVERABLE_X_PAGE_ERRORS
                                 or isinstance(exc, PlaywrightTimeoutError)
@@ -3367,6 +3513,10 @@ def scrape_all(
                             )
                             if recoverable_page_error:
                                 diagnostics["search_fallback_breaker_triggered"] = True
+                                for pending_item in selected_fallbacks[fallback_index:]:
+                                    pending_item.setdefault("diagnostics", {})[
+                                        "search_fallback_deferred"
+                                    ] = True
                                 print(
                                     f"[x-search-fallback-breaker] trigger={handle} "
                                     f"remaining={total_fallbacks - fallback_index}",
@@ -3383,6 +3533,14 @@ def scrape_all(
                             file=sys.stderr,
                             flush=True,
                         )
+                    print(
+                        f"[search-fallback-budget] "
+                        f"spent={fallback_budget.spent_seconds:.1f}s "
+                        f"limit={fallback_budget.limit_seconds:.0f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                phase_timings["x_fallback"] = time.monotonic() - fallback_started
             finally:
                 context.close()
             has_deferred_recovery = any(
@@ -3393,6 +3551,7 @@ def scrape_all(
                 )
                 for item in results
             )
+            recovery_started = time.monotonic()
             if has_deferred_recovery:
                 browser.close()
                 recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
@@ -3420,6 +3579,7 @@ def scrape_all(
                     scroll_wait_ms,
                     recovery_budget,
                 )
+            phase_timings["x_recovery"] = time.monotonic() - recovery_started
         finally:
             browser.close()
     if recovery_budget is not None:
@@ -3429,7 +3589,8 @@ def scrape_all(
             file=sys.stderr,
             flush=True,
         )
-    return results
+    phase_timings["x_total"] = time.monotonic() - scan_started
+    return results, phase_timings
 
 
 def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -3798,28 +3959,96 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
     translated = 0
     skipped = 0
     failed = 0
+    selected: list[dict[str, Any]] = []
     for row in rows:
         row_id = str(row.get("id") or "")
-        if limit > 0 and translated >= limit and row_id not in priority_ids:
+        if limit > 0 and len(selected) >= limit and row_id not in priority_ids:
             break
-        text = str(row.get("text") or "")
         if not translation_needed(row):
             skipped += 1
             continue
-        try:
-            row["translation_zh"] = translate_to_zh(text)
+        selected.append(row)
+
+    translation_cache = load_json(TRANSLATION_CACHE, {}, strict=True)
+    pending_by_key: dict[str, dict[str, Any]] = {}
+    cache_changed = False
+    for row in selected:
+        key, translation_source, source_language = translation_request(
+            str(row.get("text") or "")
+        )
+        cached = str(translation_cache.get(key) or "")
+        if cached:
+            row["translation_zh"] = cached
             row["translation_version"] = TRANSLATION_VERSION
             row.pop("translation_error", None)
             translated += 1
-        except Exception as exc:
-            row["translation_error"] = f"{type(exc).__name__}: {exc}"
-            failed += 1
-            print(
-                f"[translation-error] id={row_id} handle={row.get('handle') or '?'} "
-                f"priority={row_id in priority_ids} type={type(exc).__name__}",
-                file=sys.stderr,
-                flush=True,
-            )
+            continue
+        pending = pending_by_key.setdefault(key, {
+            "key": key,
+            "translation_source": translation_source,
+            "source_language": source_language,
+            "rows": [],
+        })
+        pending["rows"].append(row)
+
+    pending_items = list(pending_by_key.values())
+    translation_budget = RecoveryBudget(TRANSLATION_TOTAL_BUDGET_SECONDS)
+    processed_items = 0
+    with ThreadPoolExecutor(max_workers=TRANSLATION_WORKERS) as executor:
+        for offset in range(0, len(pending_items), TRANSLATION_WORKERS):
+            if translation_budget.remaining_seconds < 1.0:
+                break
+            batch = pending_items[offset:offset + TRANSLATION_WORKERS]
+            futures = [
+                (
+                    item,
+                    executor.submit(
+                        translate_source_to_zh,
+                        str(item["translation_source"]),
+                        str(item["source_language"]),
+                    ),
+                )
+                for item in batch
+            ]
+            for item, future in futures:
+                item_rows = list(item["rows"])
+                try:
+                    translation = future.result()
+                    if not translation:
+                        raise ValueError("empty translation")
+                except Exception as exc:
+                    failed += len(item_rows)
+                    for row in item_rows:
+                        row["translation_error"] = f"{type(exc).__name__}: {exc}"
+                    first_row = item_rows[0]
+                    print(
+                        f"[translation-error] id={first_row.get('id') or '?'} "
+                        f"handle={first_row.get('handle') or '?'} "
+                        f"rows={len(item_rows)} type={type(exc).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    translation_cache[str(item["key"])] = translation
+                    cache_changed = True
+                    for row in item_rows:
+                        row["translation_zh"] = translation
+                        row["translation_version"] = TRANSLATION_VERSION
+                        row.pop("translation_error", None)
+                    translated += len(item_rows)
+                processed_items += 1
+    if cache_changed:
+        save_json(TRANSLATION_CACHE, translation_cache)
+    deferred = sum(
+        len(item["rows"])
+        for item in pending_items[processed_items:]
+    )
+    print(
+        f"[translation-budget] spent={translation_budget.spent_seconds:.1f}s "
+        f"limit={translation_budget.limit_seconds:.0f}s deferred={deferred}",
+        file=sys.stderr,
+        flush=True,
+    )
     store["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
     save_json(TWEET_STORE, store)
     priority_pending = sum(
@@ -3832,6 +4061,7 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
         "translated": translated,
         "skipped": skipped,
         "failed": failed,
+        "deferred": deferred,
         "priority_needed": priority_needed,
         "priority_pending": priority_pending,
     }
@@ -3896,7 +4126,10 @@ def translate_chunk_to_zh(text: str, source_language: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     for attempt in range(TRANSLATION_RETRIES + 1):
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(
+                req,
+                timeout=TRANSLATION_HTTP_TIMEOUT_SECONDS,
+            ) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             break
         except urllib.error.HTTPError as exc:
@@ -3909,22 +4142,31 @@ def translate_chunk_to_zh(text: str, source_language: str) -> str:
     return "".join(part[0] for part in data[0] if part and part[0]).strip()
 
 
-def translate_to_zh(text: str) -> str:
-    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
+def translation_request(text: str) -> tuple[str, str, str]:
     source = normalize_translation_source(text).strip()
     translation_source = URL_RE.sub("", source).strip()
     if not translation_source:
-        return ""
+        raise ValueError("empty translation source")
     source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
     cache_source = f"v{TRANSLATION_VERSION}\0{source_language}\0{translation_source}"
     key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
-    if key in cache:
-        return str(cache[key])
-    translated = "\n\n".join(
+    return key, translation_source, source_language
+
+
+def translate_source_to_zh(translation_source: str, source_language: str) -> str:
+    return "\n\n".join(
         translated_chunk
         for chunk in split_translation_source(translation_source)
         if (translated_chunk := translate_chunk_to_zh(chunk, source_language))
     )
+
+
+def translate_to_zh(text: str) -> str:
+    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
+    key, translation_source, source_language = translation_request(text)
+    if key in cache:
+        return str(cache[key])
+    translated = translate_source_to_zh(translation_source, source_language)
     cache[key] = translated
     save_json(TRANSLATION_CACHE, cache)
     time.sleep(0.2)
@@ -4714,6 +4956,7 @@ def telegram_report_is_summary_heading(line: str) -> bool:
         "加密市场",
         "市场现货",
         "市场合约",
+        "链上确认交易（截至 ",
         "Hyperliquid清算价",
         "美国国债",
         "ETH 质押",
@@ -5242,7 +5485,10 @@ def main() -> int:
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    results = scrape_all(
+    run_started = time.monotonic()
+    phase_timings: dict[str, float] = {}
+    phase_started = time.monotonic()
+    results, x_phase_timings = scrape_all(
         kols,
         args.hours,
         args.limit,
@@ -5252,6 +5498,8 @@ def main() -> int:
         scroll_wait_ms=args.scroll_wait_ms,
         search_fallback=args.search_fallback,
     )
+    phase_timings["x_scan"] = time.monotonic() - phase_started
+    phase_timings.update(x_phase_timings)
     update_kol_status(results)
     summary = scan_summary(results)
     print(json.dumps({"scan": summary}, ensure_ascii=False))
@@ -5274,9 +5522,11 @@ def main() -> int:
         "translated": 0,
         "skipped": 0,
         "failed": 0,
+        "deferred": 0,
         "priority_needed": 0,
         "priority_pending": 0,
     }
+    phase_started = time.monotonic()
     if not args.no_translate:
         current_tweet_ids = {
             tweet_id(tw)
@@ -5285,6 +5535,7 @@ def main() -> int:
         }
         translate_stats = translate_tweet_store(args.translate_limit, current_tweet_ids)
         apply_store_translations(results)
+    phase_timings["translation"] = time.monotonic() - phase_started
     save_json(STATE_DIR / f"{day}.json", {"hours": args.hours, "store": store_stats, "results": results})
     report = build_report(results, args.hours)
     report_path = REPORT_DIR / f"{day}.md"
@@ -5293,7 +5544,9 @@ def main() -> int:
     print(str(report_path))
     print(json.dumps({"store": store_stats, "translate": translate_stats}, ensure_ascii=False))
     if args.send or live_scan_send:
+        phase_started = time.monotonic()
         stablecoin_summary = fetch_stablecoin_summary()
+        phase_timings["market"] = time.monotonic() - phase_started
         reports = build_telegram_reports(
             results,
             args.hours,
@@ -5307,8 +5560,17 @@ def main() -> int:
             args.include_low_signal,
             stablecoin_summary,
         )
+        phase_started = time.monotonic()
         stats = telegram_send_reports_once(reports, args)
+        phase_timings["telegram"] = time.monotonic() - phase_started
         print(f"sent groups={stats['groups']} rows={stats['rows']}")
+    phase_timings["total"] = time.monotonic() - run_started
+    print(json.dumps({
+        "timing_seconds": {
+            key: round(value, 1)
+            for key, value in phase_timings.items()
+        },
+    }, ensure_ascii=False))
     return 0
 
 
