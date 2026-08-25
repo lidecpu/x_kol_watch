@@ -122,6 +122,9 @@ ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
 RECOVERY_QUIET_SECONDS = 60.0
+GLOBAL_PAGE_FAILURE_STREAK = 2
+RECOVERY_ATTEMPT_CAP_SECONDS = 8.0
+RECOVERY_MIN_ATTEMPT_SECONDS = 3.0
 SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS = 180.0
 MAX_PLANNED_X_PAGE_LOADS_PER_RUN = 88
 MAX_SEARCH_FALLBACK_SCROLLS = 2
@@ -2510,6 +2513,30 @@ def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     return context
 
 
+def chromium_launch_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["CHROME_LOG_FILE"] = os.devnull
+    return env
+
+
+def chromium_log_file_arg() -> str:
+    return f"--log-file={os.devnull}"
+
+
+def cleanup_chromium_debug_log() -> None:
+    path = ROOT / "debug.log"
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(
+            f"[chromium-log-cleanup] skipped {path.name}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def select_liquidation_levels(
     points: Any,
     current_price: float,
@@ -2651,9 +2678,11 @@ def fetch_coinglass_live() -> dict[str, Any]:
                 "args": [
                     "--disable-gpu",
                     "--disable-logging",
+                    chromium_log_file_arg(),
                     "--no-first-run",
                     "--no-default-browser-check",
                 ],
+                "env": chromium_launch_env(),
             }
             if chrome_path:
                 launch_kwargs["executable_path"] = chrome_path
@@ -2740,7 +2769,10 @@ def fetch_coinglass_live() -> dict[str, Any]:
                 finally:
                     await context.close()
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                finally:
+                    cleanup_chromium_debug_log()
 
     return asyncio.run(collect_snapshot())
 
@@ -3076,9 +3108,8 @@ def rescan_page_render_failures(
                 "early_stops": 0,
             }
             diagnostics = item.setdefault("diagnostics", {})
-            remaining_accounts = len(pending_items) - item_index
-            attempt_seconds = recovery_budget.remaining_seconds / remaining_accounts
-            if attempt_seconds <= 0:
+            remaining_seconds = recovery_budget.remaining_seconds
+            if remaining_seconds < RECOVERY_MIN_ATTEMPT_SECONDS:
                 for pending_item in pending_items[item_index:]:
                     pending_diagnostics = pending_item.setdefault("diagnostics", {})
                     pending_diagnostics["recovery_budget_exhausted"] = True
@@ -3086,11 +3117,19 @@ def rescan_page_render_failures(
                         recovery_budget.spent_seconds,
                         3,
                     )
+                print(
+                    f"[x-deferred-recovery] remaining={len(pending_items) - item_index} "
+                    f"deferred; budget_remaining={remaining_seconds:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 break
+            attempt_seconds = min(RECOVERY_ATTEMPT_CAP_SECONDS, remaining_seconds)
             diagnostics["fresh_context_retry"] = int(
                 diagnostics.get("fresh_context_retry") or 0
             ) + 1
             diagnostics["page_retries"] = int(diagnostics.get("page_retries") or 0) + 1
+            diagnostics["recovery_attempted"] = True
             diagnostics["recovery_budget_limit_seconds"] = recovery_budget.limit_seconds
             diagnostics["recovery_quiet_seconds"] = RECOVERY_QUIET_SECONDS
             diagnostics["recovery_profile_only"] = True
@@ -3176,10 +3215,15 @@ def scrape_all(
         launch_args = [
             "--disable-gpu",
             "--disable-logging",
+            chromium_log_file_arg(),
             "--no-first-run",
             "--no-default-browser-check",
         ]
-        launch_kwargs: dict[str, Any] = {"headless": headless, "args": launch_args}
+        launch_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "args": launch_args,
+            "env": chromium_launch_env(),
+        }
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
@@ -3201,6 +3245,7 @@ def scrape_all(
                 )
                 durations: list[float] = []
                 profile_started = time.monotonic()
+                page_failure_streak = 0
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
                     if kol.get("auto_recheck_paused"):
@@ -3290,9 +3335,15 @@ def scrape_all(
                             error = f"{type(exc).__name__}: {exc}"
                             final_page_error = recoverable_page_error
                             diagnostics["deferred_recovery"] = recoverable_page_error
+                            page_failure_streak = (
+                                page_failure_streak + 1
+                                if recoverable_page_error
+                                else 0
+                            )
                         else:
                             status = "ok"
                             error = ""
+                            page_failure_streak = 0
                         break
                     search_fallback_error = str(
                         diagnostics.get("search_fallback_error") or ""
@@ -3301,7 +3352,10 @@ def scrape_all(
                         diagnostics.get("search_fallback_failed")
                         and search_fallback_error.endswith(RECOVERABLE_X_PAGE_ERRORS)
                     )
-                    global_page_failure = final_page_error or search_fallback_page_error
+                    global_page_failure = (
+                        page_failure_streak >= GLOBAL_PAGE_FAILURE_STREAK
+                        or search_fallback_page_error
+                    )
                     global_page_reason = (
                         "page_error"
                         if final_page_error
@@ -3581,7 +3635,10 @@ def scrape_all(
                 )
             phase_timings["x_recovery"] = time.monotonic() - recovery_started
         finally:
-            browser.close()
+            try:
+                browser.close()
+            finally:
+                cleanup_chromium_debug_log()
     if recovery_budget is not None:
         print(
             f"[x-recovery-budget] spent={recovery_budget.spent_seconds:.1f}s "
@@ -3599,11 +3656,22 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         for item in results
         if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
     )
+    recovery_deferred = sum(
+        1
+        for item in results
+        if item.get("status") == "error"
+        and item.get("diagnostics", {}).get("global_page_deferred")
+        and not item.get("diagnostics", {}).get("recovery_attempted")
+    )
     errors = sum(
         1
         for item in results
         if item.get("status") == "error"
         and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
+        and not (
+            item.get("diagnostics", {}).get("global_page_deferred")
+            and not item.get("diagnostics", {}).get("recovery_attempted")
+        )
     )
     paused = sum(1 for item in results if item.get("status") == "paused")
     success = sum(1 for item in results if item.get("status") == "ok")
@@ -3663,6 +3731,7 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         ),
         "renamed": sum(1 for item in results if item.get("diagnostics", {}).get("renamed_to")),
         "unavailable": unavailable,
+        "recovery_deferred": recovery_deferred,
         "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
 
@@ -4680,6 +4749,10 @@ def build_telegram_reports(
         str(item.get("handle") or "").strip()
         for item in results
         if item.get("status") == "error"
+        and not (
+            item.get("diagnostics", {}).get("global_page_deferred")
+            and not item.get("diagnostics", {}).get("recovery_attempted")
+        )
         and (
             item.get("diagnostics", {}).get("deferred_recovery")
             or str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
@@ -4695,6 +4768,11 @@ def build_telegram_reports(
     ]
     page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
     scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
+    recovery_deferred_line = (
+        f"恢复延后:{summary['recovery_deferred']}"
+        if summary["recovery_deferred"]
+        else ""
+    )
     status_lines = [
         line
         for line in (
@@ -4704,6 +4782,7 @@ def build_telegram_reports(
             fallback_line,
             page_issue_line,
             scan_issue_line,
+            recovery_deferred_line,
         )
         if line
     ]
