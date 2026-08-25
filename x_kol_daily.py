@@ -128,16 +128,22 @@ RECOVERY_MIN_ATTEMPT_SECONDS = 3.0
 SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS = 180.0
 MAX_PLANNED_X_PAGE_LOADS_PER_RUN = 88
 MAX_SEARCH_FALLBACK_SCROLLS = 2
+# Keep the fast readiness polling introduced after 08-22, but require a short
+# settle window so a partially mounted X page is not scraped too early.
+X_PAGE_MIN_SETTLE_MS = 1200
+X_SCROLL_MIN_SETTLE_MS = 250
 RENAME_STATUS_CANDIDATES = 3
 UNAVAILABLE_REMOVAL_DAYS = 7
 UNAVAILABLE_RECHECK_INTERVAL_DAYS = 7
 TRANSLATION_RETRIES = 1
 TRANSLATION_HTTP_TIMEOUT_SECONDS = 12
-TRANSLATION_WORKERS = 4
+TRANSLATION_WORKERS = 2
 TRANSLATION_TOTAL_BUDGET_SECONDS = 120.0
+TRANSLATION_BATCH_PAUSE_SECONDS = 0.25
 LEGACY_TRANSLATION_LIMIT = 4500
 TRANSLATION_VERSION = 2
-TRANSLATION_CHUNK_LIMIT = 4000
+# Keep the encoded GET request below Google's practical URL limit.
+TRANSLATION_CHUNK_LIMIT = 1600
 CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -2438,13 +2444,22 @@ def wait_for_x_page_ready(
     """Wait only until X exposes a usable state, up to the configured cap."""
     bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
     started = time.monotonic()
+    ready_at: float | None = None
     while True:
         health = page.evaluate(PAGE_HEALTH_JS)
-        if health.get("hasMain") or any(
+        if any(
             health.get(key)
             for key in ("loginRequired", "errorPage", "accountUnavailable")
         ):
             return
+        if health.get("hasMain"):
+            if ready_at is None:
+                ready_at = time.monotonic()
+            settled_ms = int((time.monotonic() - ready_at) * 1000)
+            if settled_ms >= min(X_PAGE_MIN_SETTLE_MS, bounded_ms):
+                return
+        else:
+            ready_at = None
         elapsed_ms = int((time.monotonic() - started) * 1000)
         remaining_ms = bounded_ms - elapsed_ms
         if remaining_ms <= 0:
@@ -2461,13 +2476,14 @@ def wait_for_x_scroll_content(
     """Wait for lazy-loaded articles, returning early when the DOM advances."""
     bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
     started = time.monotonic()
+    min_settle_ms = min(X_SCROLL_MIN_SETTLE_MS, bounded_ms)
     while True:
         article_count = int(
             page.evaluate("() => document.querySelectorAll('article').length") or 0
         )
-        if article_count > previous_article_count:
-            return
         elapsed_ms = int((time.monotonic() - started) * 1000)
+        if article_count > previous_article_count and elapsed_ms >= min_settle_ms:
+            return
         remaining_ms = bounded_ms - elapsed_ms
         if remaining_ms <= 0:
             return
@@ -4093,7 +4109,8 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
                     print(
                         f"[translation-error] id={first_row.get('id') or '?'} "
                         f"handle={first_row.get('handle') or '?'} "
-                        f"rows={len(item_rows)} type={type(exc).__name__}",
+                        f"rows={len(item_rows)} type={type(exc).__name__} "
+                        f"detail={str(exc)[:120]}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -4106,6 +4123,11 @@ def translate_tweet_store(limit: int, priority_ids: set[str] | None = None) -> d
                         row.pop("translation_error", None)
                     translated += len(item_rows)
                 processed_items += 1
+            if (
+                offset + TRANSLATION_WORKERS < len(pending_items)
+                and translation_budget.remaining_seconds > TRANSLATION_BATCH_PAUSE_SECONDS
+            ):
+                time.sleep(TRANSLATION_BATCH_PAUSE_SECONDS)
     if cache_changed:
         save_json(TRANSLATION_CACHE, translation_cache)
     deferred = sum(
@@ -4184,31 +4206,53 @@ def split_translation_source(text: str, limit: int = TRANSLATION_CHUNK_LIMIT) ->
 
 
 def translate_chunk_to_zh(text: str, source_language: str) -> str:
-    query = urllib.parse.urlencode({
-        "client": "gtx",
-        "sl": source_language,
-        "tl": "zh-CN",
-        "dt": "t",
-        "q": text,
-    })
-    url = "https://translate.googleapis.com/translate_a/single?" + query
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    for attempt in range(TRANSLATION_RETRIES + 1):
-        try:
-            with urllib.request.urlopen(
-                req,
-                timeout=TRANSLATION_HTTP_TIMEOUT_SECONDS,
-            ) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            if attempt >= TRANSLATION_RETRIES or exc.code not in {429, 500, 502, 503, 504}:
-                raise
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-            if attempt >= TRANSLATION_RETRIES:
-                raise
-        time.sleep(1)
-    return "".join(part[0] for part in data[0] if part and part[0]).strip()
+    endpoints = (
+        (
+            "https://translate.googleapis.com/translate_a/single",
+            {"client": "gtx", "sl": source_language, "tl": "zh-CN", "dt": "t"},
+        ),
+        (
+            "https://clients5.google.com/translate_a/t",
+            {"client": "dict-chrome-ex", "sl": source_language, "tl": "zh-CN"},
+        ),
+    )
+    last_error: Exception | None = None
+    for endpoint, params in endpoints:
+        query = urllib.parse.urlencode({**params, "q": text})
+        url = endpoint + "?" + query
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        for attempt in range(TRANSLATION_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(
+                    request,
+                    timeout=TRANSLATION_HTTP_TIMEOUT_SECONDS,
+                ) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                if endpoint.endswith("/single"):
+                    parts = data[0] if isinstance(data, list) and data else []
+                    translation = "".join(
+                        part[0]
+                        for part in parts
+                        if isinstance(part, list) and part and part[0]
+                    )
+                else:
+                    translation = data[0] if isinstance(data, list) and data else ""
+                if translation:
+                    return str(translation).strip()
+                raise ValueError("empty translation response")
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code not in {400, 408, 425, 429, 500, 502, 503, 504}:
+                    break
+                if attempt < TRANSLATION_RETRIES:
+                    time.sleep(1 + attempt)
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                last_error = exc
+                if attempt < TRANSLATION_RETRIES:
+                    time.sleep(1 + attempt)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("translation endpoints unavailable")
 
 
 def translation_request(text: str) -> tuple[str, str, str]:
@@ -4216,7 +4260,9 @@ def translation_request(text: str) -> tuple[str, str, str]:
     translation_source = URL_RE.sub("", source).strip()
     if not translation_source:
         raise ValueError("empty translation source")
-    source_language = "en" if re.search(r"[\u4e00-\u9fff]", source) and is_mostly_english(source) else "auto"
+    # Mixed Chinese/English posts must use auto-detection; forcing sl=en can
+    # make Google's endpoint reject otherwise valid long Chinese posts.
+    source_language = "auto"
     cache_source = f"v{TRANSLATION_VERSION}\0{source_language}\0{translation_source}"
     key = hashlib.sha256(cache_source.encode("utf-8")).hexdigest()
     return key, translation_source, source_language
