@@ -1,4 +1,11 @@
 const GITHUB_TIMEOUT_MS = 20_000;
+const ACTIVE_RUN_STATUSES = new Set([
+  "queued",
+  "in_progress",
+  "waiting",
+  "pending",
+  "requested",
+]);
 
 export default {
   async fetch(request, env) {
@@ -51,6 +58,22 @@ async function triggerGithub(env, source) {
   const repo = env.GITHUB_REPO || "x_kol_watch";
   const workflow = env.GITHUB_WORKFLOW || "x-kol-daily.yml";
   const ref = env.GITHUB_REF || "main";
+  const activeRuns = await listActiveRuns(env, owner, repo, workflow, ref);
+  if (activeRuns.length) {
+    return {
+      ok: true,
+      source,
+      skipped: true,
+      reason: "active-run",
+      active_runs: activeRuns.slice(0, 3).map((run) => ({
+        id: run.id,
+        number: run.run_number,
+        status: run.status,
+        created_at: run.created_at,
+      })),
+      time: new Date().toISOString(),
+    };
+  }
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflow}/dispatches`;
 
   const controller = new AbortController();
@@ -92,6 +115,43 @@ async function triggerGithub(env, source) {
   };
 }
 
+async function listActiveRuns(env, owner, repo, workflow, ref) {
+  const query = new URLSearchParams({
+    workflow_id: workflow,
+    branch: ref,
+    event: "workflow_dispatch",
+    per_page: "20",
+  });
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/actions/runs?${query}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GITHUB_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(apiUrl, {
+      headers: {
+        Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "x-kol-watch-trigger",
+      },
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("GitHub active-run check timed out");
+    }
+    throw new Error("GitHub active-run check failed");
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub active-run check failed ${response.status}`);
+  }
+  const payload = await response.json();
+  const runs = Array.isArray(payload?.workflow_runs) ? payload.workflow_runs : [];
+  return runs.filter((run) => ACTIVE_RUN_STATUSES.has(run?.status));
+}
+
 function errorMessage(error) {
   return error instanceof Error ? error.message : "unknown error";
 }
@@ -103,6 +163,9 @@ function logDispatch(result, level = "log") {
     source: result.source,
   };
   if (result.status) entry.status = result.status;
+  if (result.skipped) entry.skipped = true;
+  if (result.reason) entry.reason = result.reason;
+  if (result.active_runs) entry.active_runs = result.active_runs;
   if (result.workflow) entry.workflow = result.workflow;
   if (result.ref) entry.ref = result.ref;
   if (result.error) entry.error = result.error;
