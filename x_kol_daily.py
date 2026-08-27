@@ -102,6 +102,16 @@ MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
 MARKET_SUMMARY_CACHE_VERSION = 18
+STRATEGY_BTC_CACHE_VERSION = 1
+# Migration seed for caches created before Strategy had its own record.
+STRATEGY_BTC_LAST_VALID = {
+    "record_date": "2026-08-10",
+    "verified_date": "2026-08-25",
+    "holdings": 840447,
+    "change": -1690,
+    "average_price": 75385.0,
+    "total_cost_millions": 63357.0,
+}
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_CACHE_TTL_SECONDS = 600
 COINGLASS_FAILURE_COOLDOWN_SECONDS = 900
@@ -820,6 +830,77 @@ def fetch_strategy_btc() -> dict[str, Any]:
     latest = max(records, key=lambda item: item["record_date"])
     latest["verified_date"] = cn_now().date()
     return latest
+
+
+def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    def parse_date(raw: Any) -> dt.date:
+        if isinstance(raw, dt.datetime):
+            return raw.date()
+        if isinstance(raw, dt.date):
+            return raw
+        return dt.date.fromisoformat(str(raw))
+
+    try:
+        record = {
+            "record_date": parse_date(value["record_date"]),
+            "verified_date": parse_date(value["verified_date"]),
+            "holdings": int(value["holdings"]),
+            "change": int(value["change"]),
+            "average_price": float(value["average_price"]),
+            "total_cost_millions": float(value["total_cost_millions"]),
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return {}
+    numeric = (
+        record["holdings"],
+        record["change"],
+        record["average_price"],
+        record["total_cost_millions"],
+    )
+    if (
+        not all(math.isfinite(number) for number in numeric)
+        or record["holdings"] <= 0
+        or record["average_price"] <= 0
+        or record["total_cost_millions"] <= 0
+        or record["record_date"] > record["verified_date"]
+    ):
+        return {}
+    return record
+
+
+def save_strategy_btc_cache(record: dict[str, Any]) -> None:
+    normalized = normalize_strategy_btc_record(record)
+    if not normalized:
+        raise ValueError("invalid Strategy cache record")
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    state["version"] = 1
+    state["strategy_btc"] = {
+        "version": STRATEGY_BTC_CACHE_VERSION,
+        "record_date": normalized["record_date"].isoformat(),
+        "verified_date": normalized["verified_date"].isoformat(),
+        "holdings": normalized["holdings"],
+        "change": normalized["change"],
+        "average_price": normalized["average_price"],
+        "total_cost_millions": normalized["total_cost_millions"],
+    }
+    save_json(MARKET_STATE, state)
+
+
+def load_strategy_btc_cache() -> dict[str, Any]:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    cache = state.get("strategy_btc")
+    if isinstance(cache, dict) and cache.get("version") == STRATEGY_BTC_CACHE_VERSION:
+        record = normalize_strategy_btc_record(cache)
+        if record:
+            return record
+    return normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
 
 
 def fetch_bitmine_eth() -> dict[str, Any]:
@@ -1765,6 +1846,22 @@ def fetch_stablecoin_summary() -> str:
     global_volume = fetched.get("global_volume", {})
     chain_activity = fetched.get("chain_activity", {})
     strategy_btc = fetched.get("strategy_btc", {})
+    if strategy_btc:
+        try:
+            save_strategy_btc_cache(strategy_btc)
+        except market_errors as exc:
+            print(f"[strategy-btc-cache-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    else:
+        try:
+            strategy_btc = load_strategy_btc_cache()
+            if strategy_btc:
+                verified_date = strategy_btc["verified_date"].isoformat()
+                print(
+                    f"[strategy-btc-cache] using last verified record from {verified_date}",
+                    file=sys.stderr,
+                )
+        except market_errors as exc:
+            print(f"[strategy-btc-cache-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     bitmine_eth = fetched.get("bitmine_eth", {})
     us_macro_calendar = fetched.get("us_macro_calendar", {})
     supply = fetched.get("supply", {})
