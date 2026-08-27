@@ -55,6 +55,7 @@ python x_kol_daily.py --market-only --send --send-once-key "market-YYYYMMDD-purp
 
 - `wrangler.toml` 配置 Worker 名称和北京时间 `23:30` 对应的 UTC cron：`30 15 * * *`
 - `src/index.js` 在定时触发时调用 GitHub Actions `workflow_dispatch`
+- Worker 会忽略超过 24 小时且没有 job 的孤立排队运行，并传入按北京时间日期生成的稳定 `send_once_key`，避免旧运行恢复后重复发送 Telegram
 - Worker Secret 需要配置 `GITHUB_TOKEN` 和 `RUN_KEY`
 - `GET` 仅用于健康检查；手动触发必须使用 `POST` 并通过 `X-Run-Key` 请求头传递 `RUN_KEY`
 - 不要把 `RUN_KEY` 放入 URL 查询参数、日志或文档

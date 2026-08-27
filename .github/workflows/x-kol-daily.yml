@@ -1,7 +1,12 @@
 name: X KOL Daily
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      send_once_key:
+        description: Stable Telegram idempotency key supplied by the trigger
+        required: false
+        type: string
 
 concurrency:
   group: x-kol-daily
@@ -16,6 +21,7 @@ jobs:
       X_CT0: ${{ secrets.X_CT0 }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      SEND_ONCE_KEY: ${{ inputs.send_once_key }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -65,6 +71,9 @@ jobs:
         shell: bash
         run: |
           cmd=(python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
+          if [ -n "$SEND_ONCE_KEY" ]; then
+            cmd+=(--send-once-key "$SEND_ONCE_KEY")
+          fi
           echo "mode=full chars=full send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
