@@ -102,10 +102,11 @@ MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
 MARKET_SUMMARY_CACHE_VERSION = 18
-STRATEGY_BTC_CACHE_VERSION = 1
+STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
     "record_date": "2026-08-10",
+    "holdings_as_of": "2026-08-23",
     "verified_date": "2026-08-25",
     "holdings": 840447,
     "change": -1690,
@@ -828,6 +829,10 @@ def fetch_strategy_btc() -> dict[str, Any]:
     if not records:
         raise ValueError("missing complete Strategy purchase record")
     latest = max(records, key=lambda item: item["record_date"])
+    latest["holdings_as_of"] = max(
+        latest["record_date"],
+        dt.date.fromisoformat(STRATEGY_BTC_LAST_VALID["holdings_as_of"]),
+    )
     latest["verified_date"] = cn_now().date()
     return latest
 
@@ -846,6 +851,7 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
     try:
         record = {
             "record_date": parse_date(value["record_date"]),
+            "holdings_as_of": parse_date(value["holdings_as_of"]),
             "verified_date": parse_date(value["verified_date"]),
             "holdings": int(value["holdings"]),
             "change": int(value["change"]),
@@ -866,6 +872,8 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         or record["average_price"] <= 0
         or record["total_cost_millions"] <= 0
         or record["record_date"] > record["verified_date"]
+        or record["record_date"] > record["holdings_as_of"]
+        or record["holdings_as_of"] > record["verified_date"]
     ):
         return {}
     return record
@@ -882,6 +890,7 @@ def save_strategy_btc_cache(record: dict[str, Any]) -> None:
     state["strategy_btc"] = {
         "version": STRATEGY_BTC_CACHE_VERSION,
         "record_date": normalized["record_date"].isoformat(),
+        "holdings_as_of": normalized["holdings_as_of"].isoformat(),
         "verified_date": normalized["verified_date"].isoformat(),
         "holdings": normalized["holdings"],
         "change": normalized["change"],
@@ -2069,10 +2078,10 @@ def fetch_stablecoin_summary() -> str:
     strategy_lines: list[str] = []
     if strategy_btc:
         record_date = strategy_btc["record_date"].strftime("%m-%d")
-        verified_date = strategy_btc["verified_date"].strftime("%m-%d")
+        holdings_as_of = strategy_btc["holdings_as_of"].strftime("%m-%d")
         strategy_lines.extend([
             "Strategy（微策略）",
-            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 官网核验 {verified_date}",
+            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of}",
             f"上次变化 {strategy_btc['change']:+,}枚（{record_date}）",
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
