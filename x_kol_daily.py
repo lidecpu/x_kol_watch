@@ -128,7 +128,14 @@ SPOT_ETF_FLOW_SUMMARY_DAYS = 5
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
-RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
+X_AUTHENTICATION_REQUIRED_ERROR = "X authentication required"
+X_VERIFICATION_REQUIRED_ERROR = "X verification required"
+RECOVERABLE_X_PAGE_ERRORS = (
+    PAGE_RENDER_ERROR,
+    X_RATE_LIMIT_ERROR,
+    X_AUTHENTICATION_REQUIRED_ERROR,
+    X_VERIFICATION_REQUIRED_ERROR,
+)
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
@@ -2354,9 +2361,24 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
+  const verificationRequired =
+    path.includes('/account/access') ||
+    path.includes('/i/flow/account-access') ||
+    path.includes('/i/flow/verify') ||
+    path.includes('/i/flow/challenge') ||
+    Boolean(document.querySelector(
+      'iframe[src*="arkoselabs"], iframe[src*="captcha"], [data-testid="ocfEnterTextTextInput"]'
+    )) ||
+    (!hasMain && has([
+      'authenticate your account', 'verify your identity', 'confirm your identity',
+      'prove you are human', 'complete the following actions', 'suspicious activity',
+      '验证你的身份', '确认你的身份', '验证您的身份',
+      '确认您的身份', '请完成以下操作', '可疑活动'
+    ]));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
+    verificationRequired,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
       (!hasMain && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
@@ -2606,7 +2628,13 @@ def ensure_x_page_healthy(
     recovery_timeout_ms(30_000, deadline_monotonic)
     health = page.evaluate(PAGE_HEALTH_JS)
     if not health.get("hasMain") and not any(
-        health.get(key) for key in ("loginRequired", "errorPage", "accountUnavailable")
+        health.get(key)
+        for key in (
+            "loginRequired",
+            "verificationRequired",
+            "errorPage",
+            "accountUnavailable",
+        )
     ):
         page.reload(
             wait_until="domcontentloaded",
@@ -2616,7 +2644,10 @@ def ensure_x_page_healthy(
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
         record_page_health(diagnostics, phase, health)
-        raise RuntimeError("X authentication required")
+        raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
+    if health.get("verificationRequired"):
+        record_page_health(diagnostics, phase, health)
+        raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR)
     if health.get("errorPage"):
         record_page_health(diagnostics, phase, health)
         raise RuntimeError(X_RATE_LIMIT_ERROR)
@@ -3856,6 +3887,18 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "recovery_deferred": recovery_deferred,
         "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
+
+
+def ensure_scan_deliverable(
+    results: list[dict[str, Any]],
+    summary: dict[str, int],
+) -> None:
+    failed_count = sum(1 for item in results if item.get("status") == "error")
+    if failed_count and summary["success"] == 0:
+        raise RuntimeError(
+            f"X scan produced no successful KOLs ({failed_count}/{len(results)} failed); "
+            "report generation and Telegram delivery were stopped"
+        )
 
 
 def normalize_translation_source(text: str) -> str:
@@ -5745,6 +5788,8 @@ def main() -> int:
                 f"[{category}] {item.get('handle', '')} {item.get('error', '')}",
                 file=sys.stderr,
             )
+
+    ensure_scan_deliverable(results, summary)
 
     stamp = cn_now().strftime("%Y%m%d-%H%M%S")
     day = cn_now().strftime("%Y%m%d")
