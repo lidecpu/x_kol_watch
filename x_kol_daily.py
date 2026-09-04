@@ -1826,16 +1826,11 @@ def fetch_stablecoin_summary() -> str:
         }
         try:
             coinglass_snapshot = fetch_coinglass_snapshot()
-            hyperliquid_liquidation = coinglass_snapshot
-            market_structure = coinglass_snapshot.get("market_structure")
-            if isinstance(market_structure, dict):
-                coinglass_market_structure = dict(market_structure)
-                if coinglass_snapshot.get("_stale"):
-                    coinglass_market_structure["_stale"] = True
-                    if coinglass_snapshot.get("_captured_at"):
-                        coinglass_market_structure["_captured_at"] = (
-                            coinglass_snapshot["_captured_at"]
-                        )
+            if coinglass_snapshot and not coinglass_snapshot.get("_stale"):
+                hyperliquid_liquidation = coinglass_snapshot
+                market_structure = coinglass_snapshot.get("market_structure")
+                if isinstance(market_structure, dict):
+                    coinglass_market_structure = dict(market_structure)
         except Exception as exc:
             print(
                 f"[coinglass-cache-error] {type(exc).__name__}: {exc}",
