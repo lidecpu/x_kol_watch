@@ -2349,6 +2349,9 @@ PAGE_HEALTH_JS = r"""
   const text = rawText.toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
+  const hasTimeline = Boolean(document.querySelector(
+    '[data-testid="primaryColumn"], article, section[aria-label*="Timeline"], section[aria-label*="时间线"]'
+  ));
   const unavailableStateTexts = Array.from(document.querySelectorAll(
     '[data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
   )).map(node => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
@@ -2380,7 +2383,7 @@ PAGE_HEALTH_JS = r"""
       Boolean(document.querySelector('input[autocomplete="username"]')),
     verificationRequired,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
-      (!hasMain && has([
+      ((!hasMain || !hasTimeline) && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
         'verify you are human', 'unusual activity', 'automated requests',
         'temporarily limited', '超过频率限制', '出错了，请尝试重新加载',
@@ -2389,6 +2392,7 @@ PAGE_HEALTH_JS = r"""
     accountUnavailable: accountMissing || accountSuspended,
     accountUnavailableReason: accountSuspended ? 'suspended' : accountMissing ? 'missing' : '',
     hasMain,
+    hasTimeline,
     path,
     title: (document.title || '').slice(0, 160),
     textSample: rawText.replace(/\s+/g, ' ').trim().slice(0, 300)
