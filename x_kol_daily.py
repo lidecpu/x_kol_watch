@@ -101,7 +101,7 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 18
+MARKET_SUMMARY_CACHE_VERSION = 19
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
@@ -1626,6 +1626,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
+            or line.startswith("链上确认交易（最新完整日 ")
             or line.startswith("链上确认交易（截至 ")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
@@ -1699,6 +1700,7 @@ def summary_block_key(block: list[str]) -> str:
     key = re.sub(r"（缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "", block[0])
     key = re.sub(r"（亿美元，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（亿美元）", key)
     key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
+    key = re.sub(r"^链上确认交易（(?:最新完整日 |截至 )\d{2}-\d{2}）$", "链上确认交易", key)
     return key
 
 
@@ -1961,15 +1963,16 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        record_date = chain_activity["record_date"].strftime("%m-%d")
+        # Coin Metrics daily records are UTC dates; display their Beijing end date.
+        record_date = (chain_activity["record_date"] + dt.timedelta(days=1)).strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（截至 {record_date}）",
+            f"链上确认交易（最新完整日 {record_date}）",
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
-            f"24H {assets['btc']['percent']:+.2f}% | "
+            f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
             f"ETH {assets['eth']['transactions'] / 1e4:.2f}万笔 | "
-            f"24H {assets['eth']['percent']:+.2f}% | "
+            f"较上一完整日 {assets['eth']['percent']:+.2f}% | "
             f"较前7日均 {assets['eth']['seven_day_average_percent']:+.2f}%",
         ])
     if hyperliquid_liquidation:
