@@ -105,13 +105,13 @@ MARKET_SUMMARY_CACHE_VERSION = 18
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
-    "record_date": "2026-08-10",
-    "holdings_as_of": "2026-08-23",
-    "verified_date": "2026-08-25",
-    "holdings": 840447,
-    "change": -1690,
-    "average_price": 75385.0,
-    "total_cost_millions": 63357.0,
+    "record_date": "2026-08-31",
+    "holdings_as_of": "2026-08-31",
+    "verified_date": "2026-09-05",
+    "holdings": 845050,
+    "change": 4603,
+    "average_price": 75412.0,
+    "total_cost_millions": 63727.0,
 }
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_CACHE_TTL_SECONDS = 600
@@ -912,11 +912,13 @@ def load_strategy_btc_cache() -> dict[str, Any]:
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     cache = state.get("strategy_btc")
+    cached_record = {}
     if isinstance(cache, dict) and cache.get("version") == STRATEGY_BTC_CACHE_VERSION:
-        record = normalize_strategy_btc_record(cache)
-        if record:
-            return record
-    return normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
+        cached_record = normalize_strategy_btc_record(cache)
+    baseline = normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
+    if cached_record and baseline:
+        return max((cached_record, baseline), key=lambda item: item["record_date"])
+    return cached_record or baseline
 
 
 def fetch_bitmine_eth() -> dict[str, Any]:
