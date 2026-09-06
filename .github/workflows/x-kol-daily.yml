@@ -70,11 +70,11 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          cmd=(xvfb-run -a python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
+          cmd=(xvfb-run -a python x_kol_daily.py --market-only --send)
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")
           fi
-          echo "mode=full chars=full send=true"
+          echo "mode=market-only send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
