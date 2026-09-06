@@ -2661,7 +2661,7 @@ def open_x_home_context(
     cookies: list[dict[str, Any]],
     timeout_error_type: type[BaseException],
 ) -> tuple[Any, Any]:
-    """Open a healthy X home page, retrying only transient render failures."""
+    """Create a session from X home without requiring a brittle home DOM shape."""
     for attempt in range(1, 4):
         context = new_x_context(browser, cookies)
         page = context.new_page()
@@ -2672,12 +2672,9 @@ def open_x_home_context(
                 timeout=45_000,
             )
             page.wait_for_timeout(1500)
-            ensure_x_page_healthy(page)
         except Exception as exc:
             context.close()
-            retryable = str(exc) == PAGE_RENDER_ERROR or isinstance(
-                exc, timeout_error_type
-            )
+            retryable = isinstance(exc, timeout_error_type)
             if not retryable or attempt >= 3:
                 raise
             print(
