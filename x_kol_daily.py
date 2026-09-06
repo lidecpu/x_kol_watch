@@ -130,9 +130,8 @@ PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
 X_AUTHENTICATION_REQUIRED_ERROR = "X authentication required"
 X_VERIFICATION_REQUIRED_ERROR = "X verification required"
-RECOVERABLE_X_PAGE_ERRORS = (
-    PAGE_RENDER_ERROR,
-    X_RATE_LIMIT_ERROR,
+RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
+SESSION_BLOCKED_X_ERRORS = (
     X_AUTHENTICATION_REQUIRED_ERROR,
     X_VERIFICATION_REQUIRED_ERROR,
 )
@@ -2333,6 +2332,7 @@ PAGE_HEALTH_JS = r"""
   const path = (location.pathname || '').toLowerCase();
   const rawText = (document.body?.innerText || '').slice(0, 5000);
   const text = rawText.toLowerCase();
+  const title = (document.title || '').toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
   const hasTimeline = Boolean(document.querySelector(
@@ -2361,9 +2361,11 @@ PAGE_HEALTH_JS = r"""
     (!hasMain && has([
       'authenticate your account', 'verify your identity', 'confirm your identity',
       'prove you are human', 'complete the following actions', 'suspicious activity',
+      'just a moment', 'please wait', 'checking your browser', '请稍候', '请稍等',
       '验证你的身份', '确认你的身份', '验证您的身份',
       '确认您的身份', '请完成以下操作', '可疑活动'
-    ]));
+    ]) || ['just a moment', 'please wait', '请稍候', '请稍等']
+      .some(value => title.includes(value));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
@@ -2531,6 +2533,7 @@ def record_page_health(
             health.get("accountUnavailableReason") or ""
         )[:40],
         "has_main": bool(health.get("hasMain")),
+        "verification_required": bool(health.get("verificationRequired")),
     }
 
 
@@ -3501,18 +3504,21 @@ def scrape_all(
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                            recoverable_page_error = str(exc) in RECOVERABLE_X_PAGE_ERRORS or isinstance(
+                            error_text = str(exc)
+                            recoverable_page_error = error_text in RECOVERABLE_X_PAGE_ERRORS or isinstance(
                                 exc,
                                 PlaywrightTimeoutError,
                             )
+                            session_blocked = error_text in SESSION_BLOCKED_X_ERRORS
                             tweets = []
                             status = "error"
                             error = f"{type(exc).__name__}: {exc}"
-                            final_page_error = recoverable_page_error
+                            final_page_error = recoverable_page_error or session_blocked
                             diagnostics["deferred_recovery"] = recoverable_page_error
+                            diagnostics["session_blocked"] = session_blocked
                             page_failure_streak = (
                                 page_failure_streak + 1
-                                if recoverable_page_error
+                                if final_page_error
                                 else 0
                             )
                         else:
@@ -3529,10 +3535,13 @@ def scrape_all(
                     )
                     global_page_failure = (
                         page_failure_streak >= GLOBAL_PAGE_FAILURE_STREAK
+                        or diagnostics.get("session_blocked")
                         or search_fallback_page_error
                     )
                     global_page_reason = (
-                        "page_error"
+                        "session_blocked"
+                        if diagnostics.get("session_blocked")
+                        else "page_error"
                         if final_page_error
                         else "search_fallback_error"
                         if search_fallback_page_error
@@ -4969,10 +4978,16 @@ def build_telegram_reports(
         if item.get("status") == "error"
         and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
         and not item.get("diagnostics", {}).get("deferred_recovery")
+        and not item.get("diagnostics", {}).get("session_blocked")
         and not str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
     ]
     page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
     scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
+    session_blocked_line = (
+        "X验证拦截"
+        if any(item.get("diagnostics", {}).get("session_blocked") for item in results)
+        else ""
+    )
     recovery_deferred_line = (
         f"恢复延后:{summary['recovery_deferred']}"
         if summary["recovery_deferred"]
@@ -4986,6 +5001,7 @@ def build_telegram_reports(
             paused_line,
             fallback_line,
             page_issue_line,
+            session_blocked_line,
             scan_issue_line,
             recovery_deferred_line,
         )
