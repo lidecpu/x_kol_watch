@@ -1371,20 +1371,6 @@ def save_market_summary_cache(summary: str) -> None:
     save_json(MARKET_STATE, state)
 
 
-def save_market_summary_failure() -> None:
-    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
-    if not isinstance(state, dict):
-        state = {"version": 1, "snapshots": {}}
-    cache = state.get("summary_cache")
-    if not isinstance(cache, dict) or cache.get("version") != MARKET_SUMMARY_CACHE_VERSION:
-        cache = {}
-    cache["version"] = MARKET_SUMMARY_CACHE_VERSION
-    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
-    state["version"] = 1
-    state["summary_cache"] = cache
-    save_json(MARKET_STATE, state)
-
-
 def load_coinglass_cache() -> tuple[
     dict[str, Any] | None,
     dt.datetime | None,
@@ -2670,6 +2656,41 @@ def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     return context
 
 
+def open_x_home_context(
+    browser: Any,
+    cookies: list[dict[str, Any]],
+    timeout_error_type: type[BaseException],
+) -> tuple[Any, Any]:
+    """Open a healthy X home page, retrying only transient render failures."""
+    for attempt in range(1, 4):
+        context = new_x_context(browser, cookies)
+        page = context.new_page()
+        try:
+            page.goto(
+                "https://x.com/home",
+                wait_until="domcontentloaded",
+                timeout=45_000,
+            )
+            page.wait_for_timeout(1500)
+            ensure_x_page_healthy(page)
+        except Exception as exc:
+            context.close()
+            retryable = str(exc) == PAGE_RENDER_ERROR or isinstance(
+                exc, timeout_error_type
+            )
+            if not retryable or attempt >= 3:
+                raise
+            print(
+                f"[x-home-retry] attempt={attempt + 1}/3 reason={type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(2.0)
+            continue
+        return context, page
+    raise RuntimeError(PAGE_RENDER_ERROR)
+
+
 def chromium_launch_env() -> dict[str, str]:
     env = dict(os.environ)
     env["CHROME_LOG_FILE"] = os.devnull
@@ -3385,12 +3406,12 @@ def scrape_all(
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
         try:
-            context = new_x_context(browser, cookies)
+            context, page = open_x_home_context(
+                browser,
+                cookies,
+                PlaywrightTimeoutError,
+            )
             try:
-                page = context.new_page()
-                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
-                page.wait_for_timeout(1500)
-                ensure_x_page_healthy(page)
                 print(
                     f"[x-home] url={page.url} title={page.title()[:80]}",
                     file=sys.stderr,
@@ -4427,18 +4448,6 @@ def translate_source_to_zh(translation_source: str, source_language: str) -> str
         for chunk in split_translation_source(translation_source)
         if (translated_chunk := translate_chunk_to_zh(chunk, source_language))
     )
-
-
-def translate_to_zh(text: str) -> str:
-    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
-    key, translation_source, source_language = translation_request(text)
-    if key in cache:
-        return str(cache[key])
-    translated = translate_source_to_zh(translation_source, source_language)
-    cache[key] = translated
-    save_json(TRANSLATION_CACHE, cache)
-    time.sleep(0.2)
-    return translated
 
 
 def fmt_time(value: str) -> str:
