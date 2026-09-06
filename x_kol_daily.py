@@ -2461,7 +2461,10 @@ COINGLASS_LONG_SHORT_RATIO_JS = r"""
 COINGLASS_MARKET_STRUCTURE_JS = r"""
 () => {
   const leafTexts = href => {
-    const link = document.querySelector(`a.card-link[href="${href}"]`);
+    const link = Array.from(document.querySelectorAll('a[href]')).find(node => {
+      const nodeHref = node.getAttribute('href') || '';
+      return nodeHref === href || nodeHref.includes('/MarketCap');
+    });
     if (!link) return [];
     return Array.from(link.querySelectorAll('*'))
       .filter(node => node.children.length === 0)
@@ -2487,12 +2490,12 @@ COINGLASS_MARKET_STRUCTURE_JS = r"""
 
 COINGLASS_BALANCE_TOTAL_JS = r"""
 () => {
-  const rows = Array.from(document.querySelectorAll('table tr'));
-  const total = rows.find(row =>
-    Array.from(row.querySelectorAll('td')).some(cell =>
+  const total = Array.from(document.querySelectorAll('table tr')).reverse().find(row => {
+    const cells = Array.from(row.querySelectorAll('td'));
+    return cells.length >= 6 && cells.some(cell =>
       (cell.textContent || '').trim() === '总计'
-    )
-  );
+    );
+  });
   if (!total) return null;
   const cells = Array.from(total.querySelectorAll('td'))
     .map(cell => (cell.textContent || '').trim());
@@ -2787,14 +2790,18 @@ def normalize_coinglass_market_structure(raw: Any) -> dict[str, float]:
         text = str(value or "").strip().replace(",", "")
         if suffix and text.endswith(suffix):
             text = text[:-len(suffix)].strip()
-        return float(text)
+        multiplier = 1.0
+        for unit, factor in (("亿", 1e8), ("万", 1e4), ("千", 1e3)):
+            if text.endswith(unit):
+                text = text[:-1].strip()
+                multiplier = factor
+                break
+        return float(text) * multiplier
 
     try:
         dominance = parse_number(raw.get("dominance"), "%")
         dominance_change = parse_number(raw.get("dominance_change"), "%")
-        balance_text = str(raw.get("balance") or "").strip()
-        balance_multiplier = 1e4 if balance_text.endswith("万") else 1.0
-        balance = parse_number(balance_text, "万") * balance_multiplier
+        balance = parse_number(raw.get("balance"))
         balance_change_24h = parse_number(raw.get("balance_change_24h"))
         balance_change_7d = parse_number(raw.get("balance_change_7d"))
         balance_change_30d = parse_number(raw.get("balance_change_30d"))
@@ -2831,7 +2838,9 @@ def fetch_coinglass_live() -> dict[str, Any]:
         chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
         async with async_playwright() as playwright:
             launch_kwargs: dict[str, Any] = {
-                "headless": True,
+                # CoinGlass currently returns 404 to headless Chromium; its SPA
+                # serves the same public pages when a display is present.
+                "headless": False,
                 "args": [
                     "--disable-gpu",
                     "--disable-logging",
@@ -2875,11 +2884,24 @@ def fetch_coinglass_live() -> dict[str, Any]:
                         deadline = time.monotonic() + COINGLASS_PAGE_WAIT_SECONDS
                         try:
                             try:
-                                await page.goto(
-                                    url,
-                                    wait_until="domcontentloaded",
-                                    timeout=15_000,
-                                )
+                                if url == COINGLASS_MARKET_OVERVIEW_URL:
+                                    await page.goto(
+                                        "https://www.coinglass.com/zh",
+                                        wait_until="domcontentloaded",
+                                        timeout=15_000,
+                                    )
+                                elif url == COINGLASS_BALANCE_URL:
+                                    await page.goto(
+                                        COINGLASS_BALANCE_URL,
+                                        wait_until="domcontentloaded",
+                                        timeout=15_000,
+                                    )
+                                else:
+                                    await page.goto(
+                                        url,
+                                        wait_until="domcontentloaded",
+                                        timeout=15_000,
+                                    )
                             except PlaywrightTimeoutError:
                                 pass
                             raw: Any = None
@@ -2892,27 +2914,25 @@ def fetch_coinglass_live() -> dict[str, Any]:
                         finally:
                             await page.close()
 
-                    liquidation_raw, ratio_raw, market_raw, balance_raw = await asyncio.gather(
-                        read_page(
-                            COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
-                            COINGLASS_LIQUIDATION_OPTION_JS,
-                            "current_price",
-                        ),
-                        read_page(
-                            COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
-                            COINGLASS_LONG_SHORT_RATIO_JS,
-                            "long_users",
-                        ),
-                        read_page(
-                            COINGLASS_MARKET_OVERVIEW_URL,
-                            COINGLASS_MARKET_STRUCTURE_JS,
-                            "dominance",
-                        ),
-                        read_page(
-                            COINGLASS_BALANCE_URL,
-                            COINGLASS_BALANCE_TOTAL_JS,
-                            "balance",
-                        ),
+                    liquidation_raw = await read_page(
+                        COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
+                        COINGLASS_LIQUIDATION_OPTION_JS,
+                        "current_price",
+                    )
+                    ratio_raw = await read_page(
+                        COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
+                        COINGLASS_LONG_SHORT_RATIO_JS,
+                        "long_users",
+                    )
+                    market_raw = await read_page(
+                        COINGLASS_MARKET_OVERVIEW_URL,
+                        COINGLASS_MARKET_STRUCTURE_JS,
+                        "dominance",
+                    )
+                    balance_raw = await read_page(
+                        COINGLASS_BALANCE_URL,
+                        COINGLASS_BALANCE_TOTAL_JS,
+                        "balance",
                     )
                     snapshot = normalize_hyperliquid_liquidation(liquidation_raw)
                     snapshot["long_short_ratio"] = normalize_hyperliquid_long_short_ratio(
