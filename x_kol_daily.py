@@ -3358,7 +3358,13 @@ def scrape_all(
     with sync_playwright() as p:
         # Keep X Chromium launch behavior aligned with the last known-good run.
         launch_args = ["--disable-gpu", "--no-first-run", "--no-default-browser-check"]
-        launch_kwargs: dict[str, Any] = {"headless": headless, "args": launch_args}
+        x_launch_env = dict(os.environ)
+        x_launch_env.pop("DISPLAY", None)
+        launch_kwargs: dict[str, Any] = {
+            "headless": headless,
+            "args": launch_args,
+            "env": x_launch_env,
+        }
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
