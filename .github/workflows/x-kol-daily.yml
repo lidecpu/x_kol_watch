@@ -70,7 +70,7 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          cmd=(xvfb-run -a python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
+          cmd=(python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")
           fi
