@@ -3373,9 +3373,56 @@ def scrape_all(
             try:
                 page = context.new_page()
                 home_diagnostics: dict[str, Any] = {}
+                home_responses: list[dict[str, Any]] = []
+
+                def record_home_response(response: Any) -> None:
+                    if len(home_responses) >= 24:
+                        return
+                    try:
+                        parsed = urllib.parse.urlsplit(response.url)
+                        if parsed.hostname not in {"x.com", "www.x.com", "api.x.com"}:
+                            return
+                        resource_type = response.request.resource_type
+                        if resource_type not in {"document", "xhr", "fetch"}:
+                            return
+                        home_responses.append({
+                            "status": int(response.status),
+                            "resource": resource_type,
+                            "path": parsed.path[:160],
+                        })
+                    except Exception:
+                        return
+
+                page.on("response", record_home_response)
                 try:
                     page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
                     page.wait_for_timeout(10_000)
+                    dom_state = page.evaluate(
+                        """() => ({
+                          ready_state: document.readyState,
+                          body_text: (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240),
+                          main_count: document.querySelectorAll('main, [data-testid="primaryColumn"]').length,
+                          article_count: document.querySelectorAll('article').length,
+                          title: (document.title || '').slice(0, 120),
+                        })"""
+                    )
+                    print(
+                        "[x-home-state] "
+                        + json.dumps(
+                            {
+                                "url": page.url,
+                                "title": str(dom_state.get("title") or "")[:120],
+                                "ready_state": str(dom_state.get("ready_state") or ""),
+                                "main_count": int(dom_state.get("main_count") or 0),
+                                "article_count": int(dom_state.get("article_count") or 0),
+                                "body_text": str(dom_state.get("body_text") or "")[:240],
+                                "responses": home_responses,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     ensure_x_page_healthy(
                         page,
                         diagnostics=home_diagnostics,
@@ -3393,6 +3440,7 @@ def scrape_all(
                                 "login_required": bool(health.get("loginRequired")),
                                 "error_page": bool(health.get("errorPage")),
                                 "has_main": bool(health.get("hasMain")),
+                                "responses": home_responses,
                             },
                             ensure_ascii=False,
                         ),
