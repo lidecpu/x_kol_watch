@@ -3847,6 +3847,7 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         for item in results
         if item.get("status") == "error"
         and item.get("diagnostics", {}).get("global_page_deferred")
+        and not item.get("diagnostics", {}).get("session_blocked")
         and not item.get("diagnostics", {}).get("recovery_attempted")
     )
     errors = sum(
@@ -5807,6 +5808,9 @@ def main() -> int:
     print(json.dumps({"scan": summary}, ensure_ascii=False))
     for item in results:
         if item.get("status") == "error":
+            diagnostics = item.get("diagnostics", {})
+            if diagnostics.get("global_page_deferred") and diagnostics.get("session_blocked"):
+                continue
             category = (
                 "scan-unavailable"
                 if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
