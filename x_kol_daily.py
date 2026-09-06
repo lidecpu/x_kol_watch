@@ -2349,9 +2349,6 @@ PAGE_HEALTH_JS = r"""
   const text = rawText.toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
-  const hasTimeline = Boolean(document.querySelector(
-    '[data-testid="primaryColumn"], article, section[aria-label*="Timeline"], section[aria-label*="时间线"]'
-  ));
   const unavailableStateTexts = Array.from(document.querySelectorAll(
     '[data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
   )).map(node => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
@@ -2364,26 +2361,11 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
-  const verificationRequired =
-    path.includes('/account/access') ||
-    path.includes('/i/flow/account-access') ||
-    path.includes('/i/flow/verify') ||
-    path.includes('/i/flow/challenge') ||
-    Boolean(document.querySelector(
-      'iframe[src*="arkoselabs"], iframe[src*="captcha"], [data-testid="ocfEnterTextTextInput"]'
-    )) ||
-    (!hasMain && has([
-      'authenticate your account', 'verify your identity', 'confirm your identity',
-      'prove you are human', 'complete the following actions', 'suspicious activity',
-      '验证你的身份', '确认你的身份', '验证您的身份',
-      '确认您的身份', '请完成以下操作', '可疑活动'
-    ]));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
-    verificationRequired,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
-      ((!hasMain || !hasTimeline) && has([
+      (!hasMain && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
         'verify you are human', 'unusual activity', 'automated requests',
         'temporarily limited', '超过频率限制', '出错了，请尝试重新加载',
@@ -2392,7 +2374,6 @@ PAGE_HEALTH_JS = r"""
     accountUnavailable: accountMissing || accountSuspended,
     accountUnavailableReason: accountSuspended ? 'suspended' : accountMissing ? 'missing' : '',
     hasMain,
-    hasTimeline,
     path,
     title: (document.title || '').slice(0, 160),
     textSample: rawText.replace(/\s+/g, ' ').trim().slice(0, 300)
@@ -2635,13 +2616,7 @@ def ensure_x_page_healthy(
     recovery_timeout_ms(30_000, deadline_monotonic)
     health = page.evaluate(PAGE_HEALTH_JS)
     if not health.get("hasMain") and not any(
-        health.get(key)
-        for key in (
-            "loginRequired",
-            "verificationRequired",
-            "errorPage",
-            "accountUnavailable",
-        )
+        health.get(key) for key in ("loginRequired", "errorPage", "accountUnavailable")
     ):
         page.reload(
             wait_until="domcontentloaded",
@@ -2652,9 +2627,6 @@ def ensure_x_page_healthy(
     if health.get("loginRequired"):
         record_page_health(diagnostics, phase, health)
         raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
-    if health.get("verificationRequired"):
-        record_page_health(diagnostics, phase, health)
-        raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR)
     if health.get("errorPage"):
         record_page_health(diagnostics, phase, health)
         raise RuntimeError(X_RATE_LIMIT_ERROR)
@@ -3024,7 +2996,7 @@ def scrape_handle_url(
         wait_until="domcontentloaded",
         timeout=recovery_timeout_ms(45_000, deadline_monotonic),
     )
-    wait_for_x_page_ready(page, page_wait_ms, deadline_monotonic)
+    recovery_wait_for_timeout(page, page_wait_ms, deadline_monotonic)
     ensure_x_page_healthy(
         page,
         account_page=account_page,
@@ -3064,12 +3036,7 @@ def scrape_handle_url(
         if round_index >= scrolls:
             break
         page.mouse.wheel(0, 1800)
-        wait_for_x_scroll_content(
-            page,
-            scroll_wait_ms,
-            len(current_article_keys),
-            deadline_monotonic,
-        )
+        recovery_wait_for_timeout(page, scroll_wait_ms, deadline_monotonic)
 
 
 def scrape_handle(
