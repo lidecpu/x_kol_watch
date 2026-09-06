@@ -3423,11 +3423,12 @@ def scrape_all(
                         file=sys.stderr,
                         flush=True,
                     )
-                    ensure_x_page_healthy(
-                        page,
-                        diagnostics=home_diagnostics,
-                        phase="initial_home",
-                    )
+                    if os.environ.get("X_SKIP_HOME_PROBE") != "1":
+                        ensure_x_page_healthy(
+                            page,
+                            diagnostics=home_diagnostics,
+                            phase="initial_home",
+                        )
                 except Exception as exc:
                     health = page.evaluate(PAGE_HEALTH_JS)
                     print(

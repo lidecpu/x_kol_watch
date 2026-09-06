@@ -22,6 +22,7 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       SEND_ONCE_KEY: ${{ inputs.send_once_key }}
+      X_SKIP_HOME_PROBE: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -70,7 +71,7 @@ jobs:
       - name: Run KOL watcher
         shell: bash
         run: |
-          cmd=(python x_kol_daily.py --telegram-mode full --telegram-chars 0 --send)
+          cmd=(python x_kol_daily.py --handles @jackli727 --max-kols 1 --no-send --no-translate)
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")
           fi
