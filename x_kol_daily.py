@@ -3372,9 +3372,34 @@ def scrape_all(
             context = new_x_context(browser, cookies)
             try:
                 page = context.new_page()
-                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
-                page.wait_for_timeout(1500)
-                ensure_x_page_healthy(page)
+                home_diagnostics: dict[str, Any] = {}
+                try:
+                    page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
+                    page.wait_for_timeout(1500)
+                    ensure_x_page_healthy(
+                        page,
+                        diagnostics=home_diagnostics,
+                        phase="initial_home",
+                    )
+                except Exception as exc:
+                    health = page.evaluate(PAGE_HEALTH_JS)
+                    print(
+                        "[x-home-diagnostics] "
+                        + json.dumps(
+                            {
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "path": str(health.get("path") or "")[:120],
+                                "title": str(health.get("title") or "")[:120],
+                                "login_required": bool(health.get("loginRequired")),
+                                "error_page": bool(health.get("errorPage")),
+                                "has_main": bool(health.get("hasMain")),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
                 print(
                     f"[x-home] url={page.url} title={page.title()[:80]}",
                     file=sys.stderr,
