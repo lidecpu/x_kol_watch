@@ -2350,6 +2350,13 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
+  const verificationText = has([
+    'authenticate your account', 'verify your identity', 'confirm your identity',
+    'prove you are human', 'complete the following actions', 'suspicious activity',
+    'just a moment', 'please wait', 'checking your browser', '请稍候', '请稍等',
+    '验证你的身份', '确认你的身份', '验证您的身份',
+    '确认您的身份', '请完成以下操作', '可疑活动'
+  ]);
   const verificationRequired =
     path.includes('/account/access') ||
     path.includes('/i/flow/account-access') ||
@@ -2358,14 +2365,8 @@ PAGE_HEALTH_JS = r"""
     Boolean(document.querySelector(
       'iframe[src*="arkoselabs"], iframe[src*="captcha"], [data-testid="ocfEnterTextTextInput"]'
     )) ||
-    (!hasMain && has([
-      'authenticate your account', 'verify your identity', 'confirm your identity',
-      'prove you are human', 'complete the following actions', 'suspicious activity',
-      'just a moment', 'please wait', 'checking your browser', '请稍候', '请稍等',
-      '验证你的身份', '确认你的身份', '验证您的身份',
-      '确认您的身份', '请完成以下操作', '可疑活动'
-    ]) || ['just a moment', 'please wait', '请稍候', '请稍等']
-      .some(value => title.includes(value));
+    (!hasMain && (verificationText || ['just a moment', 'please wait', '请稍候', '请稍等']
+      .some(value => title.includes(value))));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
