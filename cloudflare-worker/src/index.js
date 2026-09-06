@@ -37,14 +37,14 @@ export default {
     }
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runScheduled(env));
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScheduled(env, new Date(event.scheduledTime)));
   },
 };
 
-async function runScheduled(env) {
+async function runScheduled(env, scheduledAt) {
   try {
-    const result = await triggerGithub(env, "cron");
+    const result = await triggerGithub(env, "cron", scheduledAt);
     logDispatch(result);
   } catch (error) {
     logDispatch({ ok: false, source: "cron", error: errorMessage(error) }, "error");
@@ -52,15 +52,16 @@ async function runScheduled(env) {
   }
 }
 
-async function triggerGithub(env, source) {
+async function triggerGithub(env, source, runAt = new Date()) {
   requireEnv(env, "GITHUB_TOKEN");
 
   const owner = env.GITHUB_OWNER || "lidecpu";
   const repo = env.GITHUB_REPO || "x_kol_watch";
   const workflow = env.GITHUB_WORKFLOW || "x-kol-daily.yml";
-  const ref = env.GITHUB_REF || "main";
+  const target = githubTarget(env, source, runAt);
+  const ref = target.ref;
   const { activeRuns, ignoredRuns } = await listActiveRuns(env, owner, repo, workflow, ref);
-  const sendOnceKey = beijingSendOnceKey();
+  const sendOnceKey = beijingSendOnceKey(runAt);
   if (activeRuns.length) {
     return {
       ok: true,
@@ -94,9 +95,9 @@ async function triggerGithub(env, source) {
       },
       body: JSON.stringify({
         ref,
-        inputs: {
-          send_once_key: sendOnceKey,
-        },
+        ...(target.includeInputs
+          ? { inputs: { send_once_key: sendOnceKey } }
+          : {}),
       }),
       signal: controller.signal,
     });
@@ -113,16 +114,35 @@ async function triggerGithub(env, source) {
     throw new Error(`GitHub dispatch failed ${response.status}`);
   }
 
-  return {
+  const result = {
     ok: true,
     source,
     status: response.status,
     workflow,
     ref,
-    send_once_key: sendOnceKey,
     ignored_runs: summarizeIgnoredRuns(ignoredRuns),
     time: new Date().toISOString(),
   };
+  if (target.includeInputs) result.send_once_key = sendOnceKey;
+  return result;
+}
+
+function githubTarget(env, source, runAt) {
+  const defaultRef = env.GITHUB_REF || "main";
+  const oneTimeDate = String(env.ONE_TIME_GITHUB_REF_DATE || "").trim();
+  const oneTimeRef = String(env.ONE_TIME_GITHUB_REF || "").trim();
+  if (
+    source === "cron" &&
+    oneTimeDate &&
+    oneTimeRef &&
+    beijingDateKey(runAt) === oneTimeDate
+  ) {
+    return {
+      ref: oneTimeRef,
+      includeInputs: env.ONE_TIME_GITHUB_REF_INPUTS !== "none",
+    };
+  }
+  return { ref: defaultRef, includeInputs: true };
 }
 
 async function listActiveRuns(env, owner, repo, workflow, ref) {
@@ -213,6 +233,10 @@ async function githubJson(env, apiUrl, label) {
 }
 
 function beijingSendOnceKey(date = new Date()) {
+  return `${beijingDateKey(date).replaceAll("-", "")}:24h:full`;
+}
+
+function beijingDateKey(date = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -220,7 +244,7 @@ function beijingSendOnceKey(date = new Date()) {
     day: "2-digit",
   }).formatToParts(date);
   const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-  return `${values.year}${values.month}${values.day}:24h:full`;
+  return `${values.year}-${values.month}-${values.day}`;
 }
 
 function summarizeIgnoredRuns(runs) {
