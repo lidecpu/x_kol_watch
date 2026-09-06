@@ -2552,60 +2552,6 @@ def recovery_wait_for_timeout(
         raise RecoveryBudgetExceeded("X recovery budget exhausted")
 
 
-def wait_for_x_page_ready(
-    page: Any,
-    wait_ms: int,
-    deadline_monotonic: float | None,
-) -> None:
-    """Wait only until X exposes a usable state, up to the configured cap."""
-    bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
-    started = time.monotonic()
-    ready_at: float | None = None
-    while True:
-        health = page.evaluate(PAGE_HEALTH_JS)
-        if any(
-            health.get(key)
-            for key in ("loginRequired", "errorPage", "accountUnavailable")
-        ):
-            return
-        if health.get("hasMain"):
-            if ready_at is None:
-                ready_at = time.monotonic()
-            settled_ms = int((time.monotonic() - ready_at) * 1000)
-            if settled_ms >= min(X_PAGE_MIN_SETTLE_MS, bounded_ms):
-                return
-        else:
-            ready_at = None
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        remaining_ms = bounded_ms - elapsed_ms
-        if remaining_ms <= 0:
-            return
-        page.wait_for_timeout(min(200, remaining_ms))
-
-
-def wait_for_x_scroll_content(
-    page: Any,
-    wait_ms: int,
-    previous_article_count: int,
-    deadline_monotonic: float | None,
-) -> None:
-    """Wait for lazy-loaded articles, returning early when the DOM advances."""
-    bounded_ms = recovery_timeout_ms(wait_ms, deadline_monotonic)
-    started = time.monotonic()
-    min_settle_ms = min(X_SCROLL_MIN_SETTLE_MS, bounded_ms)
-    while True:
-        article_count = int(
-            page.evaluate("() => document.querySelectorAll('article').length") or 0
-        )
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        if article_count > previous_article_count and elapsed_ms >= min_settle_ms:
-            return
-        remaining_ms = bounded_ms - elapsed_ms
-        if remaining_ms <= 0:
-            return
-        page.wait_for_timeout(min(150, remaining_ms))
-
-
 def ensure_x_page_healthy(
     page: Any,
     account_page: bool = False,
@@ -2626,7 +2572,7 @@ def ensure_x_page_healthy(
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
         record_page_health(diagnostics, phase, health)
-        raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
+        raise RuntimeError("X authentication required")
     if health.get("errorPage"):
         record_page_health(diagnostics, phase, health)
         raise RuntimeError(X_RATE_LIMIT_ERROR)
@@ -3112,7 +3058,6 @@ def scrape_handle_search_fallback(
     page_wait_ms: int,
     scroll_wait_ms: int,
     diagnostics: dict[str, Any],
-    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
     clean_handle = handle.lstrip("@")
     cutoff_ms = int(
@@ -3136,7 +3081,6 @@ def scrape_handle_search_fallback(
         scroll_wait_ms,
         diagnostics,
         merged,
-        deadline_monotonic,
     )
     rows = sorted(
         merged.values(),
@@ -3252,8 +3196,9 @@ def rescan_page_render_failures(
                 "early_stops": 0,
             }
             diagnostics = item.setdefault("diagnostics", {})
-            remaining_seconds = recovery_budget.remaining_seconds
-            if remaining_seconds < RECOVERY_MIN_ATTEMPT_SECONDS:
+            remaining_accounts = len(pending_items) - item_index
+            attempt_seconds = recovery_budget.remaining_seconds / remaining_accounts
+            if attempt_seconds <= 0:
                 for pending_item in pending_items[item_index:]:
                     pending_diagnostics = pending_item.setdefault("diagnostics", {})
                     pending_diagnostics["recovery_budget_exhausted"] = True
@@ -3261,19 +3206,11 @@ def rescan_page_render_failures(
                         recovery_budget.spent_seconds,
                         3,
                     )
-                print(
-                    f"[x-deferred-recovery] remaining={len(pending_items) - item_index} "
-                    f"deferred; budget_remaining={remaining_seconds:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
                 break
-            attempt_seconds = min(RECOVERY_ATTEMPT_CAP_SECONDS, remaining_seconds)
             diagnostics["fresh_context_retry"] = int(
                 diagnostics.get("fresh_context_retry") or 0
             ) + 1
             diagnostics["page_retries"] = int(diagnostics.get("page_retries") or 0) + 1
-            diagnostics["recovery_attempted"] = True
             diagnostics["recovery_budget_limit_seconds"] = recovery_budget.limit_seconds
             diagnostics["recovery_quiet_seconds"] = RECOVERY_QUIET_SECONDS
             diagnostics["recovery_profile_only"] = True
@@ -3343,7 +3280,7 @@ def scrape_all(
     page_wait_ms: int,
     scroll_wait_ms: int,
     search_fallback: bool,
-) -> tuple[list[dict[str, Any]], dict[str, float]]:
+) -> list[dict[str, Any]]:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except Exception as exc:
@@ -3352,19 +3289,10 @@ def scrape_all(
     cookies = cookies_from_env()
     chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
     results: list[dict[str, Any]] = []
-    phase_timings: dict[str, float] = {}
-    scan_started = time.monotonic()
     recovery_budget: RecoveryBudget | None = None
     with sync_playwright() as p:
-        # Keep X Chromium launch behavior aligned with the last known-good run.
         launch_args = ["--disable-gpu", "--no-first-run", "--no-default-browser-check"]
-        x_launch_env = dict(os.environ)
-        x_launch_env.pop("DISPLAY", None)
-        launch_kwargs: dict[str, Any] = {
-            "headless": headless,
-            "args": launch_args,
-            "env": x_launch_env,
-        }
+        launch_kwargs: dict[str, Any] = {"headless": headless, "args": launch_args}
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
@@ -3385,8 +3313,6 @@ def scrape_all(
                     1 for kol in kols if not kol.get("auto_recheck_paused")
                 )
                 durations: list[float] = []
-                profile_started = time.monotonic()
-                page_failure_streak = 0
                 for index, kol in enumerate(kols, 1):
                     handle = kol["handle"]
                     if kol.get("auto_recheck_paused"):
@@ -3476,15 +3402,9 @@ def scrape_all(
                             error = f"{type(exc).__name__}: {exc}"
                             final_page_error = recoverable_page_error
                             diagnostics["deferred_recovery"] = recoverable_page_error
-                            page_failure_streak = (
-                                page_failure_streak + 1
-                                if recoverable_page_error
-                                else 0
-                            )
                         else:
                             status = "ok"
                             error = ""
-                            page_failure_streak = 0
                         break
                     search_fallback_error = str(
                         diagnostics.get("search_fallback_error") or ""
@@ -3493,10 +3413,7 @@ def scrape_all(
                         diagnostics.get("search_fallback_failed")
                         and search_fallback_error.endswith(RECOVERABLE_X_PAGE_ERRORS)
                     )
-                    global_page_failure = (
-                        page_failure_streak >= GLOBAL_PAGE_FAILURE_STREAK
-                        or search_fallback_page_error
-                    )
+                    global_page_failure = final_page_error or search_fallback_page_error
                     global_page_reason = (
                         "page_error"
                         if final_page_error
@@ -3593,12 +3510,10 @@ def scrape_all(
                         context.close()
                         context = replacement_context
                         page = context.new_page()
-                phase_timings["x_profiles"] = time.monotonic() - profile_started
                 profile_page_failure = any(
                     item.get("diagnostics", {}).get("global_page_breaker_triggered")
                     for item in results
                 )
-                fallback_started = time.monotonic()
                 if search_fallback and not profile_page_failure:
                     fallback_items = [
                         item
@@ -3637,24 +3552,9 @@ def scrape_all(
                         flush=True,
                     )
                     total_fallbacks = len(selected_fallbacks)
-                    fallback_budget = RecoveryBudget(
-                        SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS
-                    )
                     for fallback_index, item in enumerate(selected_fallbacks, 1):
                         handle = str(item.get("handle") or "")
                         diagnostics = item.setdefault("diagnostics", {})
-                        if fallback_budget.remaining_seconds < 2.0:
-                            for pending_item in selected_fallbacks[fallback_index - 1:]:
-                                pending_item.setdefault("diagnostics", {})[
-                                    "search_fallback_deferred"
-                                ] = True
-                            print(
-                                f"[search-fallback-budget] exhausted "
-                                f"remaining={total_fallbacks - fallback_index + 1}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                            break
                         started = time.time()
                         print(
                             f"[search-fallback {fallback_index}/{total_fallbacks}] "
@@ -3672,29 +3572,11 @@ def scrape_all(
                                 page_wait_ms,
                                 scroll_wait_ms,
                                 diagnostics,
-                                fallback_budget.deadline(),
                             )
                         except Exception as exc:
                             fallback_error = f"{type(exc).__name__}: {exc}"
                             diagnostics["search_fallback_error"] = fallback_error
                             diagnostics["search_fallback_failed"] = True
-                            budget_exhausted = (
-                                isinstance(exc, RecoveryBudgetExceeded)
-                                or fallback_budget.remaining_seconds < 1.0
-                            )
-                            if budget_exhausted:
-                                diagnostics["search_fallback_budget_exhausted"] = True
-                                for pending_item in selected_fallbacks[fallback_index:]:
-                                    pending_item.setdefault("diagnostics", {})[
-                                        "search_fallback_deferred"
-                                    ] = True
-                                print(
-                                    f"[search-fallback-budget] exhausted "
-                                    f"remaining={total_fallbacks - fallback_index}",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                                break
                             recoverable_page_error = (
                                 str(exc) in RECOVERABLE_X_PAGE_ERRORS
                                 or isinstance(exc, PlaywrightTimeoutError)
@@ -3708,10 +3590,6 @@ def scrape_all(
                             )
                             if recoverable_page_error:
                                 diagnostics["search_fallback_breaker_triggered"] = True
-                                for pending_item in selected_fallbacks[fallback_index:]:
-                                    pending_item.setdefault("diagnostics", {})[
-                                        "search_fallback_deferred"
-                                    ] = True
                                 print(
                                     f"[x-search-fallback-breaker] trigger={handle} "
                                     f"remaining={total_fallbacks - fallback_index}",
@@ -3728,14 +3606,6 @@ def scrape_all(
                             file=sys.stderr,
                             flush=True,
                         )
-                    print(
-                        f"[search-fallback-budget] "
-                        f"spent={fallback_budget.spent_seconds:.1f}s "
-                        f"limit={fallback_budget.limit_seconds:.0f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                phase_timings["x_fallback"] = time.monotonic() - fallback_started
             finally:
                 context.close()
             has_deferred_recovery = any(
@@ -3746,7 +3616,6 @@ def scrape_all(
                 )
                 for item in results
             )
-            recovery_started = time.monotonic()
             if has_deferred_recovery:
                 browser.close()
                 recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
@@ -3774,12 +3643,8 @@ def scrape_all(
                     scroll_wait_ms,
                     recovery_budget,
                 )
-            phase_timings["x_recovery"] = time.monotonic() - recovery_started
         finally:
-            try:
-                browser.close()
-            finally:
-                cleanup_chromium_debug_log()
+            browser.close()
     if recovery_budget is not None:
         print(
             f"[x-recovery-budget] spent={recovery_budget.spent_seconds:.1f}s "
@@ -3787,8 +3652,7 @@ def scrape_all(
             file=sys.stderr,
             flush=True,
         )
-    phase_timings["x_total"] = time.monotonic() - scan_started
-    return results, phase_timings
+    return results
 
 
 def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -3797,22 +3661,11 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         for item in results
         if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
     )
-    recovery_deferred = sum(
-        1
-        for item in results
-        if item.get("status") == "error"
-        and item.get("diagnostics", {}).get("global_page_deferred")
-        and not item.get("diagnostics", {}).get("recovery_attempted")
-    )
     errors = sum(
         1
         for item in results
         if item.get("status") == "error"
         and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
-        and not (
-            item.get("diagnostics", {}).get("global_page_deferred")
-            and not item.get("diagnostics", {}).get("recovery_attempted")
-        )
     )
     paused = sum(1 for item in results if item.get("status") == "paused")
     success = sum(1 for item in results if item.get("status") == "ok")
@@ -3872,7 +3725,6 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         ),
         "renamed": sum(1 for item in results if item.get("diagnostics", {}).get("renamed_to")),
         "unavailable": unavailable,
-        "recovery_deferred": recovery_deferred,
         "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
 
@@ -5750,7 +5602,7 @@ def main() -> int:
     run_started = time.monotonic()
     phase_timings: dict[str, float] = {}
     phase_started = time.monotonic()
-    results, x_phase_timings = scrape_all(
+    results = scrape_all(
         kols,
         args.hours,
         args.limit,
@@ -5761,7 +5613,6 @@ def main() -> int:
         search_fallback=args.search_fallback,
     )
     phase_timings["x_scan"] = time.monotonic() - phase_started
-    phase_timings.update(x_phase_timings)
     update_kol_status(results)
     summary = scan_summary(results)
     print(json.dumps({"scan": summary}, ensure_ascii=False))
