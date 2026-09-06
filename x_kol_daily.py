@@ -128,14 +128,7 @@ SPOT_ETF_FLOW_SUMMARY_DAYS = 5
 MIN_SCROLL_ROUNDS = 3
 PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
-X_AUTHENTICATION_REQUIRED_ERROR = "X authentication required"
-X_VERIFICATION_REQUIRED_ERROR = "X verification required"
-RECOVERABLE_X_PAGE_ERRORS = (
-    PAGE_RENDER_ERROR,
-    X_RATE_LIMIT_ERROR,
-    X_AUTHENTICATION_REQUIRED_ERROR,
-    X_VERIFICATION_REQUIRED_ERROR,
-)
+RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
 RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
@@ -1826,11 +1819,16 @@ def fetch_stablecoin_summary() -> str:
         }
         try:
             coinglass_snapshot = fetch_coinglass_snapshot()
-            if coinglass_snapshot and not coinglass_snapshot.get("_stale"):
-                hyperliquid_liquidation = coinglass_snapshot
-                market_structure = coinglass_snapshot.get("market_structure")
-                if isinstance(market_structure, dict):
-                    coinglass_market_structure = dict(market_structure)
+            hyperliquid_liquidation = coinglass_snapshot
+            market_structure = coinglass_snapshot.get("market_structure")
+            if isinstance(market_structure, dict):
+                coinglass_market_structure = dict(market_structure)
+                if coinglass_snapshot.get("_stale"):
+                    coinglass_market_structure["_stale"] = True
+                    if coinglass_snapshot.get("_captured_at"):
+                        coinglass_market_structure["_captured_at"] = (
+                            coinglass_snapshot["_captured_at"]
+                        )
         except Exception as exc:
             print(
                 f"[coinglass-cache-error] {type(exc).__name__}: {exc}",
@@ -2344,9 +2342,6 @@ PAGE_HEALTH_JS = r"""
   const text = rawText.toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
-  const hasTimeline = Boolean(document.querySelector(
-    '[data-testid="primaryColumn"], article, section[aria-label*="Timeline"], section[aria-label*="时间线"]'
-  ));
   const unavailableStateTexts = Array.from(document.querySelectorAll(
     '[data-testid="empty_state_header_text"], [data-testid="empty_state_body_text"]'
   )).map(node => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
@@ -2359,26 +2354,11 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
-  const verificationRequired =
-    path.includes('/account/access') ||
-    path.includes('/i/flow/account-access') ||
-    path.includes('/i/flow/verify') ||
-    path.includes('/i/flow/challenge') ||
-    Boolean(document.querySelector(
-      'iframe[src*="arkoselabs"], iframe[src*="captcha"], [data-testid="ocfEnterTextTextInput"]'
-    )) ||
-    (!hasMain && has([
-      'authenticate your account', 'verify your identity', 'confirm your identity',
-      'prove you are human', 'complete the following actions', 'suspicious activity',
-      '验证你的身份', '确认你的身份', '验证您的身份',
-      '确认您的身份', '请完成以下操作', '可疑活动'
-    ]));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
-    verificationRequired,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
-      ((!hasMain || !hasTimeline) && has([
+      (!hasMain && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
         'verify you are human', 'unusual activity', 'automated requests',
         'temporarily limited', '超过频率限制', '出错了，请尝试重新加载',
@@ -2387,7 +2367,6 @@ PAGE_HEALTH_JS = r"""
     accountUnavailable: accountMissing || accountSuspended,
     accountUnavailableReason: accountSuspended ? 'suspended' : accountMissing ? 'missing' : '',
     hasMain,
-    hasTimeline,
     path,
     title: (document.title || '').slice(0, 160),
     textSample: rawText.replace(/\s+/g, ' ').trim().slice(0, 300)
@@ -2627,13 +2606,7 @@ def ensure_x_page_healthy(
     recovery_timeout_ms(30_000, deadline_monotonic)
     health = page.evaluate(PAGE_HEALTH_JS)
     if not health.get("hasMain") and not any(
-        health.get(key)
-        for key in (
-            "loginRequired",
-            "verificationRequired",
-            "errorPage",
-            "accountUnavailable",
-        )
+        health.get(key) for key in ("loginRequired", "errorPage", "accountUnavailable")
     ):
         page.reload(
             wait_until="domcontentloaded",
@@ -2643,10 +2616,7 @@ def ensure_x_page_healthy(
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
         record_page_health(diagnostics, phase, health)
-        raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
-    if health.get("verificationRequired"):
-        record_page_health(diagnostics, phase, health)
-        raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR)
+        raise RuntimeError("X authentication required")
     if health.get("errorPage"):
         record_page_health(diagnostics, phase, health)
         raise RuntimeError(X_RATE_LIMIT_ERROR)
@@ -3886,18 +3856,6 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         "recovery_deferred": recovery_deferred,
         "pending_removal": sum(1 for item in results if item.get("pending_removal")),
     }
-
-
-def ensure_scan_deliverable(
-    results: list[dict[str, Any]],
-    summary: dict[str, int],
-) -> None:
-    failed_count = sum(1 for item in results if item.get("status") == "error")
-    if failed_count and summary["success"] == 0:
-        raise RuntimeError(
-            f"X scan produced no successful KOLs ({failed_count}/{len(results)} failed); "
-            "report generation and Telegram delivery were stopped"
-        )
 
 
 def normalize_translation_source(text: str) -> str:
@@ -5787,8 +5745,6 @@ def main() -> int:
                 f"[{category}] {item.get('handle', '')} {item.get('error', '')}",
                 file=sys.stderr,
             )
-
-    ensure_scan_deliverable(results, summary)
 
     stamp = cn_now().strftime("%Y%m%d-%H%M%S")
     day = cn_now().strftime("%Y%m%d")
