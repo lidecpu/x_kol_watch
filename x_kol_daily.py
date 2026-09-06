@@ -3219,34 +3219,16 @@ def rescan_page_render_failures(
         flush=True,
     )
     context = None
-    home_diagnostics: dict[str, Any] = {}
     try:
         deadline_monotonic = recovery_budget.deadline()
         context = new_x_context(browser, cookies)
         page = context.new_page()
-        page.goto(
-            "https://x.com/home",
-            wait_until="domcontentloaded",
-            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
-        )
-        recovery_wait_for_timeout(
-            page,
-            max(page_wait_ms, 5000),
-            deadline_monotonic,
-        )
-        ensure_x_page_healthy(
-            page,
-            diagnostics=home_diagnostics,
-            phase="recovery_home_probe",
-            deadline_monotonic=deadline_monotonic,
-        )
     except Exception as exc:
         probe_error = f"{type(exc).__name__}: {exc}"
         for item in pending_items:
             diagnostics = item.setdefault("diagnostics", {})
             diagnostics["fresh_context_recovered"] = False
-            diagnostics["recovery_home_probe_error"] = probe_error
-            diagnostics["recovery_home_probe_diagnostics"] = home_diagnostics
+            diagnostics["recovery_context_error"] = probe_error
             diagnostics["recovery_budget_spent_seconds"] = round(
                 recovery_budget.spent_seconds,
                 3,
@@ -3254,7 +3236,7 @@ def rescan_page_render_failures(
             if isinstance(exc, RecoveryBudgetExceeded):
                 diagnostics["recovery_budget_exhausted"] = True
         print(
-            f"[x-deferred-recovery] home probe failed "
+            f"[x-deferred-recovery] context setup failed "
             f"error={probe_error}",
             file=sys.stderr,
             flush=True,
@@ -3263,17 +3245,6 @@ def rescan_page_render_failures(
             context.close()
             context = None
         return
-    else:
-        for item in pending_items:
-            diagnostics = item.setdefault("diagnostics", {})
-            diagnostics["recovery_home_probe_healthy"] = True
-        print(
-            f"[x-deferred-recovery] home probe healthy "
-            f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
-            file=sys.stderr,
-            flush=True,
-        )
-
     try:
         for item_index, item in enumerate(pending_items):
             handle = str(item.get("handle") or "")
@@ -3408,11 +3379,8 @@ def scrape_all(
             context = new_x_context(browser, cookies)
             try:
                 page = context.new_page()
-                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
-                page.wait_for_timeout(1500)
-                ensure_x_page_healthy(page)
                 print(
-                    f"[x-home] url={page.url} title={page.title()[:80]}",
+                    "[x-home] skipped; validating each KOL profile directly",
                     file=sys.stderr,
                     flush=True,
                 )
