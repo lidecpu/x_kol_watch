@@ -101,17 +101,17 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 19
+MARKET_SUMMARY_CACHE_VERSION = 18
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
-    "record_date": "2026-08-31",
-    "holdings_as_of": "2026-08-31",
-    "verified_date": "2026-09-05",
-    "holdings": 845050,
-    "change": 4603,
-    "average_price": 75412.0,
-    "total_cost_millions": 63727.0,
+    "record_date": "2026-08-10",
+    "holdings_as_of": "2026-08-23",
+    "verified_date": "2026-08-25",
+    "holdings": 840447,
+    "change": -1690,
+    "average_price": 75385.0,
+    "total_cost_millions": 63357.0,
 }
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_CACHE_TTL_SECONDS = 600
@@ -130,8 +130,9 @@ PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
 X_AUTHENTICATION_REQUIRED_ERROR = "X authentication required"
 X_VERIFICATION_REQUIRED_ERROR = "X verification required"
-RECOVERABLE_X_PAGE_ERRORS = (PAGE_RENDER_ERROR, X_RATE_LIMIT_ERROR)
-SESSION_BLOCKED_X_ERRORS = (
+RECOVERABLE_X_PAGE_ERRORS = (
+    PAGE_RENDER_ERROR,
+    X_RATE_LIMIT_ERROR,
     X_AUTHENTICATION_REQUIRED_ERROR,
     X_VERIFICATION_REQUIRED_ERROR,
 )
@@ -911,13 +912,11 @@ def load_strategy_btc_cache() -> dict[str, Any]:
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     cache = state.get("strategy_btc")
-    cached_record = {}
     if isinstance(cache, dict) and cache.get("version") == STRATEGY_BTC_CACHE_VERSION:
-        cached_record = normalize_strategy_btc_record(cache)
-    baseline = normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
-    if cached_record and baseline:
-        return max((cached_record, baseline), key=lambda item: item["record_date"])
-    return cached_record or baseline
+        record = normalize_strategy_btc_record(cache)
+        if record:
+            return record
+    return normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
 
 
 def fetch_bitmine_eth() -> dict[str, Any]:
@@ -1370,6 +1369,20 @@ def save_market_summary_cache(summary: str) -> None:
     save_json(MARKET_STATE, state)
 
 
+def save_market_summary_failure() -> None:
+    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
+    if not isinstance(state, dict):
+        state = {"version": 1, "snapshots": {}}
+    cache = state.get("summary_cache")
+    if not isinstance(cache, dict) or cache.get("version") != MARKET_SUMMARY_CACHE_VERSION:
+        cache = {}
+    cache["version"] = MARKET_SUMMARY_CACHE_VERSION
+    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
+    state["version"] = 1
+    state["summary_cache"] = cache
+    save_json(MARKET_STATE, state)
+
+
 def load_coinglass_cache() -> tuple[
     dict[str, Any] | None,
     dt.datetime | None,
@@ -1611,7 +1624,6 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
-            or line.startswith("链上确认交易（最新完整日 ")
             or line.startswith("链上确认交易（截至 ")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
@@ -1685,7 +1697,6 @@ def summary_block_key(block: list[str]) -> str:
     key = re.sub(r"（缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "", block[0])
     key = re.sub(r"（亿美元，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（亿美元）", key)
     key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
-    key = re.sub(r"^链上确认交易（(?:最新完整日 |截至 )\d{2}-\d{2}）$", "链上确认交易", key)
     return key
 
 
@@ -1948,16 +1959,15 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        # Coin Metrics daily records are UTC dates; display their Beijing end date.
-        record_date = (chain_activity["record_date"] + dt.timedelta(days=1)).strftime("%m-%d")
+        record_date = chain_activity["record_date"].strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（最新完整日 {record_date}）",
+            f"链上确认交易（截至 {record_date}）",
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
-            f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
+            f"24H {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
             f"ETH {assets['eth']['transactions'] / 1e4:.2f}万笔 | "
-            f"较上一完整日 {assets['eth']['percent']:+.2f}% | "
+            f"24H {assets['eth']['percent']:+.2f}% | "
             f"较前7日均 {assets['eth']['seven_day_average_percent']:+.2f}%",
         ])
     if hyperliquid_liquidation:
@@ -2332,7 +2342,6 @@ PAGE_HEALTH_JS = r"""
   const path = (location.pathname || '').toLowerCase();
   const rawText = (document.body?.innerText || '').slice(0, 5000);
   const text = rawText.toLowerCase();
-  const title = (document.title || '').toLowerCase();
   const has = values => values.some(value => text.includes(value));
   const hasMain = Boolean(document.querySelector('main, [data-testid="primaryColumn"]'));
   const hasTimeline = Boolean(document.querySelector(
@@ -2350,13 +2359,6 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
-  const verificationText = has([
-    'authenticate your account', 'verify your identity', 'confirm your identity',
-    'prove you are human', 'complete the following actions', 'suspicious activity',
-    'just a moment', 'please wait', 'checking your browser', '请稍候', '请稍等',
-    '验证你的身份', '确认你的身份', '验证您的身份',
-    '确认您的身份', '请完成以下操作', '可疑活动'
-  ]);
   const verificationRequired =
     path.includes('/account/access') ||
     path.includes('/i/flow/account-access') ||
@@ -2365,8 +2367,12 @@ PAGE_HEALTH_JS = r"""
     Boolean(document.querySelector(
       'iframe[src*="arkoselabs"], iframe[src*="captcha"], [data-testid="ocfEnterTextTextInput"]'
     )) ||
-    (!hasMain && (verificationText || ['just a moment', 'please wait', '请稍候', '请稍等']
-      .some(value => title.includes(value))));
+    (!hasMain && has([
+      'authenticate your account', 'verify your identity', 'confirm your identity',
+      'prove you are human', 'complete the following actions', 'suspicious activity',
+      '验证你的身份', '确认你的身份', '验证您的身份',
+      '确认您的身份', '请完成以下操作', '可疑活动'
+    ]));
   return {
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
@@ -2534,7 +2540,6 @@ def record_page_health(
             health.get("accountUnavailableReason") or ""
         )[:40],
         "has_main": bool(health.get("hasMain")),
-        "verification_required": bool(health.get("verificationRequired")),
     }
 
 
@@ -2658,38 +2663,6 @@ def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     context.route("**/*", route_static_assets)
     context.add_cookies(cookies)
     return context
-
-
-def open_x_home_context(
-    browser: Any,
-    cookies: list[dict[str, Any]],
-    timeout_error_type: type[BaseException],
-) -> tuple[Any, Any]:
-    """Create a session from X home without requiring a brittle home DOM shape."""
-    for attempt in range(1, 4):
-        context = new_x_context(browser, cookies)
-        page = context.new_page()
-        try:
-            page.goto(
-                "https://x.com/home",
-                wait_until="domcontentloaded",
-                timeout=45_000,
-            )
-            page.wait_for_timeout(1500)
-        except Exception as exc:
-            context.close()
-            retryable = isinstance(exc, timeout_error_type)
-            if not retryable or attempt >= 3:
-                raise
-            print(
-                f"[x-home-retry] attempt={attempt + 1}/3 reason={type(exc).__name__}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(2.0)
-            continue
-        return context, page
-    raise RuntimeError(PAGE_RENDER_ERROR)
 
 
 def chromium_launch_env() -> dict[str, str]:
@@ -3407,12 +3380,12 @@ def scrape_all(
             launch_kwargs["executable_path"] = chrome_path
         browser = p.chromium.launch(**launch_kwargs)
         try:
-            context, page = open_x_home_context(
-                browser,
-                cookies,
-                PlaywrightTimeoutError,
-            )
+            context = new_x_context(browser, cookies)
             try:
+                page = context.new_page()
+                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
+                page.wait_for_timeout(1500)
+                ensure_x_page_healthy(page)
                 print(
                     f"[x-home] url={page.url} title={page.title()[:80]}",
                     file=sys.stderr,
@@ -3505,21 +3478,18 @@ def scrape_all(
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                            error_text = str(exc)
-                            recoverable_page_error = error_text in RECOVERABLE_X_PAGE_ERRORS or isinstance(
+                            recoverable_page_error = str(exc) in RECOVERABLE_X_PAGE_ERRORS or isinstance(
                                 exc,
                                 PlaywrightTimeoutError,
                             )
-                            session_blocked = error_text in SESSION_BLOCKED_X_ERRORS
                             tweets = []
                             status = "error"
                             error = f"{type(exc).__name__}: {exc}"
-                            final_page_error = recoverable_page_error or session_blocked
+                            final_page_error = recoverable_page_error
                             diagnostics["deferred_recovery"] = recoverable_page_error
-                            diagnostics["session_blocked"] = session_blocked
                             page_failure_streak = (
                                 page_failure_streak + 1
-                                if final_page_error
+                                if recoverable_page_error
                                 else 0
                             )
                         else:
@@ -3536,13 +3506,10 @@ def scrape_all(
                     )
                     global_page_failure = (
                         page_failure_streak >= GLOBAL_PAGE_FAILURE_STREAK
-                        or diagnostics.get("session_blocked")
                         or search_fallback_page_error
                     )
                     global_page_reason = (
-                        "session_blocked"
-                        if diagnostics.get("session_blocked")
-                        else "page_error"
+                        "page_error"
                         if final_page_error
                         else "search_fallback_error"
                         if search_fallback_page_error
@@ -3605,8 +3572,7 @@ def scrape_all(
                                     "early_stops": 0,
                                     "page_retries": 0,
                                     "rename_checks": 0,
-                                    "deferred_recovery": global_page_reason != "session_blocked",
-                                    "session_blocked": global_page_reason == "session_blocked",
+                                    "deferred_recovery": True,
                                     "global_page_deferred": True,
                                     "global_page_trigger_handle": handle,
                                     "global_page_trigger_reason": global_page_reason,
@@ -3847,7 +3813,6 @@ def scan_summary(results: list[dict[str, Any]]) -> dict[str, int]:
         for item in results
         if item.get("status") == "error"
         and item.get("diagnostics", {}).get("global_page_deferred")
-        and not item.get("diagnostics", {}).get("session_blocked")
         and not item.get("diagnostics", {}).get("recovery_attempted")
     )
     errors = sum(
@@ -4459,6 +4424,18 @@ def translate_source_to_zh(translation_source: str, source_language: str) -> str
     )
 
 
+def translate_to_zh(text: str) -> str:
+    cache = load_json(TRANSLATION_CACHE, {}, strict=True)
+    key, translation_source, source_language = translation_request(text)
+    if key in cache:
+        return str(cache[key])
+    translated = translate_source_to_zh(translation_source, source_language)
+    cache[key] = translated
+    save_json(TRANSLATION_CACHE, cache)
+    time.sleep(0.2)
+    return translated
+
+
 def fmt_time(value: str) -> str:
     if not value:
         return ""
@@ -4981,16 +4958,10 @@ def build_telegram_reports(
         if item.get("status") == "error"
         and not str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
         and not item.get("diagnostics", {}).get("deferred_recovery")
-        and not item.get("diagnostics", {}).get("session_blocked")
         and not str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
     ]
     page_issue_line = f"页面异常:{'、'.join(page_issue_handles)}" if page_issue_handles else ""
     scan_issue_line = f"扫描异常:{'、'.join(scan_issue_handles)}" if scan_issue_handles else ""
-    session_blocked_line = (
-        "X验证拦截"
-        if any(item.get("diagnostics", {}).get("session_blocked") for item in results)
-        else ""
-    )
     recovery_deferred_line = (
         f"恢复延后:{summary['recovery_deferred']}"
         if summary["recovery_deferred"]
@@ -5004,7 +4975,6 @@ def build_telegram_reports(
             paused_line,
             fallback_line,
             page_issue_line,
-            session_blocked_line,
             scan_issue_line,
             recovery_deferred_line,
         )
@@ -5808,9 +5778,6 @@ def main() -> int:
     print(json.dumps({"scan": summary}, ensure_ascii=False))
     for item in results:
         if item.get("status") == "error":
-            diagnostics = item.get("diagnostics", {})
-            if diagnostics.get("global_page_deferred") and diagnostics.get("session_blocked"):
-                continue
             category = (
                 "scan-unavailable"
                 if str(item.get("error") or "").endswith(ACCOUNT_UNAVAILABLE_ERROR)
