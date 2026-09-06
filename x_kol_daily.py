@@ -3375,7 +3375,7 @@ def scrape_all(
                 home_diagnostics: dict[str, Any] = {}
                 try:
                     page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(10_000)
                     ensure_x_page_healthy(
                         page,
                         diagnostics=home_diagnostics,
