@@ -101,17 +101,17 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 18
+MARKET_SUMMARY_CACHE_VERSION = 19
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
-    "record_date": "2026-08-10",
-    "holdings_as_of": "2026-08-23",
-    "verified_date": "2026-08-25",
-    "holdings": 840447,
-    "change": -1690,
-    "average_price": 75385.0,
-    "total_cost_millions": 63357.0,
+    "record_date": "2026-08-31",
+    "holdings_as_of": "2026-08-31",
+    "verified_date": "2026-09-05",
+    "holdings": 845050,
+    "change": 4603,
+    "average_price": 75412.0,
+    "total_cost_millions": 63727.0,
 }
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
 COINGLASS_CACHE_TTL_SECONDS = 600
@@ -912,11 +912,13 @@ def load_strategy_btc_cache() -> dict[str, Any]:
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     cache = state.get("strategy_btc")
+    cached_record = {}
     if isinstance(cache, dict) and cache.get("version") == STRATEGY_BTC_CACHE_VERSION:
-        record = normalize_strategy_btc_record(cache)
-        if record:
-            return record
-    return normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
+        cached_record = normalize_strategy_btc_record(cache)
+    baseline = normalize_strategy_btc_record(STRATEGY_BTC_LAST_VALID)
+    if cached_record and baseline:
+        return max((cached_record, baseline), key=lambda item: item["record_date"])
+    return cached_record or baseline
 
 
 def fetch_bitmine_eth() -> dict[str, Any]:
@@ -1624,6 +1626,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
+            or line.startswith("链上确认交易（最新完整日 ")
             or line.startswith("链上确认交易（截至 ")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
@@ -1697,6 +1700,7 @@ def summary_block_key(block: list[str]) -> str:
     key = re.sub(r"（缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "", block[0])
     key = re.sub(r"（亿美元，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（亿美元）", key)
     key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
+    key = re.sub(r"^链上确认交易（(?:最新完整日 |截至 )\d{2}-\d{2}）$", "链上确认交易", key)
     return key
 
 
@@ -1959,15 +1963,16 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        record_date = chain_activity["record_date"].strftime("%m-%d")
+        # Coin Metrics daily records are UTC dates; display their Beijing end date.
+        record_date = (chain_activity["record_date"] + dt.timedelta(days=1)).strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（截至 {record_date}）",
+            f"链上确认交易（最新完整日 {record_date}）",
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
-            f"24H {assets['btc']['percent']:+.2f}% | "
+            f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
             f"ETH {assets['eth']['transactions'] / 1e4:.2f}万笔 | "
-            f"24H {assets['eth']['percent']:+.2f}% | "
+            f"较上一完整日 {assets['eth']['percent']:+.2f}% | "
             f"较前7日均 {assets['eth']['seven_day_average_percent']:+.2f}%",
         ])
     if hyperliquid_liquidation:
