@@ -58,7 +58,8 @@ async function triggerGithub(env, source) {
   const owner = env.GITHUB_OWNER || "lidecpu";
   const repo = env.GITHUB_REPO || "x_kol_watch";
   const workflow = env.GITHUB_WORKFLOW || "x-kol-daily.yml";
-  const ref = env.GITHUB_REF || "main";
+  // Scheduled production runs must always use the production branch.
+  const ref = "main";
   const { activeRuns, ignoredRuns } = await listActiveRuns(env, owner, repo, workflow, ref);
   const sendOnceKey = beijingSendOnceKey();
   if (activeRuns.length) {
