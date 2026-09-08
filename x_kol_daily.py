@@ -95,7 +95,10 @@ US_MACRO_CALENDAR_CACHE_VERSION = 1
 US_MACRO_CALENDAR_CACHE_TTL_SECONDS = 24 * 60 * 60
 US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
 STRATEGY_PURCHASES_URL = "https://www.strategy.com/purchases"
+STRATEGY_SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK0001050446.json"
+STRATEGY_SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/1050446"
 BITMINE_INVESTOR_RELATIONS_URL = "https://www.bitminetech.io/investor-relations"
+SEC_USER_AGENT = "x-kol-watch/1.0 (contact@example.com)"
 STABLECOIN_TIMEOUT_SECONDS = 15
 MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
@@ -118,6 +121,7 @@ COINGLASS_CACHE_TTL_SECONDS = 600
 COINGLASS_FAILURE_COOLDOWN_SECONDS = 900
 COINGLASS_CACHE_VERSION = 4
 COINGLASS_PAGE_WAIT_SECONDS = 20
+COINGLASS_LIVE_RETRIES = 1
 COINGLASS_LIQUIDATION_LEVEL_LIMIT = 2
 COINGLASS_LIQUIDATION_DISTANCE_LIMIT_PERCENT = 10.0
 SPOT_ETF_FLOW_CACHE_TTL_SECONDS = 3600
@@ -794,10 +798,18 @@ def us_macro_calendar_lines(calendar: dict[str, dt.datetime]) -> list[str]:
 def fetch_strategy_btc() -> dict[str, Any]:
     request = urllib.request.Request(
         STRATEGY_PURCHASES_URL,
-        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        },
     )
-    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-        page = response.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+            page = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise
+        return fetch_strategy_btc_sec()
     parser = NextDataParser()
     parser.feed(page)
     if not parser.chunks:
@@ -842,6 +854,86 @@ def fetch_strategy_btc() -> dict[str, Any]:
     )
     latest["verified_date"] = cn_now().date()
     return latest
+
+
+def fetch_strategy_btc_sec() -> dict[str, Any]:
+    request = urllib.request.Request(
+        STRATEGY_SEC_SUBMISSIONS_URL,
+        headers={"Accept": "application/json", "User-Agent": SEC_USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        payload = json.load(response)
+    recent = payload.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    candidates: list[dict[str, str]] = []
+    for index, form in enumerate(forms):
+        if form != "8-K":
+            continue
+        try:
+            filing_date = str(recent["filingDate"][index])
+            accession = str(recent["accessionNumber"][index])
+            document = str(recent["primaryDocument"][index])
+        except (IndexError, KeyError, TypeError):
+            continue
+        candidates.append({
+            "filing_date": filing_date,
+            "accession": accession,
+            "document": document,
+        })
+    if not candidates:
+        raise ValueError("missing Strategy SEC 8-K filing")
+    filing = max(candidates, key=lambda item: item["filing_date"])
+    accession_path = filing["accession"].replace("-", "")
+    release_url = (
+        f"{STRATEGY_SEC_ARCHIVES_URL}/{accession_path}/{filing['document']}"
+    )
+    request = urllib.request.Request(
+        release_url,
+        headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        page = response.read().decode("utf-8", "replace")
+    parser = HTMLTextLinkParser()
+    parser.feed(page)
+    text = parser.text()
+    holdings_match = re.search(r"holds approximately\s+([\d,]+)\s+bitcoin", text, re.IGNORECASE)
+    cost_match = re.search(r"aggregate purchase price of \$([\d.]+)\s+billion", text, re.IGNORECASE)
+    average_match = re.search(r"average purchase price of approximately \$([\d,]+)\s+per bitcoin", text, re.IGNORECASE)
+    as_of_match = re.search(
+        r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4}),\s+Strategy holds",
+        text,
+    )
+    if not all((holdings_match, cost_match, average_match, as_of_match)):
+        raise ValueError("incomplete Strategy SEC 8-K record")
+    try:
+        holdings = int(holdings_match.group(1).replace(",", ""))
+        total_cost_millions = float(cost_match.group(1)) * 1000
+        average_price = float(average_match.group(1).replace(",", ""))
+        holdings_as_of = dt.datetime.strptime(
+            as_of_match.group(1), "%B %d, %Y"
+        ).date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Strategy SEC 8-K record") from exc
+    if holdings <= 0 or average_price <= 0 or total_cost_millions <= 0:
+        raise ValueError("out-of-range Strategy SEC 8-K record")
+    previous = load_strategy_btc_cache()
+    if previous and previous.get("holdings") == holdings:
+        record_date = previous["record_date"]
+        change = previous["change"]
+        average_price = previous["average_price"]
+        total_cost_millions = previous["total_cost_millions"]
+    else:
+        record_date = holdings_as_of
+        change = holdings - int(previous.get("holdings", 0)) if previous else 0
+    return {
+        "record_date": record_date,
+        "holdings_as_of": holdings_as_of,
+        "verified_date": cn_now().date(),
+        "holdings": holdings,
+        "change": change,
+        "average_price": average_price,
+        "total_cost_millions": total_cost_millions,
+    }
 
 
 def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
@@ -930,65 +1022,78 @@ def fetch_bitmine_eth() -> dict[str, Any]:
         investor_page = response.read().decode("utf-8", "replace")
     investor_parser = HTMLTextLinkParser()
     investor_parser.feed(investor_page)
-    release_url = next((
+    release_urls = list(dict.fromkeys(
         urllib.parse.urljoin(BITMINE_INVESTOR_RELATIONS_URL, href)
         for text, href in investor_parser.links
-        if "ETH Holdings Reach" in text and href
-    ), "")
-    if not release_url:
+        if href and re.search(r"prnewswire\.com/news-releases/bitmine-", href, re.IGNORECASE)
+    ))
+    if not release_urls:
         raise ValueError("missing BitMine ETH holdings release")
-
-    request = urllib.request.Request(
-        release_url,
-        headers={"Accept": "text/html", "User-Agent": "x-kol-watch"},
-    )
-    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-        release_page = response.read().decode("utf-8", "replace")
-    release_parser = HTMLTextLinkParser()
-    release_parser.feed(release_page)
-    text = release_parser.text()
-
-    patterns = {
-        "holdings": r"crypto holdings are comprised of ([\d,]+) ETH\b",
-        "change": r"past week, we acquired ([\d,]+)\s+ETH\b",
-        "supply_percent": r"ETH holdings are ([\d.]+)% of the ETH supply",
-        "staked": r"total staked ETH stands at ([\d,]+)",
-    }
-    matches = {key: re.search(pattern, text, re.IGNORECASE) for key, pattern in patterns.items()}
-    date_match = re.search(
-        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.\s+"
-        r"(\d{1,2}),\s+(\d{4})\s+/PRNewswire/",
-        text,
-        re.IGNORECASE,
-    )
-    if any(match is None for match in matches.values()) or date_match is None:
+    records: list[dict[str, Any]] = []
+    for release_url in release_urls[:8]:
+        request = urllib.request.Request(
+            release_url,
+            headers={"Accept": "text/html", "User-Agent": "Mozilla/5.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+                release_page = response.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        release_parser = HTMLTextLinkParser()
+        release_parser.feed(release_page)
+        text = release_parser.text()
+        holdings_match = re.search(
+            r"crypto holdings are comprised of\s+([\d,.]+)\s*(million\s+)?ETH\b",
+            text,
+            re.IGNORECASE,
+        )
+        change_match = re.search(
+            r"over the past week, we acquired\s+([\d,]+)\s+ETH\b",
+            text,
+            re.IGNORECASE,
+        )
+        supply_match = re.search(r"ETH holdings are\s+([\d.]+)% of the ETH supply", text, re.IGNORECASE)
+        staked_match = re.search(r"total staked ETH stands at\s+([\d,]+)", text, re.IGNORECASE)
+        as_of_match = re.search(
+            r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})[^.]*crypto holdings are comprised",
+            text,
+        )
+        disclosure_match = re.search(
+            r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+"
+            r"(\d{1,2}),\s+(\d{4})\s+/PRNewswire/",
+            text,
+            re.IGNORECASE,
+        )
+        if not all((holdings_match, change_match, supply_match, staked_match, as_of_match, disclosure_match)):
+            continue
+        try:
+            holdings_value = float(holdings_match.group(1).replace(",", ""))
+            if holdings_match.group(2):
+                holdings_value *= 1e6
+            record = {
+                "record_date": dt.datetime.strptime(
+                    f"{disclosure_match.group(1)} {disclosure_match.group(2)} {disclosure_match.group(3)}",
+                    "%b %d %Y",
+                ).date(),
+                "holdings_as_of": dt.datetime.strptime(as_of_match.group(1), "%B %d, %Y").date(),
+                "holdings": int(holdings_value),
+                "change": int(change_match.group(1).replace(",", "")),
+                "supply_percent": float(supply_match.group(1)),
+                "staked": int(staked_match.group(1).replace(",", "")),
+            }
+        except (TypeError, ValueError):
+            continue
+        if (
+            record["holdings"] > 0
+            and record["change"] >= 0
+            and 0 < record["supply_percent"] <= 100
+            and 0 < record["staked"] <= record["holdings"]
+        ):
+            records.append(record)
+    if not records:
         raise ValueError("incomplete BitMine ETH holdings release")
-    try:
-        record_date = dt.datetime.strptime(
-            f"{date_match.group(1)} {date_match.group(2)} {date_match.group(3)}",
-            "%b %d %Y",
-        ).date()
-        holdings = int(matches["holdings"].group(1).replace(",", ""))
-        change = int(matches["change"].group(1).replace(",", ""))
-        supply_percent = float(matches["supply_percent"].group(1))
-        staked = int(matches["staked"].group(1).replace(",", ""))
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("invalid BitMine ETH holdings release") from exc
-    if (
-        holdings <= 0
-        or change < 0
-        or not 0 < supply_percent <= 100
-        or staked <= 0
-        or staked > holdings
-    ):
-        raise ValueError("out-of-range BitMine ETH holdings release")
-    return {
-        "record_date": record_date,
-        "holdings": holdings,
-        "change": change,
-        "supply_percent": supply_percent,
-        "staked": staked,
-    }
+    return max(records, key=lambda item: item["record_date"])
 
 
 def parse_etf_flow_millions(value: str) -> float | None:
@@ -2086,9 +2191,10 @@ def fetch_stablecoin_summary() -> str:
     if strategy_btc:
         record_date = strategy_btc["record_date"].strftime("%m-%d")
         holdings_as_of = strategy_btc["holdings_as_of"].strftime("%m-%d")
+        verified_date = strategy_btc["verified_date"].strftime("%m-%d")
         strategy_lines.extend([
             "Strategy（微策略）",
-            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of}",
+            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of} | 官网核验 {verified_date}",
             f"上次变化 {strategy_btc['change']:+,}枚（{record_date}）",
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
@@ -2097,10 +2203,14 @@ def fetch_stablecoin_summary() -> str:
     bitmine_lines: list[str] = []
     if bitmine_eth:
         record_date = bitmine_eth["record_date"].strftime("%m-%d")
+        holdings_as_of = bitmine_eth.get("holdings_as_of", bitmine_eth["record_date"])
+        if isinstance(holdings_as_of, str):
+            holdings_as_of = dt.date.fromisoformat(holdings_as_of)
         bitmine_lines.extend([
             "BitMine（BMNR）",
             f"ETH持仓 {bitmine_eth['holdings'] / 1e4:.2f}万枚 | "
-            f"持仓变化 {bitmine_eth['change'] / 1e4:+.2f}万枚（{record_date}披露）",
+            f"持仓截至 {holdings_as_of.strftime('%m-%d')}（{record_date}披露） | "
+            f"持仓变化 {bitmine_eth['change'] / 1e4:+.2f}万枚",
             f"供应占比 {compact_percent(bitmine_eth['supply_percent'])} | "
             f"已质押 {bitmine_eth['staked'] / 1e4:.2f}万枚",
         ])
@@ -2959,9 +3069,23 @@ def fetch_coinglass_snapshot() -> dict[str, Any]:
                 return stale_cached_snapshot()
             return {}
     started_at = time.monotonic()
-    try:
-        snapshot = fetch_coinglass_live()
-    except Exception as exc:
+    snapshot: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    for attempt in range(COINGLASS_LIVE_RETRIES + 1):
+        try:
+            snapshot = fetch_coinglass_live()
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < COINGLASS_LIVE_RETRIES:
+                print(
+                    f"[coinglass-retry] attempt={attempt + 1}/{COINGLASS_LIVE_RETRIES} "
+                    f"reason={type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                time.sleep(1.0)
+    if snapshot is None:
+        exc = last_error or RuntimeError("CoinGlass live fetch failed")
         save_coinglass_failure()
         print(
             f"[coinglass-error] {type(exc).__name__}: {exc}",
