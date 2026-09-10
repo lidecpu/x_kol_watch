@@ -3,6 +3,11 @@ name: X KOL Daily
 on:
   workflow_dispatch:
     inputs:
+      scan_kol:
+        description: Scan X KOL accounts in addition to the market overview
+        required: false
+        default: false
+        type: boolean
       send_once_key:
         description: Stable Telegram idempotency key supplied by the trigger
         required: false
@@ -67,14 +72,20 @@ jobs:
           python -m pip install -r requirements.txt
           python -m playwright install chromium
 
-      - name: Send market overview
+      - name: Send report
         shell: bash
         run: |
-          cmd=(python x_kol_daily.py --market-only --send)
+          if [ "${{ inputs.scan_kol }}" = "true" ]; then
+            cmd=(python x_kol_daily.py --send)
+            mode="market-and-kol"
+          else
+            cmd=(python x_kol_daily.py --market-only --send)
+            mode="market-only"
+          fi
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")
           fi
-          echo "mode=market-only send=true"
+          echo "mode=$mode send=true"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
