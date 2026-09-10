@@ -3512,14 +3512,39 @@ def scrape_all(
             context = new_x_context(browser, cookies)
             try:
                 page = context.new_page()
-                page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45_000)
-                page.wait_for_timeout(1500)
-                ensure_x_page_healthy(page)
-                print(
-                    f"[x-home] url={page.url} title={page.title()[:80]}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                home_diagnostics: dict[str, Any] = {}
+                try:
+                    page.goto(
+                        "https://x.com/home",
+                        wait_until="domcontentloaded",
+                        timeout=45_000,
+                    )
+                    wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
+                    ensure_x_page_healthy(
+                        page,
+                        diagnostics=home_diagnostics,
+                        phase="home",
+                    )
+                except Exception as exc:
+                    home_shell_error = str(exc) == PAGE_RENDER_ERROR or isinstance(
+                        exc,
+                        PlaywrightTimeoutError,
+                    )
+                    if not home_shell_error:
+                        raise
+                    print(
+                        f"[x-home-warning] {type(exc).__name__}: {exc} "
+                        f"diagnostics={json.dumps(home_diagnostics, ensure_ascii=False)} "
+                        "continuing=profiles",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[x-home] url={page.url} title={page.title()[:80]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 total_kols = len(kols)
                 planned_profile_loads = sum(
                     1 for kol in kols if not kol.get("auto_recheck_paused")
