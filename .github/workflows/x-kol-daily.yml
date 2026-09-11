@@ -1,6 +1,8 @@
 name: X KOL Daily
 
 on:
+  schedule:
+    - cron: "40 15 * * *"
   workflow_dispatch:
     inputs:
       send_once_key:
@@ -12,9 +14,57 @@ concurrency:
   group: x-kol-daily
   cancel-in-progress: false
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+    steps:
+      - name: Check Cloudflare dispatch
+        id: decide
+        shell: bash
+        env:
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "manual dispatch: run enabled"
+            exit 0
+          fi
+
+          cutoff="$(date -u -d '3 hours ago' '+%Y-%m-%dT%H:%M:%SZ')"
+          api_url="$GH_API_URL/repos/$GH_REPOSITORY/actions/workflows/x-kol-daily.yml/runs?branch=main&event=workflow_dispatch&per_page=20"
+          if ! response="$(curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 20 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$api_url")"; then
+            echo "::warning::Cloudflare dispatch check failed; running scheduled fallback"
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          recent_count="$(jq --arg cutoff "$cutoff" \
+            '[.workflow_runs[] | select(.created_at >= $cutoff)] | length' \
+            <<< "$response")"
+          if [ "$recent_count" -gt 0 ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Cloudflare already dispatched $recent_count run(s) after $cutoff; fallback skipped"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "No recent Cloudflare dispatch after $cutoff; fallback enabled"
+          fi
+
   scan:
-    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: gate
+    if: ${{ github.ref == 'refs/heads/main' && needs.gate.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
