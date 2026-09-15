@@ -1,4 +1,5 @@
 name: X KOL Daily
+run-name: X KOL Daily ${{ inputs.send_once_key || github.event_name }}
 
 on:
   schedule:
@@ -23,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.decide.outputs.should_run }}
+      send_once_key: ${{ steps.decide.outputs.send_once_key }}
     steps:
       - name: Check Cloudflare dispatch
         id: decide
@@ -32,15 +34,30 @@ jobs:
           GH_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
+          INPUT_SEND_ONCE_KEY: ${{ inputs.send_once_key }}
         run: |
           if [ "$EVENT_NAME" != "schedule" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "send_once_key=$INPUT_SEND_ONCE_KEY" >> "$GITHUB_OUTPUT"
             echo "manual dispatch: run enabled"
             exit 0
           fi
 
-          cutoff="$(date -u -d '3 hours ago' '+%Y-%m-%dT%H:%M:%SZ')"
-          api_url="$GH_API_URL/repos/$GH_REPOSITORY/actions/workflows/x-kol-daily.yml/runs?branch=main&event=workflow_dispatch&per_page=20"
+          now_epoch="$(date -u '+%s')"
+          today="$(date -u '+%Y-%m-%d')"
+          today_schedule_epoch="$(date -u -d "$today 15:40:00" '+%s')"
+          if [ "$now_epoch" -ge "$today_schedule_epoch" ]; then
+            schedule_day="$today"
+          else
+            schedule_day="$(date -u -d "$today - 1 day" '+%Y-%m-%d')"
+          fi
+          dispatch_from="${schedule_day}T15:00:00Z"
+          dispatch_to="${schedule_day}T17:00:00Z"
+          send_once_key="${schedule_day//-/}:24h:full"
+          expected_title="X KOL Daily $send_once_key"
+          echo "send_once_key=$send_once_key" >> "$GITHUB_OUTPUT"
+
+          api_url="$GH_API_URL/repos/$GH_REPOSITORY/actions/workflows/x-kol-daily.yml/runs?branch=main&event=workflow_dispatch&per_page=50"
           if ! response="$(curl --fail --silent --show-error --retry 2 --retry-all-errors --max-time 20 \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -51,15 +68,16 @@ jobs:
             exit 0
           fi
 
-          recent_count="$(jq --arg cutoff "$cutoff" \
-            '[.workflow_runs[] | select(.created_at >= $cutoff)] | length' \
+          recent_count="$(jq --arg expected_title "$expected_title" \
+            --arg dispatch_from "$dispatch_from" --arg dispatch_to "$dispatch_to" \
+            '[.workflow_runs[] | select(.display_title == $expected_title or (.created_at >= $dispatch_from and .created_at < $dispatch_to))] | length' \
             <<< "$response")"
           if [ "$recent_count" -gt 0 ]; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "Cloudflare already dispatched $recent_count run(s) after $cutoff; fallback skipped"
+            echo "Cloudflare already dispatched $recent_count run(s) for $schedule_day; fallback skipped"
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "No recent Cloudflare dispatch after $cutoff; fallback enabled"
+            echo "No Cloudflare dispatch for $schedule_day; fallback enabled with key $send_once_key"
           fi
 
   scan:
@@ -72,7 +90,7 @@ jobs:
       X_CT0: ${{ secrets.X_CT0 }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      SEND_ONCE_KEY: ${{ inputs.send_once_key }}
+      SEND_ONCE_KEY: ${{ needs.gate.outputs.send_once_key }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
