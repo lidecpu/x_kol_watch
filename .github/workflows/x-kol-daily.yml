@@ -6,6 +6,16 @@ on:
     - cron: "40 15 * * *"
   workflow_dispatch:
     inputs:
+      scan_kol:
+        description: Run the X KOL scan for a manual probe
+        required: false
+        default: false
+        type: boolean
+      send_kol:
+        description: Send the manual KOL probe report to Telegram
+        required: false
+        default: false
+        type: boolean
       send_once_key:
         description: Stable Telegram idempotency key supplied by the trigger
         required: false
@@ -138,11 +148,22 @@ jobs:
       - name: Send report
         shell: bash
         run: |
-          cmd=(python x_kol_daily.py --market-only --send)
+          if [ "${{ inputs.scan_kol }}" = "true" ]; then
+            if [ "${{ inputs.send_kol }}" = "true" ]; then
+              cmd=(python x_kol_daily.py --send)
+              mode="kol-scan-and-send"
+            else
+              cmd=(python x_kol_daily.py --no-send)
+              mode="kol-scan-only"
+            fi
+          else
+            cmd=(python x_kol_daily.py --market-only --send)
+            mode="market-only"
+          fi
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")
           fi
-          echo "mode=market-only send=true"
+          echo "mode=$mode"
           printf 'command:'
           printf ' %q' "${cmd[@]}"
           printf '\n'
