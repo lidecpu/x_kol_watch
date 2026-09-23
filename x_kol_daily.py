@@ -1806,10 +1806,15 @@ def refresh_cached_summary_etf(
 
 
 def normalize_stablecoin_summary_labels(summary: str) -> str:
-    return (
+    normalized = (
         summary.replace("链变化 ", "链上流通量变化 ")
         .replace("净增发", "净增")
         .replace("净销毁", "净减")
+    )
+    return re.sub(
+        r"链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 (\d{2}-\d{2})）",
+        r"链上确认交易（最新完整日 \1）",
+        normalized,
     )
 
 
@@ -1834,6 +1839,11 @@ def summary_block_key(block: list[str]) -> str:
     key = re.sub(r"（缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "", block[0])
     key = re.sub(r"（亿美元，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（亿美元）", key)
     key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
+    key = re.sub(
+        r"^链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 \d{2}-\d{2}）$",
+        "链上确认交易",
+        key,
+    )
     key = re.sub(r"^链上确认交易（(?:最新完整日 |截至 )\d{2}-\d{2}）$", "链上确认交易", key)
     return key
 
@@ -2108,12 +2118,12 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        # Coin Metrics daily records are UTC dates; make both source and local end date explicit.
+        # Coin Metrics daily records are UTC dates; display the Beijing end date only.
         source_date = chain_activity["record_date"]
         local_end_date = (source_date + dt.timedelta(days=1)).strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（最新完整日 UTC {source_date.strftime('%m-%d')}｜北京时间 {local_end_date}）",
+            f"链上确认交易（最新完整日 {local_end_date}）",
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
             f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
