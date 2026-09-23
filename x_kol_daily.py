@@ -903,12 +903,41 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4}),\s+Strategy holds",
         text,
     )
+    table_values_match = re.search(
+        r"BTC Purchased.*?Average Purchase Price\s+\(2\)\s+"
+        r"([\d,]+)\s+\$\s+([\d.]+)\s+\$\s+([\d,]+)\s+"
+        r"([\d,]+)\s+\$\s+([\d.]+)\s+\$\s+([\d,]+)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    table_record: dict[str, str] | None = None
     if not all((holdings_match, cost_match, average_match, as_of_match)):
-        raise ValueError("incomplete Strategy SEC 8-K record")
+        if not table_values_match:
+            raise ValueError("incomplete Strategy SEC 8-K record")
+        table_as_of_match = re.search(
+            r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
+            text,
+        )
+        assert table_as_of_match is not None
+        _, _, _, holdings, total_cost, average = (
+            table_values_match.groups()
+        )
+        as_of_match = table_as_of_match
+        table_record = {
+            "holdings": holdings,
+            "total_cost_millions": total_cost,
+            "average_price": average,
+            "holdings_as_of": table_as_of_match.group(1),
+        }
     try:
-        holdings = int(holdings_match.group(1).replace(",", ""))
-        total_cost_millions = float(cost_match.group(1)) * 1000
-        average_price = float(average_match.group(1).replace(",", ""))
+        if table_record is not None:
+            holdings = int(table_record["holdings"].replace(",", ""))
+            total_cost_millions = float(table_record["total_cost_millions"]) * 1000
+            average_price = float(table_record["average_price"].replace(",", ""))
+        else:
+            holdings = int(holdings_match.group(1).replace(",", ""))
+            total_cost_millions = float(cost_match.group(1)) * 1000
+            average_price = float(average_match.group(1).replace(",", ""))
         holdings_as_of = dt.datetime.strptime(
             as_of_match.group(1), "%B %d, %Y"
         ).date()
@@ -1928,6 +1957,7 @@ def fetch_stablecoin_summary() -> str:
         ),
     }
     fetched: dict[str, Any] = {}
+    coinglass_captured_at: dt.datetime | None = None
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {
             name: executor.submit(job[0])
@@ -1935,8 +1965,11 @@ def fetch_stablecoin_summary() -> str:
         }
         try:
             coinglass_snapshot = fetch_coinglass_snapshot()
-            if coinglass_snapshot and not coinglass_snapshot.get("_stale"):
+            if coinglass_snapshot:
                 hyperliquid_liquidation = coinglass_snapshot
+                coinglass_captured_at = parse_cache_timestamp(
+                    coinglass_snapshot.get("_captured_at")
+                )
                 market_structure = coinglass_snapshot.get("market_structure")
                 if isinstance(market_structure, dict):
                     coinglass_market_structure = dict(market_structure)
@@ -2027,12 +2060,19 @@ def fetch_stablecoin_summary() -> str:
             )
             if global_volume:
                 dominance_line += f" | ETH占比 {global_volume['eth_dominance']:.2f}%"
-            market_lines.extend([
-                dominance_line,
+            exchange_line = (
                 f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
                 f"24H {compact_btc_change(coinglass_market_structure['exchange_balance_change_24h'])} | "
                 f"7D {compact_btc_change(coinglass_market_structure['exchange_balance_change_7d'])} | "
-                f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}",
+                f"30D {compact_btc_change(coinglass_market_structure['exchange_balance_change_30d'])}"
+            )
+            if coinglass_market_structure and coinglass_captured_at is not None:
+                exchange_line += (
+                    f" | 数据截至 {coinglass_captured_at.strftime('%m-%d %H:%M')}"
+                )
+            market_lines.extend([
+                dominance_line,
+                exchange_line,
             ])
         elif global_volume:
             market_lines.append(
@@ -2068,11 +2108,12 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        # Coin Metrics daily records are UTC dates; display their Beijing end date.
-        record_date = (chain_activity["record_date"] + dt.timedelta(days=1)).strftime("%m-%d")
+        # Coin Metrics daily records are UTC dates; make both source and local end date explicit.
+        source_date = chain_activity["record_date"]
+        local_end_date = (source_date + dt.timedelta(days=1)).strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（最新完整日 {record_date}）",
+            f"链上确认交易（最新完整日 UTC {source_date.strftime('%m-%d')}｜北京时间 {local_end_date}）",
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
             f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
