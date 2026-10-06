@@ -856,6 +856,103 @@ def fetch_strategy_btc() -> dict[str, Any]:
     return latest
 
 
+def parse_strategy_btc_sec(page: str) -> dict[str, Any]:
+    tables = HTMLTableParser()
+    tables.feed(page)
+    text_parser = HTMLTextLinkParser()
+    text_parser.feed(page)
+    text = text_parser.text()
+    date_pattern = r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4})(\*)?"
+    cutoff_match = re.search(
+        r"as of\s+(\d{1,2}):(\d{2})\s*(a\.m\.|p\.m\.)\s+Eastern Time",
+        text,
+        re.IGNORECASE,
+    )
+    holdings_records: list[dict[str, Any]] = []
+    purchases: dict[dt.date, int] = {}
+    for table in tables.tables:
+        table_text = " ".join(" ".join(row) for row in table)
+        for index, row in enumerate(table[:-1]):
+            header = " ".join(row)
+            is_holdings = "Aggregate BTC Holdings" in header
+            is_purchase = re.search(r"BTC (?:Purchased|Acquired)\b", header)
+            if not is_holdings and not is_purchase:
+                continue
+            date_match = re.search(
+                rf"As of\s+{date_pattern}" if is_holdings else
+                rf"During Period\s+.*?\s+to\s+{date_pattern}",
+                table_text,
+            )
+            if date_match is None:
+                continue
+            source_date = dt.datetime.strptime(date_match.group(1), "%B %d, %Y").date()
+            values = " ".join(table[index + 1]).replace("$", "").split()
+            if len(values) not in {3, 6}:
+                raise ValueError("incomplete Strategy SEC BTC table")
+            try:
+                if is_purchase:
+                    purchases[source_date] = (
+                        0 if values[0] == "-" else int(values[0].replace(",", ""))
+                    )
+                if is_holdings:
+                    if not re.search(r"in\s+billions", header, re.IGNORECASE):
+                        raise ValueError("unknown Strategy SEC cost unit")
+                    holdings, total_cost, average = values[-3:]
+                    record = {
+                        "record_date": source_date,
+                        "holdings_as_of": source_date,
+                        "holdings": int(holdings.replace(",", "")),
+                        "total_cost_millions": float(total_cost.replace(",", "")) * 1000,
+                        "average_price": float(average.replace(",", "")),
+                    }
+                    if date_match.group(2) and cutoff_match:
+                        hour, minute = map(int, cutoff_match.groups()[:2])
+                        if not 1 <= hour <= 12 or not 0 <= minute < 60:
+                            raise ValueError("invalid Strategy SEC cutoff time")
+                        hour = hour % 12 + (12 if cutoff_match.group(3).lower() == "p.m." else 0)
+                        local_cutoff = us_eastern_release_time(source_date, hour, minute)
+                        record["holdings_as_of"] = local_cutoff.date()
+                        record["holdings_as_of_time"] = local_cutoff.strftime("%H:%M")
+                    holdings_records.append(record)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid Strategy SEC BTC table") from exc
+    if holdings_records:
+        latest = max(holdings_records, key=lambda item: item["record_date"])
+        source_date = latest["record_date"]
+        if source_date not in purchases:
+            raise ValueError("missing Strategy SEC BTC purchase amount")
+        latest["change"] = purchases[source_date]
+        latest["record_date"] = latest["holdings_as_of"]
+    else:
+        holdings_match = re.search(r"holds approximately\s+([\d,]+)\s+bitcoin", text, re.IGNORECASE)
+        cost_match = re.search(r"aggregate purchase price of \$([\d.]+)\s+billion", text, re.IGNORECASE)
+        average_match = re.search(r"average purchase price of approximately \$([\d,.]+)\s+per bitcoin", text, re.IGNORECASE)
+        as_of_match = re.search(rf"As of\s+{date_pattern},\s+Strategy holds", text)
+        change_match = re.search(r"acquired\s+([\d,]+)\s+bitcoin", text, re.IGNORECASE)
+        if not all((holdings_match, cost_match, average_match, as_of_match, change_match)):
+            raise ValueError("incomplete Strategy SEC 8-K record")
+        source_date = dt.datetime.strptime(as_of_match.group(1), "%B %d, %Y").date()
+        latest = {
+            "record_date": source_date,
+            "holdings_as_of": source_date,
+            "holdings": int(holdings_match.group(1).replace(",", "")),
+            "total_cost_millions": float(cost_match.group(1)) * 1000,
+            "average_price": float(average_match.group(1).replace(",", "")),
+            "change": int(change_match.group(1).replace(",", "")),
+        }
+    if (
+        not all(math.isfinite(latest[key]) for key in (
+            "holdings", "total_cost_millions", "average_price", "change",
+        ))
+        or latest["holdings"] <= 0
+        or latest["total_cost_millions"] <= 0
+        or latest["average_price"] <= 0
+        or not 0 <= latest["change"] <= latest["holdings"]
+    ):
+        raise ValueError("out-of-range Strategy SEC 8-K record")
+    return latest
+
+
 def fetch_strategy_btc_sec() -> dict[str, Any]:
     request = urllib.request.Request(
         STRATEGY_SEC_SUBMISSIONS_URL,
@@ -882,87 +979,35 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         })
     if not candidates:
         raise ValueError("missing Strategy SEC 8-K filing")
-    filing = max(candidates, key=lambda item: item["filing_date"])
-    accession_path = filing["accession"].replace("-", "")
-    release_url = (
-        f"{STRATEGY_SEC_ARCHIVES_URL}/{accession_path}/{filing['document']}"
-    )
-    request = urllib.request.Request(
-        release_url,
-        headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
-    )
-    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-        page = response.read().decode("utf-8", "replace")
-    parser = HTMLTextLinkParser()
-    parser.feed(page)
-    text = parser.text()
-    holdings_match = re.search(r"holds approximately\s+([\d,]+)\s+bitcoin", text, re.IGNORECASE)
-    cost_match = re.search(r"aggregate purchase price of \$([\d.]+)\s+billion", text, re.IGNORECASE)
-    average_match = re.search(r"average purchase price of approximately \$([\d,]+)\s+per bitcoin", text, re.IGNORECASE)
-    as_of_match = re.search(
-        r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4}),\s+Strategy holds",
-        text,
-    )
-    table_values_match = re.search(
-        r"BTC Purchased.*?Average Purchase Price\s+\(2\)\s+"
-        r"([\d,]+)\s+\$\s+([\d.]+)\s+\$\s+([\d,]+)\s+"
-        r"([\d,]+)\s+\$\s+([\d.]+)\s+\$\s+([\d,]+)",
-        text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    table_record: dict[str, str] | None = None
-    if not all((holdings_match, cost_match, average_match, as_of_match)):
-        if not table_values_match:
-            raise ValueError("incomplete Strategy SEC 8-K record")
-        table_as_of_match = re.search(
-            r"As of\s+([A-Z][a-z]+\s+\d{1,2},\s+\d{4})",
-            text,
+    for filing in sorted(candidates, key=lambda item: item["filing_date"], reverse=True)[:5]:
+        accession_path = filing["accession"].replace("-", "")
+        release_url = (
+            f"{STRATEGY_SEC_ARCHIVES_URL}/{accession_path}/{filing['document']}"
         )
-        assert table_as_of_match is not None
-        _, _, _, holdings, total_cost, average = (
-            table_values_match.groups()
+        request = urllib.request.Request(
+            release_url,
+            headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
         )
-        as_of_match = table_as_of_match
-        table_record = {
-            "holdings": holdings,
-            "total_cost_millions": total_cost,
-            "average_price": average,
-            "holdings_as_of": table_as_of_match.group(1),
-        }
-    try:
-        if table_record is not None:
-            holdings = int(table_record["holdings"].replace(",", ""))
-            total_cost_millions = float(table_record["total_cost_millions"]) * 1000
-            average_price = float(table_record["average_price"].replace(",", ""))
-        else:
-            holdings = int(holdings_match.group(1).replace(",", ""))
-            total_cost_millions = float(cost_match.group(1)) * 1000
-            average_price = float(average_match.group(1).replace(",", ""))
-        holdings_as_of = dt.datetime.strptime(
-            as_of_match.group(1), "%B %d, %Y"
-        ).date()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("invalid Strategy SEC 8-K record") from exc
-    if holdings <= 0 or average_price <= 0 or total_cost_millions <= 0:
-        raise ValueError("out-of-range Strategy SEC 8-K record")
-    previous = load_strategy_btc_cache()
-    if previous and previous.get("holdings") == holdings:
-        record_date = previous["record_date"]
-        change = previous["change"]
-        average_price = previous["average_price"]
-        total_cost_millions = previous["total_cost_millions"]
+        with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+            page = response.read().decode("utf-8", "replace")
+        if not re.search(r"Aggregate BTC Holdings|holds approximately", page, re.IGNORECASE):
+            continue
+        record = parse_strategy_btc_sec(page)
+        break
     else:
-        record_date = holdings_as_of
-        change = holdings - int(previous.get("holdings", 0)) if previous else 0
-    return {
-        "record_date": record_date,
-        "holdings_as_of": holdings_as_of,
-        "verified_date": cn_now().date(),
-        "holdings": holdings,
-        "change": change,
-        "average_price": average_price,
-        "total_cost_millions": total_cost_millions,
-    }
+        raise ValueError("missing Strategy SEC BTC holdings in recent 8-K filings")
+    previous = load_strategy_btc_cache()
+    if previous and previous.get("holdings") == record["holdings"] and record["change"] == 0:
+        record["record_date"] = previous["record_date"]
+        record["change"] = previous["change"]
+    record["verified_date"] = cn_now().date()
+    record["verification_source"] = "SEC"
+    print(
+        f"[strategy-btc-sec] filing={filing['filing_date']} "
+        f"holdings={record['holdings']} as_of={record['holdings_as_of']}",
+        file=sys.stderr,
+    )
+    return record
 
 
 def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
@@ -988,6 +1033,11 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         }
     except (KeyError, TypeError, ValueError, OverflowError):
         return {}
+    if value.get("verification_source") == "SEC":
+        record["verification_source"] = "SEC"
+    cutoff_time = str(value.get("holdings_as_of_time") or "")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", cutoff_time):
+        record["holdings_as_of_time"] = cutoff_time
     numeric = (
         record["holdings"],
         record["change"],
@@ -1025,6 +1075,9 @@ def save_strategy_btc_cache(record: dict[str, Any]) -> None:
         "average_price": normalized["average_price"],
         "total_cost_millions": normalized["total_cost_millions"],
     }
+    for key in ("verification_source", "holdings_as_of_time"):
+        if key in normalized:
+            state["strategy_btc"][key] = normalized[key]
     save_json(MARKET_STATE, state)
 
 
@@ -1760,7 +1813,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
-            or line.startswith("链上确认交易（最新完整日 ")
+            or line.startswith("链上确认交易（最新完整")
             or line.startswith("链上确认交易（截至 ")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
@@ -1805,15 +1858,38 @@ def refresh_cached_summary_etf(
     return "\n".join(lines[:start] + etf_lines + lines[end:]).strip()
 
 
+def chain_activity_heading(source_date: dt.date) -> str:
+    start = dt.datetime.combine(
+        source_date, dt.time(), tzinfo=dt.timezone.utc,
+    ).astimezone(CN_TZ)
+    end = start + dt.timedelta(days=1)
+    return (
+        f"链上确认交易（最新完整区间，北京时间 "
+        f"{start.strftime('%m-%d %H:%M')} 至 {end.strftime('%m-%d %H:%M')}）"
+    )
+
+
 def normalize_stablecoin_summary_labels(summary: str) -> str:
     normalized = (
         summary.replace("链变化 ", "链上流通量变化 ")
         .replace("净增发", "净增")
         .replace("净销毁", "净减")
     )
-    return re.sub(
+    normalized = re.sub(
         r"链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 (\d{2}-\d{2})）",
         r"链上确认交易（最新完整日 \1）",
+        normalized,
+    )
+    def replace_chain_date(match: re.Match[str]) -> str:
+        try:
+            end = dt.datetime.strptime(f"{cn_now().year}-{match.group(1)}", "%Y-%m-%d").date()
+        except ValueError:
+            return match.group(0)
+        return chain_activity_heading(end - dt.timedelta(days=1))
+
+    return re.sub(
+        r"链上确认交易（最新完整日 (\d{2}-\d{2})）",
+        replace_chain_date,
         normalized,
     )
 
@@ -1841,6 +1917,12 @@ def summary_block_key(block: list[str]) -> str:
     key = re.sub(r"（BTC，缓存\s+\d{2}-\d{2}\s+\d{2}:\d{2}）$", "（BTC）", key)
     key = re.sub(
         r"^链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 \d{2}-\d{2}）$",
+        "链上确认交易",
+        key,
+    )
+    key = re.sub(
+        r"^链上确认交易（最新完整区间，北京时间 "
+        r"\d{2}-\d{2} \d{2}:\d{2} 至 \d{2}-\d{2} \d{2}:\d{2}）$",
         "链上确认交易",
         key,
     )
@@ -2118,12 +2200,9 @@ def fetch_stablecoin_summary() -> str:
             )
         market_lines.extend(["市场合约（亿美元）", futures_text])
     if chain_activity:
-        # Coin Metrics daily records are UTC dates; display the Beijing end date only.
-        source_date = chain_activity["record_date"]
-        local_end_date = (source_date + dt.timedelta(days=1)).strftime("%m-%d")
         assets = chain_activity["assets"]
         market_lines.extend([
-            f"链上确认交易（最新完整日 {local_end_date}）",
+            chain_activity_heading(chain_activity["record_date"]),
             f"BTC {assets['btc']['transactions'] / 1e4:.2f}万笔 | "
             f"较上一完整日 {assets['btc']['percent']:+.2f}% | "
             f"较前7日均 {assets['btc']['seven_day_average_percent']:+.2f}%",
@@ -2243,9 +2322,14 @@ def fetch_stablecoin_summary() -> str:
         record_date = strategy_btc["record_date"].strftime("%m-%d")
         holdings_as_of = strategy_btc["holdings_as_of"].strftime("%m-%d")
         verified_date = strategy_btc["verified_date"].strftime("%m-%d")
+        if strategy_btc.get("holdings_as_of_time"):
+            holdings_as_of += f" {strategy_btc['holdings_as_of_time']}（北京时间）"
+        verification_label = (
+            "SEC核验" if strategy_btc.get("verification_source") == "SEC" else "官网核验"
+        )
         strategy_lines.extend([
             "Strategy（微策略）",
-            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of} | 官网核验 {verified_date}",
+            f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of} | {verification_label} {verified_date}",
             f"上次变化 {strategy_btc['change']:+,}枚（{record_date}）",
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
