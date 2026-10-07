@@ -124,12 +124,18 @@ class StrategyParsingTests(unittest.TestCase):
         self.assertEqual(restored["verification_source"], "SEC")
         self.assertEqual(restored["change"], 334)
 
+    def test_cached_holdings_label_preserves_cutoff_without_timezone(self):
+        old = "BTC持仓 900,000枚 | 持仓截至 10-05 04:00（北京时间） | SEC核验 10-07"
+        expected = "BTC持仓 900,000枚 | 持仓截至 10-05 04:00 | SEC核验 10-07"
+        self.assertEqual(market.normalize_stablecoin_summary_labels(old), expected)
+        self.assertEqual(market.normalize_stablecoin_summary_labels(expected), expected)
+
 
 class ChainDateTests(unittest.TestCase):
     def test_exact_beijing_interval(self):
         self.assertEqual(
             market.chain_activity_heading(dt.date(2026, 10, 5)),
-            "链上确认交易（最新完整区间，北京时间 10-05 08:00 至 10-06 08:00）",
+            "链上确认交易（10-05 08:00 至 10-06 08:00）",
         )
         self.assertIn(
             "12-31 08:00 至 01-01 08:00",
@@ -139,15 +145,19 @@ class ChainDateTests(unittest.TestCase):
     def test_old_cached_labels_normalize_and_merge_once(self):
         new = market.chain_activity_heading(dt.date(2026, 10, 5))
         old = "链上确认交易（最新完整日 10-06）"
-        self.assertEqual(market.normalize_stablecoin_summary_labels(old), new)
-        self.assertEqual(
-            market.normalize_stablecoin_summary_labels(
-                "链上确认交易（最新完整日 UTC 10-05｜北京时间 10-06）"
-            ), new,
-        )
-        self.assertEqual(market.summary_block_key([old]), market.summary_block_key([new]))
-        merged = market.merge_partial_market_summary(new + "\nBTC current", old + "\nBTC old", None)
-        self.assertEqual(merged, new + "\nBTC current")
+        for cached in (
+            old,
+            "链上确认交易（最新完整日 UTC 10-05｜北京时间 10-06）",
+            "链上确认交易（最新完整区间，北京时间 10-05 08:00 至 10-06 08:00）",
+            new,
+        ):
+            with self.subTest(cached=cached):
+                self.assertEqual(market.normalize_stablecoin_summary_labels(cached), new)
+                self.assertEqual(market.summary_block_key([cached]), market.summary_block_key([new]))
+                merged = market.merge_partial_market_summary(
+                    new + "\nBTC current", cached + "\nBTC old", None,
+                )
+                self.assertEqual(merged, new + "\nBTC current")
         separated = market.market_summary_with_separators(["加密市场", new])
         self.assertEqual(separated[1], market.TELEGRAM_SECTION_SEPARATOR)
 

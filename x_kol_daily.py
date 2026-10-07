@@ -1813,8 +1813,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
             continue
         if (
             line in section_headings
-            or line.startswith("链上确认交易（最新完整")
-            or line.startswith("链上确认交易（截至 ")
+            or line.startswith("链上确认交易（")
             or line.startswith("Hyperliquid清算价（BTC，缓存 ")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
         ) and separated:
@@ -1864,7 +1863,7 @@ def chain_activity_heading(source_date: dt.date) -> str:
     ).astimezone(CN_TZ)
     end = start + dt.timedelta(days=1)
     return (
-        f"链上确认交易（最新完整区间，北京时间 "
+        f"链上确认交易（"
         f"{start.strftime('%m-%d %H:%M')} 至 {end.strftime('%m-%d %H:%M')}）"
     )
 
@@ -1874,6 +1873,8 @@ def normalize_stablecoin_summary_labels(summary: str) -> str:
         summary.replace("链变化 ", "链上流通量变化 ")
         .replace("净增发", "净增")
         .replace("净销毁", "净减")
+        .replace("链上确认交易（最新完整区间，北京时间 ", "链上确认交易（")
+        .replace("（北京时间）", "")
     )
     normalized = re.sub(
         r"链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 (\d{2}-\d{2})）",
@@ -1921,7 +1922,7 @@ def summary_block_key(block: list[str]) -> str:
         key,
     )
     key = re.sub(
-        r"^链上确认交易（最新完整区间，北京时间 "
+        r"^链上确认交易（(?:最新完整区间，北京时间 )?"
         r"\d{2}-\d{2} \d{2}:\d{2} 至 \d{2}-\d{2} \d{2}:\d{2}）$",
         "链上确认交易",
         key,
@@ -2323,7 +2324,7 @@ def fetch_stablecoin_summary() -> str:
         holdings_as_of = strategy_btc["holdings_as_of"].strftime("%m-%d")
         verified_date = strategy_btc["verified_date"].strftime("%m-%d")
         if strategy_btc.get("holdings_as_of_time"):
-            holdings_as_of += f" {strategy_btc['holdings_as_of_time']}（北京时间）"
+            holdings_as_of += f" {strategy_btc['holdings_as_of_time']}"
         verification_label = (
             "SEC核验" if strategy_btc.get("verification_source") == "SEC" else "官网核验"
         )
