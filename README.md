@@ -93,9 +93,6 @@ Lookonchain | @lookonchain | 链上监测
 
 ## 注意
 
-- GitHub KOL 扫描使用完整 Chromium 的新无头模式，保留正常资源加载和浏览器 HTTP 缓存，不修改浏览器指纹。参见 [Playwright 浏览器说明](https://playwright.dev/python/docs/browsers#chromium-new-headless-mode)。
-- 遇到 X 安全验证时，`[x-verification]` 只记录阶段、判断来源和状态码；扫描停止，不把验证失败当成无新推文，不更新推文缓存或发送 Telegram。
-- Cloudflare Browser Run 官方说明其请求会被识别为机器人流量，不能保证通过 X 的安全验证。参见 [Cloudflare FAQ](https://developers.cloudflare.com/browser-run/faq/#will-browser-run-be-detected-by-bot-management)。
 - X Cookie 可能过期，抓不到推文时更新 `X_AUTH` 和 `X_CT0`
 - GitHub Actions 运行在 GitHub 服务器，X 可能限制机房 IP
 - Telegram Bot Token 和 X Cookie 都是敏感信息，只放 GitHub Secrets
