@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      max_kols:
+        description: Maximum KOLs for a manual scan (0 scans all)
+        required: false
+        default: 0
+        type: number
       send_once_key:
         description: Stable Telegram idempotency key supplied by the trigger
         required: false
@@ -147,6 +152,8 @@ jobs:
 
       - name: Send report
         shell: bash
+        env:
+          MAX_KOLS: ${{ inputs.max_kols || '0' }}
         run: |
           if [ "${{ inputs.scan_kol }}" = "true" ]; then
             if [ "${{ inputs.send_kol }}" = "true" ]; then
@@ -156,6 +163,11 @@ jobs:
               cmd=(python x_kol_daily.py --no-send)
               mode="kol-scan-only"
             fi
+            if ! [[ "$MAX_KOLS" =~ ^[0-9]+$ ]]; then
+              echo "::error::max_kols must be a non-negative integer"
+              exit 1
+            fi
+            cmd+=(--max-kols "$MAX_KOLS")
           else
             cmd=(python x_kol_daily.py --market-only --send)
             mode="market-only"
