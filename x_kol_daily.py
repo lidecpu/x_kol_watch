@@ -138,7 +138,6 @@ RECOVERABLE_X_PAGE_ERRORS = (
     PAGE_RENDER_ERROR,
     X_RATE_LIMIT_ERROR,
     X_AUTHENTICATION_REQUIRED_ERROR,
-    X_VERIFICATION_REQUIRED_ERROR,
 )
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
@@ -2610,7 +2609,21 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
+  const cloudflareChallenge = !hasTimeline && (
+    Boolean(document.querySelector(
+      '#challenge-form, #challenge-stage, #challenge-running, #cf-challenge-running, ' +
+      'iframe[src*="challenges.cloudflare.com"]'
+    )) ||
+    ((has(['cloudflare']) || Boolean(document.querySelector(
+      'script[src*="/cdn-cgi/challenge-platform/"]'
+    ))) && has([
+      'verifying you are human', 'verify you are human', 'checking your browser',
+      'performing security verification', '正在进行安全验证', '验证您不是自动程序',
+      '正在验证您是否是人类', '请验证您是人类'
+    ]))
+  );
   const verificationRequired =
+    cloudflareChallenge ||
     path.includes('/account/access') ||
     path.includes('/i/flow/account-access') ||
     path.includes('/i/flow/verify') ||
@@ -2628,6 +2641,7 @@ PAGE_HEALTH_JS = r"""
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
     verificationRequired,
+    cloudflareChallenge,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
       ((!hasMain || !hasTimeline) && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
@@ -2785,6 +2799,8 @@ def record_page_health(
         "title": str(health.get("title") or "")[:160],
         "text_sample": str(health.get("textSample") or "")[:300],
         "login_required": bool(health.get("loginRequired")),
+        "verification_required": bool(health.get("verificationRequired")),
+        "cloudflare_challenge": bool(health.get("cloudflareChallenge")),
         "error_page": bool(health.get("errorPage")),
         "account_unavailable": bool(health.get("accountUnavailable")),
         "account_unavailable_reason": str(
@@ -2814,6 +2830,60 @@ def recovery_wait_for_timeout(
         raise RecoveryBudgetExceeded("X recovery budget exhausted")
 
 
+def navigate_x_page(
+    page: Any,
+    url: str | None,
+    diagnostics: dict[str, Any] | None = None,
+    phase: str = "page",
+    deadline_monotonic: float | None = None,
+) -> None:
+    """Detect document challenges even when navigation itself raises."""
+    challenge_status: int | None = None
+
+    def observe_response(response: Any) -> None:
+        nonlocal challenge_status
+        if response.request.resource_type != "document" or response.frame != page.main_frame:
+            return
+        if response.header_value("cf-mitigated") == "challenge":
+            challenge_status = response.status
+
+    page.on("response", observe_response)
+    try:
+        options = {
+            "wait_until": "domcontentloaded",
+            "timeout": recovery_timeout_ms(45_000, deadline_monotonic),
+        }
+        try:
+            response = page.reload(**options) if url is None else page.goto(url, **options)
+        except Exception:
+            if challenge_status is None:
+                raise
+        else:
+            if response is not None:
+                observe_response(response)
+    finally:
+        page.remove_listener("response", observe_response)
+    if challenge_status is not None:
+        if diagnostics is not None:
+            diagnostics["page_health"] = {
+                "phase": phase,
+                "verification_required": True,
+                "cloudflare_challenge": True,
+                "challenge_source": "response_header",
+                "http_status": challenge_status,
+            }
+        print(
+            "[x-verification] " + json.dumps({
+                "phase": phase,
+                "source": "response_header",
+                "http_status": challenge_status,
+            }),
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR) from None
+
+
 def wait_for_x_page_ready(
     page: Any,
     wait_ms: int,
@@ -2827,7 +2897,7 @@ def wait_for_x_page_ready(
         health = page.evaluate(PAGE_HEALTH_JS)
         if any(
             health.get(key)
-            for key in ("loginRequired", "errorPage", "accountUnavailable")
+            for key in ("loginRequired", "verificationRequired", "errorPage", "accountUnavailable")
         ):
             return
         if health.get("hasMain"):
@@ -2886,10 +2956,7 @@ def ensure_x_page_healthy(
             "accountUnavailable",
         )
     ):
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
-        )
+        navigate_x_page(page, None, diagnostics, phase, deadline_monotonic)
         recovery_wait_for_timeout(page, 2500, deadline_monotonic)
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
@@ -2897,6 +2964,15 @@ def ensure_x_page_healthy(
         raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
     if health.get("verificationRequired"):
         record_page_health(diagnostics, phase, health)
+        print(
+            "[x-verification] " + json.dumps({
+                "phase": phase,
+                "source": "page",
+                "cloudflare_challenge": bool(health.get("cloudflareChallenge")),
+            }),
+            file=sys.stderr,
+            flush=True,
+        )
         raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR)
     if health.get("errorPage"):
         record_page_health(diagnostics, phase, health)
@@ -2911,7 +2987,7 @@ def ensure_x_page_healthy(
 
 def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
-    context.route("**/*", route_static_assets)
+    # Routing disables HTTP cache; keep X resources and cache behavior intact.
     context.add_cookies(cookies)
     return context
 
@@ -3259,10 +3335,9 @@ def scrape_handle_url(
     merged: dict[str, dict[str, Any]],
     deadline_monotonic: float | None = None,
 ) -> None:
-    page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=recovery_timeout_ms(45_000, deadline_monotonic),
+    navigate_x_page(
+        page, url, diagnostics, "profile" if account_page else "search_fallback",
+        deadline_monotonic,
     )
     wait_for_x_page_ready(page, page_wait_ms, deadline_monotonic)
     ensure_x_page_healthy(
@@ -3361,7 +3436,7 @@ def scrape_handle(
                 deadline_monotonic,
             )
         except Exception as exc:
-            if url_index == 0:
+            if url_index == 0 or str(exc) == X_VERIFICATION_REQUIRED_ERROR:
                 raise
             if diagnostics is not None:
                 diagnostics["search_fallback_error"] = f"{type(exc).__name__}: {exc}"
@@ -3464,10 +3539,9 @@ def rescan_page_render_failures(
         deadline_monotonic = recovery_budget.deadline()
         context = new_x_context(browser, cookies)
         page = context.new_page()
-        page.goto(
-            "https://x.com/home",
-            wait_until="domcontentloaded",
-            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
+        navigate_x_page(
+            page, "https://x.com/home", home_diagnostics, "recovery_home_probe",
+            deadline_monotonic,
         )
         recovery_wait_for_timeout(
             page,
@@ -3481,6 +3555,10 @@ def rescan_page_render_failures(
             deadline_monotonic=deadline_monotonic,
         )
     except Exception as exc:
+        if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+            if context is not None:
+                context.close()
+            raise
         probe_error = f"{type(exc).__name__}: {exc}"
         for item in pending_items:
             diagnostics = item.setdefault("diagnostics", {})
@@ -3574,6 +3652,8 @@ def rescan_page_render_failures(
                     deadline_monotonic,
                 )
             except Exception as exc:
+                if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                    raise
                 diagnostics["fresh_context_recovered"] = False
                 diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
                 diagnostics["fresh_context_diagnostics"] = retry_diagnostics
@@ -3630,7 +3710,6 @@ def scrape_all(
     recovery_budget: RecoveryBudget | None = None
     with sync_playwright() as p:
         launch_args = [
-            "--disable-gpu",
             "--disable-logging",
             chromium_log_file_arg(),
             "--no-first-run",
@@ -3643,18 +3722,27 @@ def scrape_all(
         }
         if chrome_path:
             launch_kwargs["executable_path"] = chrome_path
+        elif headless:
+            # Use full Chromium's new headless mode, not the headless shell.
+            launch_kwargs["channel"] = "chromium"
         browser = p.chromium.launch(**launch_kwargs)
         try:
+            browser_mode = (
+                "explicit-executable" if chrome_path
+                else "chromium-new-headless" if headless
+                else "chromium-headed"
+            )
+            print(
+                f"[x-browser] mode={browser_mode} assets=normal",
+                file=sys.stderr,
+                flush=True,
+            )
             context = new_x_context(browser, cookies)
             try:
                 page = context.new_page()
                 home_diagnostics: dict[str, Any] = {}
                 try:
-                    page.goto(
-                        "https://x.com/home",
-                        wait_until="domcontentloaded",
-                        timeout=45_000,
-                    )
+                    navigate_x_page(page, "https://x.com/home", home_diagnostics, "home")
                     wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
                     ensure_x_page_healthy(
                         page,
@@ -3740,6 +3828,8 @@ def scrape_all(
                                 diagnostics,
                             )
                         except Exception as exc:
+                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                raise
                             if str(exc) == ACCOUNT_UNAVAILABLE_ERROR and not rename_attempted:
                                 rename_attempted = True
                                 try:
@@ -3748,6 +3838,8 @@ def scrape_all(
                                     if renamed_handle:
                                         record_handle_alias(handle, renamed_handle)
                                 except Exception as recovery_exc:
+                                    if str(recovery_exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                        raise
                                     diagnostics["rename_error"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
                                     renamed_handle = ""
                                 if renamed_handle:
@@ -3976,6 +4068,8 @@ def scrape_all(
                                 fallback_budget.deadline(),
                             )
                         except Exception as exc:
+                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                raise
                             fallback_error = f"{type(exc).__name__}: {exc}"
                             diagnostics["search_fallback_error"] = fallback_error
                             diagnostics["search_fallback_failed"] = True
@@ -4269,21 +4363,23 @@ def recover_renamed_handle(page: Any, handle: str, page_wait_ms: int) -> tuple[s
     status_ids = cached_status_ids(handle)
     for status_id in status_ids:
         try:
-            page.goto(f"https://x.com/i/status/{status_id}", wait_until="domcontentloaded", timeout=45_000)
+            navigate_x_page(page, f"https://x.com/i/status/{status_id}", phase="rename_status")
             page.wait_for_timeout(page_wait_ms)
             ensure_x_page_healthy(page)
             candidate = canonical_handle(page.evaluate(STATUS_AUTHOR_JS, status_id))
             if not candidate or candidate.lower() == handle.lower():
                 continue
-            page.goto(
+            navigate_x_page(
+                page,
                 f"https://x.com/{urllib.parse.quote(candidate.lstrip('@'))}",
-                wait_until="domcontentloaded",
-                timeout=45_000,
+                phase="rename_profile",
             )
             page.wait_for_timeout(page_wait_ms)
             ensure_x_page_healthy(page, account_page=True)
             return candidate, len(status_ids)
-        except Exception:
+        except Exception as exc:
+            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                raise
             continue
     return "", len(status_ids)
 
