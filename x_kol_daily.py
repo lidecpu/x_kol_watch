@@ -53,6 +53,7 @@ COINGECKO_MARKET_CHART_URL = (
     "?vs_currency=usd&days=2"
 )
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+COINPAPRIKA_GLOBAL_URL = "https://api.coinpaprika.com/v1/global"
 COINGECKO_DERIVATIVES_URL = "https://api.coingecko.com/api/v3/derivatives"
 COIN_METRICS_ASSET_METRICS_URL = (
     "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
@@ -104,8 +105,9 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 20
+MARKET_SUMMARY_CACHE_VERSION = 21
 GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO = 5.0
+GLOBAL_VOLUME_MAX_AGE_SECONDS = 3600
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
@@ -1359,50 +1361,89 @@ def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
     return result
 
 
+def global_spot_volume_record(
+    current: Any,
+    percent: Any,
+    market_cap: float,
+) -> dict[str, Any]:
+    current, percent = float(current), float(percent)
+    if (
+        not math.isfinite(current) or not math.isfinite(percent)
+        or current <= 0 or current > market_cap * GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO
+        or percent <= -100
+    ):
+        raise ValueError("invalid global spot volume or 24h change")
+    previous = current / (1 + percent / 100)
+    if not math.isfinite(previous) or previous <= 0:
+        raise ValueError("invalid previous global spot volume")
+    return {
+        "current": current,
+        "delta": current - previous,
+        "percent": percent,
+        "volume_valid": True,
+    }
+
+
 def fetch_global_volume() -> dict[str, Any]:
     payload = fetch_market_json(COINGECKO_GLOBAL_URL)
     data = payload.get("data", {})
-    current = float(data.get("total_volume", {}).get("usd"))
-    percent = float(data.get("volume_change_percentage_24h_usd"))
     market_cap = float(data.get("total_market_cap", {}).get("usd"))
     market_cap_percent = float(data.get("market_cap_change_percentage_24h_usd"))
     market_cap_percentage = data.get("market_cap_percentage", {})
     btc_dominance = float(market_cap_percentage.get("btc"))
     eth_dominance = float(market_cap_percentage.get("eth"))
     if not all(math.isfinite(value) for value in (
-        current,
-        percent,
         market_cap,
         market_cap_percent,
         btc_dominance,
         eth_dominance,
     )):
         raise ValueError("non-finite CoinGecko global data")
-    if current <= 0 or market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
+    if market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
         raise ValueError("out-of-range CoinGecko global data")
-    volume_valid = current <= market_cap * GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO
-    if volume_valid:
-        divisor = 1 + percent / 100
-        if divisor <= 0:
-            raise ValueError("invalid CoinGecko global volume change")
-        previous = current / divisor
-        delta = current - previous
-    else:
-        print(
-            "[global-volume-invalid] CoinGecko total volume exceeds "
-            f"{GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO:g}x market cap; omitting spot total",
-            file=sys.stderr,
-        )
-    return {
-        "current": current if volume_valid else None,
-        "delta": delta if volume_valid else None,
-        "percent": percent if volume_valid else None,
-        "volume_valid": volume_valid,
+    result = {
+        "current": None,
+        "delta": None,
+        "percent": None,
+        "volume_valid": False,
         "market_cap": market_cap,
         "market_cap_percent": market_cap_percent,
         "btc_dominance": btc_dominance,
         "eth_dominance": eth_dominance,
     }
+    try:
+        result.update(global_spot_volume_record(
+            data.get("total_volume", {}).get("usd"),
+            data.get("volume_change_percentage_24h_usd"),
+            market_cap,
+        ))
+        result["volume_source"] = "CoinGecko"
+        return result
+    except (ValueError, TypeError, AttributeError) as exc:
+        print(
+            f"[global-volume-invalid] CoinGecko: {exc}; trying CoinPaprika",
+            file=sys.stderr,
+        )
+    try:
+        fallback = fetch_market_json(COINPAPRIKA_GLOBAL_URL)
+        updated_at = float(fallback.get("last_updated"))
+        age = cn_now().timestamp() - updated_at
+        if not math.isfinite(age) or not -300 <= age <= GLOBAL_VOLUME_MAX_AGE_SECONDS:
+            raise ValueError("stale or invalid CoinPaprika global timestamp")
+        result.update(global_spot_volume_record(
+            fallback.get("volume_24h_usd"),
+            fallback.get("volume_24h_change_24h"),
+            market_cap,
+        ))
+        result["volume_source"] = "CoinPaprika"
+        print(
+            f"[global-volume-fallback] CoinPaprika current={result['current']:.2f} "
+            f"percent={result['percent']:.2f}",
+            file=sys.stderr,
+        )
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        print(f"[global-volume-fallback-error] {type(exc).__name__}: {exc}", file=sys.stderr)
+    return result
 
 
 def fetch_chain_activity() -> dict[str, Any]:
@@ -2232,24 +2273,33 @@ def fetch_stablecoin_summary() -> str:
                 f"ETH占比 {global_volume['eth_dominance']:.2f}%"
             )
         if global_volume_valid:
+            volume_source = global_volume.get("volume_source", "CoinGecko")
+            source_label = f" | 来源 {volume_source}" if volume_source != "CoinGecko" else ""
             spot_lines.append(
                 f"全网 {global_volume['current'] / 1e8:.2f}亿 | "
                 f"{signed_yi(global_volume['delta'])}（{global_volume['percent']:+.2f}%）"
+                f"{source_label}"
             )
+    if not global_volume_valid:
+        spot_lines.append("全网 暂不可用")
     if dex_volume:
         spot_lines.append(
             f"DEX {dex_volume['current'] / 1e8:.2f}亿 | "
             f"{signed_yi(dex_volume['delta'])}（{dex_volume['percent']:+.2f}%）"
         )
+    cex_available = False
     if global_volume_valid and dex_volume:
         cex_current = global_volume["current"] - dex_volume["current"]
         cex_delta = global_volume["delta"] - dex_volume["delta"]
         cex_previous = cex_current - cex_delta
         if cex_current >= 0 and cex_previous > 0:
+            cex_available = True
             spot_lines.append(
                 f"CEX估算 {cex_current / 1e8:.2f}亿 | "
                 f"{signed_yi(cex_delta)}（{cex_delta / cex_previous * 100:+.2f}%）"
             )
+    if not cex_available:
+        spot_lines.append("CEX估算 暂不可用")
     if spot_lines:
         market_lines.extend(["市场现货（亿美元）", *spot_lines])
     if derivatives_volume:

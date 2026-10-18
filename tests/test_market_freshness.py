@@ -253,25 +253,165 @@ class GlobalVolumeTests(unittest.TestCase):
             }
         }
 
-    def test_implausible_volume_is_omitted_but_market_data_is_kept(self):
+    def _fallback(self, volume=1.2e11, percent=20.0, age=0):
+        return {
+            "volume_24h_usd": volume,
+            "volume_24h_change_24h": percent,
+            "last_updated": market.cn_now().timestamp() - age,
+        }
+
+    def test_implausible_volume_uses_fallback_and_keeps_market_data(self):
         with patch.object(
-            market, "fetch_market_json", return_value=self._payload(5.4e13, -69.0)
+            market, "fetch_market_json", side_effect=[
+                self._payload(5.4e13, -69.0), self._fallback(),
+            ],
+        ) as fetch:
+            result = market.fetch_global_volume()
+        self.assertTrue(result["volume_valid"])
+        self.assertEqual(result["current"], 1.2e11)
+        self.assertAlmostEqual(result["delta"], 2e10)
+        self.assertEqual(result["percent"], 20.0)
+        self.assertEqual(result["volume_source"], "CoinPaprika")
+        self.assertEqual(result["market_cap"], 2.7e12)
+        self.assertEqual(result["eth_dominance"], 11.0)
+        self.assertEqual(fetch.call_args.args[0], market.COINPAPRIKA_GLOBAL_URL)
+
+    def test_failed_fallback_keeps_market_data_without_fake_volume(self):
+        with patch.object(
+            market, "fetch_market_json", side_effect=[
+                self._payload(5.4e13, -69.0), OSError("unavailable"),
+            ],
         ):
             result = market.fetch_global_volume()
         self.assertFalse(result["volume_valid"])
         self.assertIsNone(result["current"])
         self.assertIsNone(result["delta"])
+        self.assertIsNone(result["percent"])
         self.assertEqual(result["market_cap"], 2.7e12)
         self.assertEqual(result["eth_dominance"], 11.0)
 
     def test_normal_volume_is_returned(self):
         with patch.object(
             market, "fetch_market_json", return_value=self._payload(1.0e11)
-        ):
+        ) as fetch:
             result = market.fetch_global_volume()
+        fetch.assert_called_once_with(market.COINGECKO_GLOBAL_URL)
         self.assertTrue(result["volume_valid"])
         self.assertEqual(result["current"], 1.0e11)
         self.assertGreater(result["delta"], 0)
+        self.assertEqual(result["volume_source"], "CoinGecko")
+
+    def test_invalid_primary_volume_or_change_uses_fallback(self):
+        for volume, percent in (
+            (None, 10), (float("nan"), 10), (float("inf"), 10),
+            (-1, 10), (0, 10), (1e11, None), (1e11, float("nan")),
+            (1e11, -100), (1e11, -101),
+        ):
+            with self.subTest(volume=volume, percent=percent), patch.object(
+                market, "fetch_market_json", side_effect=[
+                    self._payload(volume, percent), self._fallback(),
+                ],
+            ):
+                result = market.fetch_global_volume()
+            self.assertEqual(result["volume_source"], "CoinPaprika")
+
+    def test_invalid_or_stale_fallback_is_rejected(self):
+        fallbacks = [
+            self._fallback(volume=5.4e13),
+            self._fallback(volume=float("nan")),
+            self._fallback(volume=0),
+            self._fallback(percent=-100),
+            self._fallback(percent=float("inf")),
+            self._fallback(age=market.GLOBAL_VOLUME_MAX_AGE_SECONDS + 1),
+            self._fallback(age=-600),
+            self._fallback() | {"last_updated": None},
+            self._fallback() | {"last_updated": float("nan")},
+        ]
+        for fallback in fallbacks:
+            with self.subTest(fallback=fallback), patch.object(
+                market, "fetch_market_json", side_effect=[
+                    self._payload(5.4e13), fallback,
+                ],
+            ):
+                result = market.fetch_global_volume()
+            self.assertFalse(result["volume_valid"])
+            self.assertIsNone(result["current"])
+
+    def test_zero_and_negative_fallback_changes_are_preserved(self):
+        for percent in (0, -20):
+            with self.subTest(percent=percent), patch.object(
+                market, "fetch_market_json", side_effect=[
+                    self._payload(5.4e13), self._fallback(percent=percent),
+                ],
+            ):
+                result = market.fetch_global_volume()
+            previous = 1.2e11 / (1 + percent / 100)
+            self.assertAlmostEqual(result["delta"], 1.2e11 - previous)
+            self.assertEqual(result["percent"], percent)
+
+
+class GlobalVolumeRenderingTests(unittest.TestCase):
+    def _summary(self, global_volume, dex_volume=None):
+        dex_volume = dex_volume or {
+            "current": 1e10, "delta": 2e9, "percent": 25.0,
+        }
+        with patch.multiple(
+            market,
+            load_market_summary_cache=lambda: ("", None, None),
+            refresh_cached_summary_etf=lambda summary, _: summary,
+            previous_derivatives_volume=lambda _: None,
+            previous_eth_staking_total=lambda _: None,
+            fetch_dex_volume=lambda: dex_volume,
+            fetch_global_volume=lambda: global_volume,
+            fetch_chain_activity=lambda: {},
+            fetch_derivatives_volume=lambda: 1e11,
+            fetch_eth_staking_metrics=lambda: {},
+            fetch_us_treasury_debt=lambda: {},
+            fetch_us_treasury_yields=lambda: {},
+            fetch_stablecoin_supply=lambda: {},
+            fetch_stablecoin_volumes=lambda: {},
+            fetch_strategy_btc=lambda: {},
+            load_strategy_btc_cache=lambda: {},
+            fetch_us_macro_calendar=lambda: {},
+            fetch_bitmine_eth=lambda: {},
+            fetch_coinglass_snapshot=lambda: {},
+            fetch_spot_etf_flow_snapshot=lambda: {},
+            save_derivatives_snapshot=lambda *_: None,
+            save_eth_staking_snapshot=lambda *_: None,
+            save_json=lambda *_: None,
+        ):
+            return market.fetch_stablecoin_summary()
+
+    def _volume(self):
+        return {
+            **market.global_spot_volume_record(1.2e11, 20, 2.7e12),
+            "volume_source": "CoinPaprika",
+            "market_cap": 2.7e12,
+            "market_cap_percent": -2.0,
+            "btc_dominance": 60.0,
+            "eth_dominance": 11.0,
+        }
+
+    def test_fallback_total_dex_and_cex_use_consistent_changes(self):
+        summary = self._summary(self._volume())
+        self.assertIn("全网 1200.00亿 | +200.00亿（+20.00%） | 来源 CoinPaprika", summary)
+        self.assertIn("DEX 100.00亿 | +20.00亿（+25.00%）", summary)
+        self.assertIn("CEX估算 1100.00亿 | +180.00亿（+19.57%）", summary)
+        self.assertNotIn("暂不可用", summary)
+
+    def test_both_sources_failed_are_visible_as_unavailable(self):
+        summary = self._summary({})
+        self.assertIn("全网 暂不可用", summary)
+        self.assertIn("DEX 100.00亿", summary)
+        self.assertIn("CEX估算 暂不可用", summary)
+
+    def test_cex_is_not_negative_when_total_is_less_than_dex(self):
+        summary = self._summary(self._volume(), {
+            "current": 2e11, "delta": 2e10, "percent": 100 / 9,
+        })
+        self.assertIn("全网 1200.00亿", summary)
+        self.assertIn("CEX估算 暂不可用", summary)
+        self.assertNotIn("CEX估算 -", summary)
 
 
 class ChainDateTests(unittest.TestCase):
