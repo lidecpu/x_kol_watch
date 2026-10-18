@@ -103,6 +103,7 @@ class StrategyParsingTests(unittest.TestCase):
         self.assertEqual(record["holdings"], 900000)
         self.assertEqual(record["change"], 334)
         self.assertEqual(record["verification_source"], "SEC")
+        self.assertEqual(record["latest_filing_date"], dt.date(2026, 10, 6))
 
     def test_website_403_uses_sec(self):
         error = urllib.error.HTTPError(market.STRATEGY_PURCHASES_URL, 403, "Forbidden", {}, None)
@@ -113,7 +114,11 @@ class StrategyParsingTests(unittest.TestCase):
 
     def test_cache_preserves_verification_and_cutoff(self):
         record = market.parse_strategy_btc_sec(split_tables())
-        record.update(verified_date=dt.date(2026, 10, 7), verification_source="SEC")
+        record.update(
+            verified_date=dt.date(2026, 10, 7),
+            verification_source="SEC",
+            latest_filing_date=dt.date(2026, 10, 6),
+        )
         with patch.object(market, "load_json", return_value={}), \
                 patch.object(market, "save_json") as save:
             market.save_strategy_btc_cache(record)
@@ -122,6 +127,7 @@ class StrategyParsingTests(unittest.TestCase):
             restored = market.load_strategy_btc_cache()
         self.assertEqual(restored["holdings_as_of_time"], "04:00")
         self.assertEqual(restored["verification_source"], "SEC")
+        self.assertEqual(restored["latest_filing_date"], dt.date(2026, 10, 6))
         self.assertEqual(restored["change"], 334)
 
     def test_cached_holdings_label_preserves_cutoff_without_timezone(self):
@@ -129,6 +135,54 @@ class StrategyParsingTests(unittest.TestCase):
         expected = "BTC持仓 900,000枚 | 持仓截至 10-05 04:00 | SEC核验 10-07"
         self.assertEqual(market.normalize_stablecoin_summary_labels(old), expected)
         self.assertEqual(market.normalize_stablecoin_summary_labels(expected), expected)
+
+    def test_latest_filing_date_is_preserved_separately_from_verification_date(self):
+        record = market.parse_strategy_btc_sec(split_tables())
+        record.update(
+            verified_date=dt.date(2026, 10, 18),
+            latest_filing_date=dt.date(2026, 10, 16),
+            verification_source="SEC",
+        )
+        with patch.object(market, "load_json", return_value={}), \
+                patch.object(market, "save_json") as save:
+            market.save_strategy_btc_cache(record)
+        saved = save.call_args.args[1]
+        with patch.object(market, "load_json", return_value=saved):
+            restored = market.load_strategy_btc_cache()
+        self.assertEqual(restored["latest_filing_date"], dt.date(2026, 10, 16))
+        self.assertEqual(restored["verified_date"], dt.date(2026, 10, 18))
+
+class GlobalVolumeTests(unittest.TestCase):
+    def _payload(self, volume, percent=10.0):
+        return {
+            "data": {
+                "total_volume": {"usd": volume},
+                "volume_change_percentage_24h_usd": percent,
+                "total_market_cap": {"usd": 2.7e12},
+                "market_cap_change_percentage_24h_usd": -2.0,
+                "market_cap_percentage": {"btc": 60.0, "eth": 11.0},
+            }
+        }
+
+    def test_implausible_volume_is_omitted_but_market_data_is_kept(self):
+        with patch.object(
+            market, "fetch_market_json", return_value=self._payload(5.4e13, -69.0)
+        ):
+            result = market.fetch_global_volume()
+        self.assertFalse(result["volume_valid"])
+        self.assertIsNone(result["current"])
+        self.assertIsNone(result["delta"])
+        self.assertEqual(result["market_cap"], 2.7e12)
+        self.assertEqual(result["eth_dominance"], 11.0)
+
+    def test_normal_volume_is_returned(self):
+        with patch.object(
+            market, "fetch_market_json", return_value=self._payload(1.0e11)
+        ):
+            result = market.fetch_global_volume()
+        self.assertTrue(result["volume_valid"])
+        self.assertEqual(result["current"], 1.0e11)
+        self.assertGreater(result["delta"], 0)
 
 
 class ChainDateTests(unittest.TestCase):

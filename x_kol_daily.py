@@ -104,7 +104,8 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 19
+MARKET_SUMMARY_CACHE_VERSION = 20
+GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO = 5.0
 STRATEGY_BTC_CACHE_VERSION = 2
 # Migration seed for caches created before Strategy had its own record.
 STRATEGY_BTC_LAST_VALID = {
@@ -138,7 +139,6 @@ RECOVERABLE_X_PAGE_ERRORS = (
     PAGE_RENDER_ERROR,
     X_RATE_LIMIT_ERROR,
     X_AUTHENTICATION_REQUIRED_ERROR,
-    X_VERIFICATION_REQUIRED_ERROR,
 )
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
@@ -979,6 +979,10 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         })
     if not candidates:
         raise ValueError("missing Strategy SEC 8-K filing")
+    latest_filing_date = max(
+        dt.date.fromisoformat(item["filing_date"])
+        for item in candidates
+    )
     for filing in sorted(candidates, key=lambda item: item["filing_date"], reverse=True)[:5]:
         accession_path = filing["accession"].replace("-", "")
         release_url = (
@@ -1002,6 +1006,7 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         record["change"] = previous["change"]
     record["verified_date"] = cn_now().date()
     record["verification_source"] = "SEC"
+    record["latest_filing_date"] = latest_filing_date
     print(
         f"[strategy-btc-sec] filing={filing['filing_date']} "
         f"holdings={record['holdings']} as_of={record['holdings_as_of']}",
@@ -1033,6 +1038,13 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         }
     except (KeyError, TypeError, ValueError, OverflowError):
         return {}
+    latest_filing_raw = value.get("latest_filing_date")
+    if latest_filing_raw:
+        try:
+            latest_filing_date = parse_date(latest_filing_raw)
+        except (TypeError, ValueError):
+            return {}
+        record["latest_filing_date"] = latest_filing_date
     if value.get("verification_source") == "SEC":
         record["verification_source"] = "SEC"
     cutoff_time = str(value.get("holdings_as_of_time") or "")
@@ -1052,6 +1064,13 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         or record["record_date"] > record["verified_date"]
         or record["record_date"] > record["holdings_as_of"]
         or record["holdings_as_of"] > record["verified_date"]
+        or (
+            "latest_filing_date" in record
+            and (
+                record["latest_filing_date"] < record["record_date"]
+                or record["latest_filing_date"] > record["verified_date"]
+            )
+        )
     ):
         return {}
     return record
@@ -1078,6 +1097,10 @@ def save_strategy_btc_cache(record: dict[str, Any]) -> None:
     for key in ("verification_source", "holdings_as_of_time"):
         if key in normalized:
             state["strategy_btc"][key] = normalized[key]
+    if "latest_filing_date" in normalized:
+        state["strategy_btc"]["latest_filing_date"] = (
+            normalized["latest_filing_date"].isoformat()
+        )
     save_json(MARKET_STATE, state)
 
 
@@ -1313,7 +1336,7 @@ def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
     return result
 
 
-def fetch_global_volume() -> dict[str, float]:
+def fetch_global_volume() -> dict[str, Any]:
     payload = fetch_market_json(COINGECKO_GLOBAL_URL)
     data = payload.get("data", {})
     current = float(data.get("total_volume", {}).get("usd"))
@@ -1323,9 +1346,6 @@ def fetch_global_volume() -> dict[str, float]:
     market_cap_percentage = data.get("market_cap_percentage", {})
     btc_dominance = float(market_cap_percentage.get("btc"))
     eth_dominance = float(market_cap_percentage.get("eth"))
-    divisor = 1 + percent / 100
-    if divisor <= 0:
-        raise ValueError("invalid CoinGecko global volume change")
     if not all(math.isfinite(value) for value in (
         current,
         percent,
@@ -1335,13 +1355,26 @@ def fetch_global_volume() -> dict[str, float]:
         eth_dominance,
     )):
         raise ValueError("non-finite CoinGecko global data")
-    if current < 0 or market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
+    if current <= 0 or market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
         raise ValueError("out-of-range CoinGecko global data")
-    previous = current / divisor
+    volume_valid = current <= market_cap * GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO
+    if volume_valid:
+        divisor = 1 + percent / 100
+        if divisor <= 0:
+            raise ValueError("invalid CoinGecko global volume change")
+        previous = current / divisor
+        delta = current - previous
+    else:
+        print(
+            "[global-volume-invalid] CoinGecko total volume exceeds "
+            f"{GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO:g}x market cap; omitting spot total",
+            file=sys.stderr,
+        )
     return {
-        "current": current,
-        "delta": current - previous,
-        "percent": percent,
+        "current": current if volume_valid else None,
+        "delta": delta if volume_valid else None,
+        "percent": percent if volume_valid else None,
+        "volume_valid": volume_valid,
         "market_cap": market_cap,
         "market_cap_percent": market_cap_percent,
         "btc_dominance": btc_dominance,
@@ -2090,6 +2123,9 @@ def fetch_stablecoin_summary() -> str:
 
     dex_volume = fetched.get("dex_volume", {})
     global_volume = fetched.get("global_volume", {})
+    global_volume_valid = bool(global_volume.get("volume_valid", True)) if global_volume else False
+    if global_volume and not global_volume_valid:
+        market_fetch_failed = True
     chain_activity = fetched.get("chain_activity", {})
     strategy_btc = fetched.get("strategy_btc", {})
     if strategy_btc:
@@ -2172,16 +2208,17 @@ def fetch_stablecoin_summary() -> str:
                 f"BTC占比 {global_volume['btc_dominance']:.2f}% | "
                 f"ETH占比 {global_volume['eth_dominance']:.2f}%"
             )
-        spot_lines.append(
-            f"全网 {global_volume['current'] / 1e8:.2f}亿 | "
-            f"{signed_yi(global_volume['delta'])}（{global_volume['percent']:+.2f}%）"
-        )
+        if global_volume_valid:
+            spot_lines.append(
+                f"全网 {global_volume['current'] / 1e8:.2f}亿 | "
+                f"{signed_yi(global_volume['delta'])}（{global_volume['percent']:+.2f}%）"
+            )
     if dex_volume:
         spot_lines.append(
             f"DEX {dex_volume['current'] / 1e8:.2f}亿 | "
             f"{signed_yi(dex_volume['delta'])}（{dex_volume['percent']:+.2f}%）"
         )
-    if global_volume and dex_volume:
+    if global_volume_valid and dex_volume:
         cex_current = global_volume["current"] - dex_volume["current"]
         cex_delta = global_volume["delta"] - dex_volume["delta"]
         cex_previous = cex_current - cex_delta
@@ -2328,6 +2365,14 @@ def fetch_stablecoin_summary() -> str:
         verification_label = (
             "SEC核验" if strategy_btc.get("verification_source") == "SEC" else "官网核验"
         )
+        latest_filing_date = strategy_btc.get("latest_filing_date")
+        if (
+            strategy_btc.get("verification_source") == "SEC"
+            and isinstance(latest_filing_date, dt.date)
+        ):
+            verification_label = (
+                f"SEC最新申报 {latest_filing_date.strftime('%m-%d')} | SEC核验"
+            )
         strategy_lines.extend([
             "Strategy（微策略）",
             f"BTC持仓 {strategy_btc['holdings']:,}枚 | 持仓截至 {holdings_as_of} | {verification_label} {verified_date}",
@@ -2524,6 +2569,381 @@ def cookies_from_env() -> list[dict[str, Any]]:
     return cookies
 
 
+def x_snowflake_created_at(url: str, now: dt.datetime) -> dt.datetime | None:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if (
+            parts.scheme != "https" or parts.hostname not in {"x.com", "twitter.com"}
+            or parts.username or parts.password or parts.port
+            or parts.query or parts.fragment
+        ):
+            return None
+        match = re.fullmatch(r"/[A-Za-z0-9_]{1,32}/status/([1-9][0-9]{14,19})", parts.path)
+        if not match:
+            return None
+        identifier = int(match[1])
+        if identifier >= 1 << 63:
+            return None
+        # X Snowflake: 41 timestamp bits, then 22 worker/sequence bits.
+        # https://github.com/twitter-archive/snowflake/tree/snowflake-2010
+        created = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(
+            milliseconds=(identifier >> 22) + 1288834974657,
+        )
+        return created if created <= now else None
+    except (ValueError, OverflowError):
+        return None
+
+
+class CloudflareTweetParser(HTMLParser):
+    """Parse profile timestamps from DOM or the documented X Snowflake format."""
+
+    def __init__(self, handle: str) -> None:
+        super().__init__()
+        self.handle = handle
+        self.articles: list[dict[str, Any]] = []
+        self.current: dict[str, Any] | None = None
+        self.stack: list[str] = []
+        self.article_depth = 0
+        self.body_depth = 0
+        self.link_depth = 0
+        self.button_depth = 0
+        self.button_parts: list[str] = []
+        self.page_title_parts: list[str] = []
+        self.in_title = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "title":
+            self.in_title = True
+        if tag not in {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }:
+            self.stack.append(tag)
+        depth = len(self.stack)
+        if tag == "article":
+            self.article_depth += 1
+            if self.article_depth == 1:
+                self.current = {
+                    "url": "", "datetime": "", "body": [], "quote_before_body": False,
+                    "body_found": False, "format": "", "truncated": False,
+                }
+                self.articles.append(self.current)
+        if self.current is None or self.article_depth != 1:
+            return
+        if tag == "a":
+            href = str(attributes.get("href") or "")
+            try:
+                parts = urllib.parse.urlsplit(urllib.parse.urljoin("https://x.com", href))
+                valid_origin = (
+                    parts.scheme == "https" and parts.hostname in {"x.com", "twitter.com"}
+                    and not parts.username and not parts.password and not parts.port
+                )
+            except ValueError:
+                return
+            match = re.fullmatch(r"/([A-Za-z0-9_]{1,32})/status/([0-9]+)", parts.path)
+            if (
+                not self.current["url"] and match
+                and valid_origin
+                and not self.body_depth
+            ):
+                self.current["url"] = f"https://x.com/{match[1]}/status/{match[2]}"
+                self.link_depth = depth
+            elif match and self.current["url"] and not self.current["body_found"]:
+                self.current["quote_before_body"] = True
+        if tag == "time" and self.link_depth:
+            self.current["datetime"] = str(attributes.get("datetime") or "")
+        classes = set(str(attributes.get("class") or "").split())
+        standard_body = attributes.get("data-testid") == "tweetText"
+        alternate_body = tag == "div" and {"text-primary", "whitespace-pre-wrap"} <= classes
+        if (
+            not self.current["body_found"] and not self.current["quote_before_body"]
+            and (standard_body or alternate_body)
+        ):
+            self.current["body_found"] = True
+            self.current["format"] = "standard" if standard_body else "alternate"
+            self.body_depth = depth
+        if self.body_depth and tag == "br":
+            self.current["body"].append(" ")
+        if self.body_depth and tag == "button":
+            self.button_depth = depth
+            self.button_parts = []
+            if attributes.get("data-testid") == "tweet-text-show-more-link":
+                self.current["truncated"] = True
+        if self.body_depth and tag == "img" and attributes.get("alt"):
+            self.current["body"].append(str(attributes["alt"]))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self.in_title = False
+        if tag not in self.stack:
+            return
+        depth = len(self.stack) - self.stack[::-1].index(tag)
+        if self.button_depth >= depth and self.button_depth:
+            if self.current and "".join(self.button_parts).strip().casefold() in {
+                "show more", "显示更多", "顯示更多",
+            }:
+                self.current["truncated"] = True
+            self.button_depth = 0
+        if self.body_depth >= depth:
+            self.body_depth = 0
+        if self.link_depth >= depth:
+            self.link_depth = 0
+        del self.stack[depth - 1:]
+        if tag == "article":
+            self.article_depth = max(0, self.article_depth - 1)
+            if not self.article_depth:
+                self.current = None
+                self.body_depth = self.link_depth = self.button_depth = 0
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.page_title_parts.append(data)
+        if self.current and self.article_depth == 1 and self.body_depth:
+            if self.button_depth:
+                self.button_parts.append(data)
+            else:
+                self.current["body"].append(data)
+
+    def snapshot(self, hours: int, now: dt.datetime) -> dict[str, Any]:
+        cutoff = now - dt.timedelta(hours=hours)
+        rows: dict[str, dt.datetime] = {}
+        missing_times = missing_bodies = truncated = matching = 0
+        recent_body_errors = recent_truncated = 0
+        formats: set[str] = set()
+        timestamp_sources: dict[str, int] = {}
+        visible_times: list[dt.datetime] = []
+        for article in self.articles:
+            url = article["url"]
+            if not url:
+                continue
+            author = urllib.parse.urlsplit(url).path.split("/")[1]
+            if author.casefold() != self.handle.lstrip("@").casefold():
+                continue
+            matching += 1
+            if article["format"]:
+                formats.add(article["format"])
+            text = " ".join("".join(article["body"]).split())
+            missing_bodies += not bool(text)
+            truncated += bool(article["truncated"])
+            try:
+                source = "dom_datetime"
+                if article["datetime"]:
+                    created = dt.datetime.fromisoformat(article["datetime"].replace("Z", "+00:00"))
+                elif article["format"] == "alternate":
+                    created = x_snowflake_created_at(url, now)
+                    source = "x_snowflake"
+                else:
+                    created = None
+                if created is None or created.utcoffset() is None or created > now:
+                    raise ValueError("unknown or future timestamp")
+            except ValueError:
+                missing_times += 1
+                continue
+            timestamp_sources[source] = timestamp_sources.get(source, 0) + 1
+            visible_times.append(created.astimezone(dt.timezone.utc))
+            if created < cutoff:
+                continue
+            if not text:
+                recent_body_errors += 1
+                continue
+            if article["truncated"]:
+                recent_truncated += 1
+                continue
+            rows[url] = created.astimezone(dt.timezone.utc)
+        error = ""
+        title = "".join(self.page_title_parts).strip().casefold()
+        if title in {"just a moment...", "attention required! | cloudflare"}:
+            error = "verification_required"
+        elif missing_times:
+            error = "timestamp_missing"
+        elif recent_truncated:
+            error = "text_truncated"
+        elif recent_body_errors:
+            error = "body_missing"
+        elif not matching:
+            error = "profile_not_verified"
+        in_order = all(
+            left >= right
+            for left, right in zip(visible_times, visible_times[1:])
+        )
+        newest = max(visible_times) if visible_times else None
+        oldest = min(visible_times) if visible_times else None
+        if error:
+            coverage = "snapshot_error"
+        elif not visible_times:
+            coverage = "snapshot_unknown"
+        elif newest >= cutoff:
+            coverage = "snapshot_recent_visible"
+        elif in_order:
+            coverage = "snapshot_no_recent_visible"
+        else:
+            coverage = "snapshot_order_unknown"
+        return {
+            "status": "error" if error else "snapshot_ok",
+            "error": error,
+            "coverage": coverage,
+            "page_format": "+".join(sorted(formats)) or "unknown",
+            "articles": len(self.articles),
+            "matching_articles": matching,
+            "missing_timestamps": missing_times,
+            "missing_bodies": missing_bodies,
+            "truncated_tweets": truncated,
+            "parsed_tweets": len(rows),
+            "timestamp_sources": timestamp_sources,
+            "recent_created_at_utc": [
+                created.isoformat(timespec="milliseconds")
+                for created in sorted(rows.values(), reverse=True)
+            ],
+            "visible_newest_created_at_utc": (
+                newest.isoformat(timespec="milliseconds") if newest else ""
+            ),
+            "visible_oldest_created_at_utc": (
+                oldest.isoformat(timespec="milliseconds") if oldest else ""
+            ),
+            "visible_order_descending": bool(visible_times) and in_order,
+        }
+
+
+def cloudflare_browser_account_id() -> str:
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+    if not account_id:
+        for path in (
+            ROOT / "cloudflare-worker" / ".wrangler" / "cache" / "wrangler-account.json",
+            ROOT / ".wrangler" / "cache" / "wrangler-account.json",
+        ):
+            if not path.exists():
+                continue
+            try:
+                cache = json.loads(path.read_text(encoding="utf-8"))
+                account = cache["account"]
+                account_id = account["id"] if isinstance(account, dict) else account
+            except (OSError, ValueError, KeyError, TypeError):
+                raise RuntimeError("invalid Cloudflare account cache; set CLOUDFLARE_ACCOUNT_ID") from None
+            break
+    if not isinstance(account_id, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", account_id):
+        raise RuntimeError("missing or invalid CLOUDFLARE_ACCOUNT_ID")
+    return account_id
+
+
+def cloudflare_probe(kols: list[dict[str, str]], hours: int) -> list[dict[str, Any]]:
+    if not 1 <= len(kols) <= 2 or hours <= 0:
+        raise ValueError("Cloudflare probe requires 1-2 KOLs and positive hours")
+    token = os.environ.get("CLOUDFLARE_BROWSER_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("missing CLOUDFLARE_BROWSER_API_TOKEN")
+    account_id = cloudflare_browser_account_id()
+    cookies = [cookie for cookie in cookies_from_env() if cookie["domain"] == ".x.com"]
+    endpoint = (
+        f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+        "/browser-rendering/content?cacheTTL=0"
+    )
+    results: list[dict[str, Any]] = []
+    for index, kol in enumerate(kols):
+        handle = canonical_handle(kol.get("handle"))
+        if not handle:
+            raise ValueError("invalid Cloudflare probe handle")
+        if index:
+            time.sleep(12)
+        payload = {
+            "url": f"https://x.com/{handle.lstrip('@')}",
+            "cookies": cookies,
+            "gotoOptions": {"waitUntil": "networkidle2", "timeout": 45000},
+            "waitForTimeout": 4000,
+        }
+        request = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        outcome: dict[str, Any] = {
+            "handle": handle, "backend": "cloudflare_content",
+            "status": "error", "coverage": "snapshot_error", "error": "",
+        }
+        try:
+            with urllib.request.urlopen(request, timeout=75) as response:
+                data = json.load(response)
+                outcome["api_status"] = response.status
+                browser_ms = response.headers.get("X-Browser-Ms-Used")
+                try:
+                    usage = float(browser_ms)
+                    if math.isfinite(usage) and usage >= 0:
+                        outcome["browser_ms"] = round(usage, 1)
+                except (TypeError, ValueError):
+                    pass
+        except urllib.error.HTTPError as exc:
+            outcome["api_status"] = exc.code
+            outcome["error"] = "cloudflare_rate_limit" if exc.code == 429 else "cloudflare_http_error"
+            try:
+                if exc.code == 429:
+                    try:
+                        retry_after = int(exc.headers.get("Retry-After", ""))
+                        if retry_after > 0:
+                            outcome["retry_after_seconds"] = retry_after
+                    except ValueError:
+                        pass
+                    try:
+                        body = json.load(exc)
+                        errors = body.get("errors", []) if isinstance(body, dict) else []
+                        messages = " ".join(
+                            str(error.get("message") or "").casefold()
+                            for error in errors if isinstance(error, dict)
+                        )
+                        if "daily" in messages and any(word in messages for word in ("limit", "quota")):
+                            outcome["error"] = "cloudflare_daily_quota"
+                    except (ValueError, TypeError):
+                        pass
+            finally:
+                exc.close()
+            results.append(outcome)
+            break
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            outcome["error"] = "cloudflare_request_failed"
+            results.append(outcome)
+            break
+        if not isinstance(data, dict) or data.get("success") is not True:
+            outcome["error"] = "cloudflare_api_error"
+        elif not isinstance(data.get("result"), str) or not isinstance(data.get("meta"), dict):
+            outcome["error"] = "cloudflare_invalid_response"
+        else:
+            meta = data["meta"]
+            origin_headers = meta.get("headers", {})
+            origin_status = meta.get("status")
+            if type(origin_status) is not int or not 100 <= origin_status <= 599:
+                outcome["error"] = "cloudflare_invalid_response"
+                results.append(outcome)
+                break
+            outcome["origin_status"] = origin_status
+            try:
+                final_url = urllib.parse.urlsplit(str(meta.get("finalUrl") or ""))
+            except ValueError:
+                outcome["error"] = "cloudflare_invalid_response"
+                results.append(outcome)
+                break
+            if isinstance(origin_headers, dict) and origin_headers.get("cf-mitigated") == "challenge":
+                outcome["error"] = "verification_required"
+            elif final_url.path.startswith(("/i/flow/login", "/login", "/account/access")):
+                outcome["error"] = "authentication_required"
+            elif final_url.path.startswith(("/i/jf/onboarding/", "/i/flow/signup")):
+                outcome["error"] = "account_setup_required"
+            elif meta.get("status") == 429:
+                outcome["error"] = "x_rate_limit"
+            elif meta.get("status") != 200:
+                outcome["error"] = "x_http_error"
+            elif (
+                final_url.scheme != "https" or final_url.hostname not in {"x.com", "twitter.com"}
+                or final_url.path.rstrip("/").casefold() != f"/{handle.lstrip('@')}".casefold()
+            ):
+                outcome["error"] = "profile_not_verified"
+            else:
+                parser = CloudflareTweetParser(handle)
+                parser.feed(data["result"])
+                outcome.update(parser.snapshot(hours, dt.datetime.now(dt.timezone.utc)))
+        results.append(outcome)
+        if outcome["status"] == "error":
+            break
+    return results
+
+
 def route_static_assets(route: Any) -> None:
     req = route.request
     if req.resource_type in {"image", "media", "font"}:
@@ -2610,7 +3030,21 @@ PAGE_HEALTH_JS = r"""
   const accountSuspended = stateMatches([
     'account suspended', '账号已被冻结'
   ]);
+  const cloudflareChallenge = !hasTimeline && (
+    Boolean(document.querySelector(
+      '#challenge-form, #challenge-stage, #challenge-running, #cf-challenge-running, ' +
+      'iframe[src*="challenges.cloudflare.com"]'
+    )) ||
+    ((has(['cloudflare']) || Boolean(document.querySelector(
+      'script[src*="/cdn-cgi/challenge-platform/"]'
+    ))) && has([
+      'verifying you are human', 'verify you are human', 'checking your browser',
+      'performing security verification', '正在进行安全验证', '验证您不是自动程序',
+      '正在验证您是否是人类', '请验证您是人类'
+    ]))
+  );
   const verificationRequired =
+    cloudflareChallenge ||
     path.includes('/account/access') ||
     path.includes('/i/flow/account-access') ||
     path.includes('/i/flow/verify') ||
@@ -2628,6 +3062,7 @@ PAGE_HEALTH_JS = r"""
     loginRequired: path.includes('/i/flow/login') || path === '/login' ||
       Boolean(document.querySelector('input[autocomplete="username"]')),
     verificationRequired,
+    cloudflareChallenge,
     errorPage: Boolean(document.querySelector('[data-testid="error-detail"]')) ||
       ((!hasMain || !hasTimeline) && has([
         'rate limit exceeded', 'something went wrong', 'try reloading',
@@ -2785,6 +3220,8 @@ def record_page_health(
         "title": str(health.get("title") or "")[:160],
         "text_sample": str(health.get("textSample") or "")[:300],
         "login_required": bool(health.get("loginRequired")),
+        "verification_required": bool(health.get("verificationRequired")),
+        "cloudflare_challenge": bool(health.get("cloudflareChallenge")),
         "error_page": bool(health.get("errorPage")),
         "account_unavailable": bool(health.get("accountUnavailable")),
         "account_unavailable_reason": str(
@@ -2814,6 +3251,51 @@ def recovery_wait_for_timeout(
         raise RecoveryBudgetExceeded("X recovery budget exhausted")
 
 
+def navigate_x_page(
+    page: Any,
+    url: str | None,
+    diagnostics: dict[str, Any] | None = None,
+    phase: str = "page",
+    deadline_monotonic: float | None = None,
+) -> None:
+    """Detect document challenges even when navigation itself raises."""
+    challenge_status: int | None = None
+
+    def observe_response(response: Any) -> None:
+        nonlocal challenge_status
+        if response.request.resource_type != "document" or response.frame != page.main_frame:
+            return
+        if response.header_value("cf-mitigated") == "challenge":
+            challenge_status = response.status
+
+    page.on("response", observe_response)
+    try:
+        options = {
+            "wait_until": "domcontentloaded",
+            "timeout": recovery_timeout_ms(45_000, deadline_monotonic),
+        }
+        try:
+            response = page.reload(**options) if url is None else page.goto(url, **options)
+        except Exception:
+            if challenge_status is None:
+                raise
+        else:
+            if response is not None:
+                observe_response(response)
+    finally:
+        page.remove_listener("response", observe_response)
+    if challenge_status is not None:
+        if diagnostics is not None:
+            diagnostics["page_health"] = {
+                "phase": phase,
+                "verification_required": True,
+                "cloudflare_challenge": True,
+                "challenge_source": "response_header",
+                "http_status": challenge_status,
+            }
+        raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR) from None
+
+
 def wait_for_x_page_ready(
     page: Any,
     wait_ms: int,
@@ -2827,7 +3309,7 @@ def wait_for_x_page_ready(
         health = page.evaluate(PAGE_HEALTH_JS)
         if any(
             health.get(key)
-            for key in ("loginRequired", "errorPage", "accountUnavailable")
+            for key in ("loginRequired", "verificationRequired", "errorPage", "accountUnavailable")
         ):
             return
         if health.get("hasMain"):
@@ -2886,10 +3368,7 @@ def ensure_x_page_healthy(
             "accountUnavailable",
         )
     ):
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
-        )
+        navigate_x_page(page, None, diagnostics, phase, deadline_monotonic)
         recovery_wait_for_timeout(page, 2500, deadline_monotonic)
         health = page.evaluate(PAGE_HEALTH_JS)
     if health.get("loginRequired"):
@@ -3259,10 +3738,9 @@ def scrape_handle_url(
     merged: dict[str, dict[str, Any]],
     deadline_monotonic: float | None = None,
 ) -> None:
-    page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=recovery_timeout_ms(45_000, deadline_monotonic),
+    navigate_x_page(
+        page, url, diagnostics, "profile" if account_page else "search_fallback",
+        deadline_monotonic,
     )
     wait_for_x_page_ready(page, page_wait_ms, deadline_monotonic)
     ensure_x_page_healthy(
@@ -3361,7 +3839,7 @@ def scrape_handle(
                 deadline_monotonic,
             )
         except Exception as exc:
-            if url_index == 0:
+            if url_index == 0 or str(exc) == X_VERIFICATION_REQUIRED_ERROR:
                 raise
             if diagnostics is not None:
                 diagnostics["search_fallback_error"] = f"{type(exc).__name__}: {exc}"
@@ -3464,10 +3942,9 @@ def rescan_page_render_failures(
         deadline_monotonic = recovery_budget.deadline()
         context = new_x_context(browser, cookies)
         page = context.new_page()
-        page.goto(
-            "https://x.com/home",
-            wait_until="domcontentloaded",
-            timeout=recovery_timeout_ms(45_000, deadline_monotonic),
+        navigate_x_page(
+            page, "https://x.com/home", home_diagnostics, "recovery_home_probe",
+            deadline_monotonic,
         )
         recovery_wait_for_timeout(
             page,
@@ -3481,6 +3958,10 @@ def rescan_page_render_failures(
             deadline_monotonic=deadline_monotonic,
         )
     except Exception as exc:
+        if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+            if context is not None:
+                context.close()
+            raise
         probe_error = f"{type(exc).__name__}: {exc}"
         for item in pending_items:
             diagnostics = item.setdefault("diagnostics", {})
@@ -3574,6 +4055,8 @@ def rescan_page_render_failures(
                     deadline_monotonic,
                 )
             except Exception as exc:
+                if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                    raise
                 diagnostics["fresh_context_recovered"] = False
                 diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
                 diagnostics["fresh_context_diagnostics"] = retry_diagnostics
@@ -3607,6 +4090,281 @@ def rescan_page_render_failures(
             context.close()
 
 
+def local_cdp_url(value: str) -> str:
+    try:
+        endpoint = urllib.parse.urlsplit(value)
+        port = endpoint.port
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid local Chrome CDP URL") from None
+    if (
+        endpoint.scheme not in {"http", "https", "ws", "wss"}
+        or endpoint.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.query
+        or endpoint.fragment
+        or port == 0
+    ):
+        raise argparse.ArgumentTypeError(
+            "CDP must use a loopback URL without credentials or query parameters"
+        )
+    return value
+
+
+def cloudflare_cdp_probe(
+    kols: list[dict[str, str]],
+    hours: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    search_fallback: bool,
+    cookie_cdp_url: str | None = None,
+) -> dict[str, Any]:
+    if (
+        not 1 <= len(kols) <= 2 or hours <= 0 or not 1 <= limit <= 8
+        or not 0 <= scrolls <= 6 or not 0 <= page_wait_ms <= 6000
+        or not 0 <= scroll_wait_ms <= 2000
+        or any(not canonical_handle(item.get("handle")) for item in kols)
+    ):
+        raise ValueError("Cloudflare CDP probe exceeds its bounded scan parameters")
+    if cookie_cdp_url is not None:
+        cookie_cdp_url = local_cdp_url(cookie_cdp_url)
+    output: dict[str, Any] = {
+        "backend": "cloudflare_cdp",
+        "cookie_source": "szwechat8" if cookie_cdp_url else "project_env",
+        "status": "error", "error": "", "coverage": "bounded_scan", "results": [],
+    }
+    started = time.monotonic()
+    cookies: list[dict[str, Any]] = []
+    phase = "configuration"
+    remote = None
+    try:
+        token = os.environ.get("CLOUDFLARE_BROWSER_API_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("missing browser token")
+        account_id = cloudflare_browser_account_id()
+        phase = "playwright"
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            try:
+                if cookie_cdp_url:
+                    phase = "local_connection"
+                    local = playwright.chromium.connect_over_cdp(
+                        cookie_cdp_url, no_defaults=True, timeout=15_000,
+                    )
+                    if not local.contexts:
+                        raise RuntimeError("no local browser context")
+                    context = local.contexts[0]
+                    owned_page = context.new_page()
+                    try:
+                        phase = "profile_verification"
+                        owned_page.goto(
+                            "chrome://version", wait_until="domcontentloaded", timeout=10_000,
+                        )
+                        path = owned_page.evaluate(
+                            "() => document.querySelector('#profile_path')?.textContent?.trim() || ''"
+                        )
+                        parts = str(path).replace("\\", "/").rstrip("/").casefold().split("/")
+                        if parts[:3] != ["d:", "google缓存", "szwechat8"]:
+                            raise RuntimeError("wrong profile")
+                        output["source_profile_verified"] = True
+                        phase = "source_cookies"
+                        source_cookies = context.cookies("https://x.com")
+                        for name in ("auth_token", "ct0"):
+                            matching = [
+                                item for item in source_cookies
+                                if item.get("name") == name and item.get("domain") in {".x.com", "x.com"}
+                                and item.get("path") == "/" and item.get("value")
+                            ]
+                            if not matching or len({item["value"] for item in matching}) != 1:
+                                raise RuntimeError("missing or ambiguous source cookie")
+                            cookie = matching[0]
+                            expires = cookie.get("expires", -1)
+                            if expires > 0 and expires <= time.time():
+                                raise RuntimeError("expired source cookie")
+                            cookies.append({
+                                key: cookie[key]
+                                for key in ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite")
+                            })
+                    finally:
+                        owned_page.close()
+                else:
+                    phase = "source_cookies"
+                    cookies = [
+                        item for item in cookies_from_env() if item["domain"] == ".x.com"
+                    ]
+                phase = "cloudflare_connection"
+                remote = playwright.chromium.connect_over_cdp(
+                    f"wss://api.cloudflare.com/client/v4/accounts/{account_id}"
+                    "/browser-rendering/devtools/browser?keep_alive=10000",
+                    headers={"Authorization": f"Bearer {token}"}, timeout=20_000,
+                )
+                if not remote.contexts:
+                    raise RuntimeError("no Cloudflare browser context")
+                context = remote.contexts[0]
+                context.add_cookies(cookies)
+                page = context.new_page()
+                deadline = time.monotonic() + 90
+                phase = "home"
+                navigate_x_page(
+                    page, "https://x.com/home", phase="cloudflare_home",
+                    deadline_monotonic=deadline,
+                )
+                wait_for_x_page_ready(page, max(page_wait_ms, 5000), deadline)
+                ensure_x_page_healthy(page, phase="cloudflare_home", deadline_monotonic=deadline)
+                if urllib.parse.urlsplit(page.url).path != "/home":
+                    raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
+                output["home_healthy"] = True
+                cutoff_ms = int(
+                    (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).timestamp() * 1000
+                )
+                for kol in kols:
+                    handle = canonical_handle(kol["handle"])
+                    diagnostics: dict[str, Any] = {
+                        "profile_tweets": 0, "search_fallback_used": False,
+                        "scroll_rounds": 0, "early_stops": 0,
+                    }
+                    merged: dict[str, dict[str, Any]] = {}
+                    phase = "profile"
+                    scrape_handle_url(
+                        page, handle, f"https://x.com/{handle.lstrip('@')}", True,
+                        cutoff_ms, limit, scrolls, page_wait_ms, scroll_wait_ms,
+                        diagnostics, merged, deadline,
+                    )
+                    if search_fallback and not merged:
+                        phase = "search"
+                        diagnostics["search_fallback_used"] = True
+                        search_url = "https://x.com/search?" + urllib.parse.urlencode({
+                            "q": f"from:{handle.lstrip('@')}", "src": "typed_query", "f": "live",
+                        })
+                        scrape_handle_url(
+                            page, handle, search_url, False,
+                            cutoff_ms, limit, scrolls, page_wait_ms, scroll_wait_ms,
+                            diagnostics, merged, deadline,
+                        )
+                        if urllib.parse.urlsplit(page.url).path != "/search":
+                            raise RuntimeError(X_AUTHENTICATION_REQUIRED_ERROR)
+                    tweets = sorted(
+                        merged.values(), key=lambda item: item.get("created_at_ms", 0), reverse=True,
+                    )[:limit]
+                    output["results"].append({
+                        "handle": handle, "status": "ok", "tweet_count": len(tweets),
+                        "scroll_rounds": diagnostics["scroll_rounds"],
+                        "search_fallback_used": diagnostics["search_fallback_used"],
+                        "recent_created_at_utc": [item.get("created_at") for item in tweets],
+                    })
+                output["status"] = "ok"
+            finally:
+                if remote is not None:
+                    try:
+                        remote.close()
+                        output["remote_closed"] = True
+                    except Exception:
+                        output["remote_closed"] = False
+                        output["status"] = "error"
+                        output["error"] = "cloudflare_close_failed"
+    except Exception as exc:
+        output["status"] = "error"
+        output["failure_phase"] = phase
+        output["error"] = {
+            X_VERIFICATION_REQUIRED_ERROR: "verification_required",
+            X_AUTHENTICATION_REQUIRED_ERROR: "authentication_required",
+            X_RATE_LIMIT_ERROR: "x_rate_limit",
+            PAGE_RENDER_ERROR: "page_render_failed",
+            ACCOUNT_UNAVAILABLE_ERROR: "account_unavailable",
+        }.get(str(exc), f"{phase}_failed")
+    finally:
+        cookies.clear()
+    output["elapsed_seconds"] = round(time.monotonic() - started, 1)
+    return output
+
+
+def scrape_all_cdp(
+    playwright: Any,
+    endpoint: str,
+    kols: list[dict[str, str]],
+    hours: int,
+    limit: int,
+    scrolls: int,
+    page_wait_ms: int,
+    scroll_wait_ms: int,
+    search_fallback: bool,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    endpoint = local_cdp_url(endpoint)
+    started = time.monotonic()
+    try:
+        browser = playwright.chromium.connect_over_cdp(
+            endpoint, no_defaults=True, timeout=15_000,
+        )
+    except Exception:
+        raise RuntimeError(
+            "cannot connect to local Chrome; open the selected Google shortcut with CDP enabled"
+        ) from None
+    if not browser.contexts:
+        raise RuntimeError("local Chrome has no existing browser context")
+    # Use the selected profile as-is and close only the tab owned by this scan.
+    page = browser.contexts[0].new_page()
+    results: list[dict[str, Any]] = []
+    try:
+        page.goto("chrome://version", wait_until="domcontentloaded", timeout=10_000)
+        profile_path = page.evaluate(
+            "() => document.querySelector('#profile_path')?.textContent?.trim() || ''"
+        )
+        profile_parts = str(profile_path).replace("\\", "/").rstrip("/").casefold().split("/")
+        if profile_parts[:3] != ["d:", "google缓存", "szwechat8"]:
+            raise RuntimeError(
+                "CDP is not connected to Google szwechat8; verify the Chrome profile and loopback address"
+            )
+        navigate_x_page(page, "https://x.com/home", phase="home")
+        wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
+        ensure_x_page_healthy(page, phase="home")
+        for index, kol in enumerate(kols, 1):
+            diagnostics: dict[str, Any] = {
+                "profile_tweets": 0,
+                "search_fallback_used": False,
+                "scroll_rounds": 0,
+                "early_stops": 0,
+                "page_retries": 0,
+                "rename_checks": 0,
+                "browser_source": "local_cdp",
+            }
+            if kol.get("auto_recheck_paused"):
+                results.append({
+                    **kol, "status": "paused", "error": "", "tweets": [],
+                    "diagnostics": {**diagnostics, "auto_recheck_paused": True},
+                })
+                continue
+            try:
+                tweets = scrape_handle(
+                    page, kol["handle"], hours, limit, scrolls,
+                    page_wait_ms, scroll_wait_ms, search_fallback, diagnostics,
+                )
+            except Exception as exc:
+                if str(exc) in {
+                    X_AUTHENTICATION_REQUIRED_ERROR,
+                    X_VERIFICATION_REQUIRED_ERROR,
+                    X_RATE_LIMIT_ERROR,
+                }:
+                    raise
+                tweets, status, error = [], "error", f"{type(exc).__name__}: {exc}"
+            else:
+                status, error = "ok", ""
+            results.append({
+                **kol, "status": status, "error": error, "tweets": tweets,
+                "diagnostics": diagnostics,
+            })
+            print(
+                f"[scan {index}/{len(kols)}] {kol['handle']} {status} tweets={len(tweets)}",
+                file=sys.stderr,
+                flush=True,
+            )
+    finally:
+        page.close()
+    return results, {"x_total": time.monotonic() - started}
+
+
 def scrape_all(
     kols: list[dict[str, str]],
     hours: int,
@@ -3616,11 +4374,19 @@ def scrape_all(
     page_wait_ms: int,
     scroll_wait_ms: int,
     search_fallback: bool,
+    cdp_url: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except Exception as exc:
         raise RuntimeError("missing playwright; run: python -m pip install playwright && python -m playwright install chromium") from exc
+
+    if cdp_url is not None:
+        with sync_playwright() as p:
+            return scrape_all_cdp(
+                p, cdp_url, kols, hours, limit, scrolls,
+                page_wait_ms, scroll_wait_ms, search_fallback,
+            )
 
     cookies = cookies_from_env()
     chrome_path = os.environ.get("CHROME_PATH", "").strip() or None
@@ -3650,11 +4416,7 @@ def scrape_all(
                 page = context.new_page()
                 home_diagnostics: dict[str, Any] = {}
                 try:
-                    page.goto(
-                        "https://x.com/home",
-                        wait_until="domcontentloaded",
-                        timeout=45_000,
-                    )
+                    navigate_x_page(page, "https://x.com/home", home_diagnostics, "home")
                     wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
                     ensure_x_page_healthy(
                         page,
@@ -3740,6 +4502,8 @@ def scrape_all(
                                 diagnostics,
                             )
                         except Exception as exc:
+                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                raise
                             if str(exc) == ACCOUNT_UNAVAILABLE_ERROR and not rename_attempted:
                                 rename_attempted = True
                                 try:
@@ -3748,6 +4512,8 @@ def scrape_all(
                                     if renamed_handle:
                                         record_handle_alias(handle, renamed_handle)
                                 except Exception as recovery_exc:
+                                    if str(recovery_exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                        raise
                                     diagnostics["rename_error"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
                                     renamed_handle = ""
                                 if renamed_handle:
@@ -3976,6 +4742,8 @@ def scrape_all(
                                 fallback_budget.deadline(),
                             )
                         except Exception as exc:
+                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                raise
                             fallback_error = f"{type(exc).__name__}: {exc}"
                             diagnostics["search_fallback_error"] = fallback_error
                             diagnostics["search_fallback_failed"] = True
@@ -4269,21 +5037,23 @@ def recover_renamed_handle(page: Any, handle: str, page_wait_ms: int) -> tuple[s
     status_ids = cached_status_ids(handle)
     for status_id in status_ids:
         try:
-            page.goto(f"https://x.com/i/status/{status_id}", wait_until="domcontentloaded", timeout=45_000)
+            navigate_x_page(page, f"https://x.com/i/status/{status_id}", phase="rename_status")
             page.wait_for_timeout(page_wait_ms)
             ensure_x_page_healthy(page)
             candidate = canonical_handle(page.evaluate(STATUS_AUTHOR_JS, status_id))
             if not candidate or candidate.lower() == handle.lower():
                 continue
-            page.goto(
+            navigate_x_page(
+                page,
                 f"https://x.com/{urllib.parse.quote(candidate.lstrip('@'))}",
-                wait_until="domcontentloaded",
-                timeout=45_000,
+                phase="rename_profile",
             )
             page.wait_for_timeout(page_wait_ms)
             ensure_x_page_healthy(page, account_page=True)
             return candidate, len(status_ids)
-        except Exception:
+        except Exception as exc:
+            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                raise
             continue
     return "", len(status_ids)
 
@@ -5941,6 +6711,23 @@ def main() -> int:
     ap.add_argument("--scroll-wait-ms", type=int, default=900)
     ap.add_argument("--search-fallback", action=argparse.BooleanOptionalAction, default=True, help="try X search only when profile page has no recent tweets")
     ap.add_argument("--headed", action="store_true", help="show browser")
+    ap.add_argument(
+        "--cdp-url",
+        type=local_cdp_url,
+        help="use verified Google szwechat8 at an explicit local CDP URL; Telegram requires --send",
+    )
+    ap.add_argument(
+        "--cloudflare-probe", action="store_true",
+        help="read-only Cloudflare content probe for 1-2 explicit KOLs; never cache or send",
+    )
+    ap.add_argument(
+        "--cloudflare-cdp-probe", action="store_true",
+        help="read-only Cloudflare CDP scan for 1-2 KOLs; bounded to 90 seconds",
+    )
+    ap.add_argument(
+        "--cookie-cdp-url", type=local_cdp_url,
+        help="explicit consent to send verified szwechat8 X cookies to Cloudflare in memory",
+    )
     ap.add_argument("--send", action="store_true", help="send report to Telegram")
     ap.add_argument("--no-send", action="store_true", help="do not send Telegram after a live scan")
     ap.add_argument("--market-only", action="store_true", help="build only the market overview; never scan KOLs")
@@ -5965,7 +6752,23 @@ def main() -> int:
     ap.add_argument("--telegram-preview", action="store_true", help="print Telegram compact format")
     ap.add_argument("--dry-run", action="store_true", help="parse config only")
     args = ap.parse_args()
-    live_scan_send = not args.no_send
+    if args.cookie_cdp_url and not args.cloudflare_cdp_probe:
+        ap.error("--cookie-cdp-url requires --cloudflare-cdp-probe")
+    if args.cloudflare_probe and args.cloudflare_cdp_probe:
+        ap.error("choose only one Cloudflare probe mode")
+    if args.cloudflare_probe or args.cloudflare_cdp_probe:
+        if args.cdp_url or args.send or args.market_only or args.cache_recent or args.translate_cache:
+            ap.error("Cloudflare probes cannot be combined with other scan, cache, or send modes")
+        if not args.handles.strip() and not 1 <= args.max_kols <= 2:
+            ap.error("Cloudflare probes require --handles or --max-kols 1-2")
+        if args.hours <= 0:
+            ap.error("Cloudflare probes require positive --hours")
+    if args.cloudflare_cdp_probe and (
+        not 1 <= args.limit <= 8 or not 0 <= args.scrolls <= 6
+        or not 0 <= args.page_wait_ms <= 6000 or not 0 <= args.scroll_wait_ms <= 2000
+    ):
+        ap.error("Cloudflare CDP probe requires limit 1-8, scrolls 0-6, and bounded waits")
+    live_scan_send = not args.no_send and args.cdp_url is None
 
     load_dotenv(ROOT / ".env")
     if args.market_only:
@@ -6041,6 +6844,24 @@ def main() -> int:
             raise RuntimeError(f"no matching handles: {args.handles}")
     if args.max_kols > 0:
         kols = kols[:args.max_kols]
+    if args.cloudflare_probe or args.cloudflare_cdp_probe:
+        if len(kols) > 2:
+            ap.error("Cloudflare probes are limited to 2 KOLs")
+        if args.cloudflare_cdp_probe:
+            probe = cloudflare_cdp_probe(
+                kols, args.hours, args.limit, args.scrolls,
+                args.page_wait_ms, args.scroll_wait_ms, args.search_fallback,
+                args.cookie_cdp_url,
+            )
+            print(json.dumps({"cloudflare_cdp_probe": probe}, ensure_ascii=False))
+            return 0 if probe["status"] == "ok" else 2
+        try:
+            probe = cloudflare_probe(kols, args.hours)
+        except (RuntimeError, ValueError) as exc:
+            print(json.dumps({"cloudflare_probe_error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps({"cloudflare_probe": probe}, ensure_ascii=False))
+        return 2 if any(item["status"] == "error" for item in probe) else 0
     kols = apply_unavailable_recheck_policy(
         kols,
         force_recheck=bool(args.handles.strip()),
@@ -6060,6 +6881,7 @@ def main() -> int:
         page_wait_ms=args.page_wait_ms,
         scroll_wait_ms=args.scroll_wait_ms,
         search_fallback=args.search_fallback,
+        cdp_url=args.cdp_url,
     )
     phase_timings["x_scan"] = time.monotonic() - phase_started
     phase_timings.update(x_phase_timings)
