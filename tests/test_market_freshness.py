@@ -103,7 +103,64 @@ class StrategyParsingTests(unittest.TestCase):
         self.assertEqual(record["holdings"], 900000)
         self.assertEqual(record["change"], 334)
         self.assertEqual(record["verification_source"], "SEC")
-        self.assertEqual(record["latest_filing_date"], dt.date(2026, 10, 6))
+        self.assertEqual(record["filing_date"], dt.date(2026, 10, 5))
+
+    def test_holdings_in_press_release_exhibit_are_not_skipped(self):
+        filings = {"filings": {"recent": {
+            "form": ["8-K", "8-K", "8-K"],
+            "filingDate": ["2026-10-16", "2026-10-13", "2026-10-05"],
+            "accessionNumber": ["dividend", "holdings", "old"],
+            "primaryDocument": ["dividend.htm", "main.htm", "old.htm"],
+        }}}
+        exhibit = table(
+            ["During Period October 5, 2026 to October 11, 2026", "", "As of October 11, 2026"],
+            ["BTC Purchased (1)", "AggregatePurchase Price (in millions) (2)", "Average Purchase Price (2)",
+             "Aggregate BTC Holdings", "Aggregate Purchase Price (in billions) (2)", "Average Purchase Price (2)"],
+            ["250", "$", "21.5", "$", "86,194", "848,250", "$", "64.00", "$", "75,444"],
+        )
+        with patch.object(market.urllib.request, "urlopen", side_effect=[
+            io.BytesIO(json.dumps(filings).encode()),
+            io.BytesIO(b"<p>Dividend declaration.</p>"),
+            io.BytesIO(b'<a href="mstr-ex99_1.htm">Press release, dated October 12, 2026</a>'),
+            io.BytesIO(exhibit.encode()),
+        ]) as opened, patch.object(market, "load_strategy_btc_cache", return_value={}):
+            record = market.fetch_strategy_btc_sec()
+        self.assertEqual(record["holdings"], 848250)
+        self.assertEqual(record["change"], 250)
+        self.assertEqual(record["holdings_as_of"], dt.date(2026, 10, 11))
+        self.assertEqual(record["filing_date"], dt.date(2026, 10, 13))
+        self.assertEqual(record["average_price"], 75444)
+        self.assertEqual(record["total_cost_millions"], 64000)
+        self.assertEqual(opened.call_count, 4)
+        self.assertEqual(
+            opened.call_args.args[0].full_url,
+            market.STRATEGY_SEC_ARCHIVES_URL + "/holdings/mstr-ex99_1.htm",
+        )
+
+    def test_exhibit_links_outside_the_filing_are_not_followed(self):
+        filings = {"filings": {"recent": {
+            "form": ["8-K", "8-K"],
+            "filingDate": ["2026-10-16", "2026-10-05"],
+            "accessionNumber": ["new", "old"],
+            "primaryDocument": ["main.htm", "old.htm"],
+        }}}
+        for href in (
+            "https://example.com/press.htm",
+            "https://www.sec.gov.evil.example/press.htm",
+            "../old/ex99.htm",
+            "ex99.htm?redirect=1",
+            "https://user@www.sec.gov/Archives/edgar/data/1050446/new/ex99.htm",
+        ):
+            with self.subTest(href=href), patch.object(
+                market.urllib.request, "urlopen", side_effect=[
+                    io.BytesIO(json.dumps(filings).encode()),
+                    io.BytesIO(f'<a href="{href}">Press release</a>'.encode()),
+                    io.BytesIO(split_tables().encode()),
+                ],
+            ) as opened, patch.object(market, "load_strategy_btc_cache", return_value={}):
+                record = market.fetch_strategy_btc_sec()
+                self.assertEqual(record["filing_date"], dt.date(2026, 10, 5))
+                self.assertEqual(opened.call_count, 3)
 
     def test_website_403_uses_sec(self):
         error = urllib.error.HTTPError(market.STRATEGY_PURCHASES_URL, 403, "Forbidden", {}, None)
@@ -117,7 +174,7 @@ class StrategyParsingTests(unittest.TestCase):
         record.update(
             verified_date=dt.date(2026, 10, 7),
             verification_source="SEC",
-            latest_filing_date=dt.date(2026, 10, 6),
+            filing_date=dt.date(2026, 10, 6),
         )
         with patch.object(market, "load_json", return_value={}), \
                 patch.object(market, "save_json") as save:
@@ -127,7 +184,7 @@ class StrategyParsingTests(unittest.TestCase):
             restored = market.load_strategy_btc_cache()
         self.assertEqual(restored["holdings_as_of_time"], "04:00")
         self.assertEqual(restored["verification_source"], "SEC")
-        self.assertEqual(restored["latest_filing_date"], dt.date(2026, 10, 6))
+        self.assertEqual(restored["filing_date"], dt.date(2026, 10, 6))
         self.assertEqual(restored["change"], 334)
 
     def test_cached_holdings_label_preserves_cutoff_without_timezone(self):
@@ -136,11 +193,11 @@ class StrategyParsingTests(unittest.TestCase):
         self.assertEqual(market.normalize_stablecoin_summary_labels(old), expected)
         self.assertEqual(market.normalize_stablecoin_summary_labels(expected), expected)
 
-    def test_latest_filing_date_is_preserved_separately_from_verification_date(self):
+    def test_holdings_filing_date_is_preserved_separately_from_verification_date(self):
         record = market.parse_strategy_btc_sec(split_tables())
         record.update(
             verified_date=dt.date(2026, 10, 18),
-            latest_filing_date=dt.date(2026, 10, 16),
+            filing_date=dt.date(2026, 10, 13),
             verification_source="SEC",
         )
         with patch.object(market, "load_json", return_value={}), \
@@ -149,8 +206,40 @@ class StrategyParsingTests(unittest.TestCase):
         saved = save.call_args.args[1]
         with patch.object(market, "load_json", return_value=saved):
             restored = market.load_strategy_btc_cache()
-        self.assertEqual(restored["latest_filing_date"], dt.date(2026, 10, 16))
+        self.assertEqual(restored["filing_date"], dt.date(2026, 10, 13))
         self.assertEqual(restored["verified_date"], dt.date(2026, 10, 18))
+
+
+class TreasuryDateTests(unittest.TestCase):
+    def test_debt_uses_latest_published_date_not_fetch_date(self):
+        payload = {"data": [
+            {"record_date": "2026-10-15", "tot_pub_debt_out_amt": "40388317675071.91"},
+            {"record_date": "2026-10-14", "tot_pub_debt_out_amt": "40329229827541.02"},
+        ]}
+        with patch.object(market, "fetch_market_json", return_value=payload):
+            record = market.fetch_us_treasury_debt()
+        self.assertEqual(record["record_date"], dt.date(2026, 10, 15))
+        self.assertAlmostEqual(record["current"], 40388317675071.91, places=2)
+
+    def test_yields_choose_latest_available_business_day(self):
+        xml = (
+            '<feed xmlns="http://www.w3.org/2005/Atom" '
+            'xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata" '
+            'xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">'
+            + "".join(
+                '<entry><content><m:properties>'
+                f'<d:NEW_DATE>{date}T00:00:00</d:NEW_DATE>'
+                '<d:BC_2YEAR>4.74</d:BC_2YEAR><d:BC_5YEAR>4.89</d:BC_5YEAR>'
+                '<d:BC_10YEAR>5.09</d:BC_10YEAR><d:BC_30YEAR>5.43</d:BC_30YEAR>'
+                '</m:properties></content></entry>'
+                for date in ("2026-10-16", "2026-10-15")
+            )
+            + '</feed>'
+        )
+        with patch.object(market.urllib.request, "urlopen", return_value=io.BytesIO(xml.encode())):
+            record = market.fetch_us_treasury_yields()
+        self.assertEqual(record["record_date"], dt.date(2026, 10, 16))
+
 
 class GlobalVolumeTests(unittest.TestCase):
     def _payload(self, volume, percent=10.0):

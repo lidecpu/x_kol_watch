@@ -979,25 +979,48 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         })
     if not candidates:
         raise ValueError("missing Strategy SEC 8-K filing")
-    latest_filing_date = max(
-        dt.date.fromisoformat(item["filing_date"])
-        for item in candidates
-    )
     for filing in sorted(candidates, key=lambda item: item["filing_date"], reverse=True)[:5]:
         accession_path = filing["accession"].replace("-", "")
         release_url = (
             f"{STRATEGY_SEC_ARCHIVES_URL}/{accession_path}/{filing['document']}"
         )
-        request = urllib.request.Request(
-            release_url,
-            headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
-        )
-        with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-            page = response.read().decode("utf-8", "replace")
-        if not re.search(r"Aggregate BTC Holdings|holds approximately", page, re.IGNORECASE):
-            continue
-        record = parse_strategy_btc_sec(page)
-        break
+        document_urls = [release_url]
+        record = None
+        for document_url in document_urls:
+            request = urllib.request.Request(
+                document_url,
+                headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
+            )
+            with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+                page = response.read().decode("utf-8", "replace")
+            parser = HTMLTextLinkParser()
+            parser.feed(page)
+            if re.search(r"Aggregate\s*BTC\s*Holdings|holds approximately", parser.text(), re.IGNORECASE):
+                record = parse_strategy_btc_sec(page)
+                break
+            if document_url != release_url:
+                continue
+            # Some 8-Ks put the BTC table in a linked press-release exhibit.
+            for label, href in parser.links:
+                if not re.search(r"press\s*release", label, re.IGNORECASE):
+                    continue
+                attachment_url = urllib.parse.urljoin(release_url, href)
+                attachment = urllib.parse.urlsplit(attachment_url)
+                filing_path = urllib.parse.urlsplit(release_url).path.rsplit("/", 1)[0] + "/"
+                if (
+                    attachment.scheme != "https"
+                    or attachment.netloc != "www.sec.gov"
+                    or attachment.query or attachment.fragment
+                    or not attachment.path.startswith(filing_path)
+                    or not re.fullmatch(r"[^/]+\.html?", attachment.path[len(filing_path):], re.IGNORECASE)
+                ):
+                    continue
+                if attachment_url not in document_urls:
+                    document_urls.append(attachment_url)
+                if len(document_urls) >= 4:
+                    break
+        if record is not None:
+            break
     else:
         raise ValueError("missing Strategy SEC BTC holdings in recent 8-K filings")
     previous = load_strategy_btc_cache()
@@ -1006,7 +1029,7 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         record["change"] = previous["change"]
     record["verified_date"] = cn_now().date()
     record["verification_source"] = "SEC"
-    record["latest_filing_date"] = latest_filing_date
+    record["filing_date"] = dt.date.fromisoformat(filing["filing_date"])
     print(
         f"[strategy-btc-sec] filing={filing['filing_date']} "
         f"holdings={record['holdings']} as_of={record['holdings_as_of']}",
@@ -1038,13 +1061,13 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         }
     except (KeyError, TypeError, ValueError, OverflowError):
         return {}
-    latest_filing_raw = value.get("latest_filing_date")
-    if latest_filing_raw:
+    filing_raw = value.get("filing_date")
+    if filing_raw:
         try:
-            latest_filing_date = parse_date(latest_filing_raw)
+            filing_date = parse_date(filing_raw)
         except (TypeError, ValueError):
             return {}
-        record["latest_filing_date"] = latest_filing_date
+        record["filing_date"] = filing_date
     if value.get("verification_source") == "SEC":
         record["verification_source"] = "SEC"
     cutoff_time = str(value.get("holdings_as_of_time") or "")
@@ -1065,10 +1088,10 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         or record["record_date"] > record["holdings_as_of"]
         or record["holdings_as_of"] > record["verified_date"]
         or (
-            "latest_filing_date" in record
+            "filing_date" in record
             and (
-                record["latest_filing_date"] < record["record_date"]
-                or record["latest_filing_date"] > record["verified_date"]
+                record["filing_date"] < record["record_date"]
+                or record["filing_date"] > record["verified_date"]
             )
         )
     ):
@@ -1097,9 +1120,9 @@ def save_strategy_btc_cache(record: dict[str, Any]) -> None:
     for key in ("verification_source", "holdings_as_of_time"):
         if key in normalized:
             state["strategy_btc"][key] = normalized[key]
-    if "latest_filing_date" in normalized:
-        state["strategy_btc"]["latest_filing_date"] = (
-            normalized["latest_filing_date"].isoformat()
+    if "filing_date" in normalized:
+        state["strategy_btc"]["filing_date"] = (
+            normalized["filing_date"].isoformat()
         )
     save_json(MARKET_STATE, state)
 
@@ -2365,13 +2388,13 @@ def fetch_stablecoin_summary() -> str:
         verification_label = (
             "SEC核验" if strategy_btc.get("verification_source") == "SEC" else "官网核验"
         )
-        latest_filing_date = strategy_btc.get("latest_filing_date")
+        filing_date = strategy_btc.get("filing_date")
         if (
             strategy_btc.get("verification_source") == "SEC"
-            and isinstance(latest_filing_date, dt.date)
+            and isinstance(filing_date, dt.date)
         ):
             verification_label = (
-                f"SEC最新申报 {latest_filing_date.strftime('%m-%d')} | SEC核验"
+                f"SEC披露 {filing_date.strftime('%m-%d')} | SEC核验"
             )
         strategy_lines.extend([
             "Strategy（微策略）",
