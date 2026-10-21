@@ -416,8 +416,8 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
 
 class MarketSeparatorTests(unittest.TestCase):
     def test_live_and_cached_reports_use_short_separators(self):
-        self.assertEqual(market.TELEGRAM_SECTION_SEPARATOR, "━" * 20)
-        for separator in ("", "━" * 51, market.TELEGRAM_SECTION_SEPARATOR):
+        self.assertEqual(market.TELEGRAM_SECTION_SEPARATOR, "━" * 40)
+        for separator in ("", "━" * 20, "━" * 51, market.TELEGRAM_SECTION_SEPARATOR):
             with self.subTest(separator_length=len(separator)):
                 summary = "\n".join(line for line in [
                     "加密市场", "总市值 unchanged", separator,
