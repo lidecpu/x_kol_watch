@@ -105,7 +105,7 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 21
+MARKET_SUMMARY_CACHE_VERSION = 22
 GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO = 5.0
 GLOBAL_VOLUME_MAX_AGE_SECONDS = 3600
 STRATEGY_BTC_CACHE_VERSION = 2
@@ -1327,13 +1327,6 @@ def fetch_farside_etf_flow(url: str) -> dict[str, Any]:
     return parse_farside_etf_flow_html(page)
 
 
-def fetch_spot_etf_flows_live() -> dict[str, Any]:
-    return {
-        "BTC": fetch_farside_etf_flow(FARSIDE_BITCOIN_ETF_FLOW_URL),
-        "ETH": fetch_farside_etf_flow(FARSIDE_ETHEREUM_ETF_FLOW_URL),
-    }
-
-
 def fetch_stablecoin_volumes() -> dict[str, dict[str, float]]:
     result: dict[str, dict[str, float]] = {}
     for symbol, coin_id in (("USDT", "tether"), ("USDC", "usd-coin")):
@@ -1366,9 +1359,10 @@ def global_spot_volume_record(
     percent: Any,
     market_cap: float,
 ) -> dict[str, Any]:
-    current, percent = float(current), float(percent)
+    current, percent, market_cap = float(current), float(percent), float(market_cap)
     if (
         not math.isfinite(current) or not math.isfinite(percent)
+        or not math.isfinite(market_cap) or market_cap <= 0
         or current <= 0 or current > market_cap * GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO
         or percent <= -100
     ):
@@ -1385,33 +1379,35 @@ def global_spot_volume_record(
 
 
 def fetch_global_volume() -> dict[str, Any]:
-    payload = fetch_market_json(COINGECKO_GLOBAL_URL)
-    data = payload.get("data", {})
-    market_cap = float(data.get("total_market_cap", {}).get("usd"))
-    market_cap_percent = float(data.get("market_cap_change_percentage_24h_usd"))
-    market_cap_percentage = data.get("market_cap_percentage", {})
-    btc_dominance = float(market_cap_percentage.get("btc"))
-    eth_dominance = float(market_cap_percentage.get("eth"))
-    if not all(math.isfinite(value) for value in (
-        market_cap,
-        market_cap_percent,
-        btc_dominance,
-        eth_dominance,
-    )):
-        raise ValueError("non-finite CoinGecko global data")
-    if market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
-        raise ValueError("out-of-range CoinGecko global data")
     result = {
         "current": None,
         "delta": None,
         "percent": None,
         "volume_valid": False,
-        "market_cap": market_cap,
-        "market_cap_percent": market_cap_percent,
-        "btc_dominance": btc_dominance,
-        "eth_dominance": eth_dominance,
     }
+    source_errors = (
+        OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException,
+    )
     try:
+        payload = fetch_market_json(COINGECKO_GLOBAL_URL)
+        data = payload.get("data", {})
+        market_cap = float(data.get("total_market_cap", {}).get("usd"))
+        market_cap_percent = float(data.get("market_cap_change_percentage_24h_usd"))
+        market_cap_percentage = data.get("market_cap_percentage", {})
+        btc_dominance = float(market_cap_percentage.get("btc"))
+        eth_dominance = float(market_cap_percentage.get("eth"))
+        if not all(math.isfinite(value) for value in (
+            market_cap, market_cap_percent, btc_dominance, eth_dominance,
+        )):
+            raise ValueError("non-finite CoinGecko global data")
+        if market_cap <= 0 or not 0 <= btc_dominance <= 100 or not 0 <= eth_dominance <= 100:
+            raise ValueError("out-of-range CoinGecko global data")
+        result.update(
+            market_cap=market_cap,
+            market_cap_percent=market_cap_percent,
+            btc_dominance=btc_dominance,
+            eth_dominance=eth_dominance,
+        )
         result.update(global_spot_volume_record(
             data.get("total_volume", {}).get("usd"),
             data.get("volume_change_percentage_24h_usd"),
@@ -1419,9 +1415,9 @@ def fetch_global_volume() -> dict[str, Any]:
         ))
         result["volume_source"] = "CoinGecko"
         return result
-    except (ValueError, TypeError, AttributeError) as exc:
+    except source_errors as exc:
         print(
-            f"[global-volume-invalid] CoinGecko: {exc}; trying CoinPaprika",
+            f"[global-volume-primary-error] CoinGecko {type(exc).__name__}: {exc}; trying CoinPaprika",
             file=sys.stderr,
         )
     try:
@@ -1430,18 +1426,43 @@ def fetch_global_volume() -> dict[str, Any]:
         age = cn_now().timestamp() - updated_at
         if not math.isfinite(age) or not -300 <= age <= GLOBAL_VOLUME_MAX_AGE_SECONDS:
             raise ValueError("stale or invalid CoinPaprika global timestamp")
-        result.update(global_spot_volume_record(
+        fallback_market_cap = float(
+            result.get("market_cap") or fallback.get("market_cap_usd")
+        )
+        volume_record = global_spot_volume_record(
             fallback.get("volume_24h_usd"),
             fallback.get("volume_24h_change_24h"),
-            market_cap,
-        ))
+            fallback_market_cap,
+        )
+        if "market_cap" not in result:
+            fallback_market_cap_change = fallback.get("market_cap_change_24h")
+            try:
+                fallback_market_cap_change = float(fallback_market_cap_change)
+            except (TypeError, ValueError):
+                fallback_market_cap_change = None
+            if fallback_market_cap_change is not None and not math.isfinite(fallback_market_cap_change):
+                fallback_market_cap_change = None
+            fallback_btc_dominance = fallback.get("bitcoin_dominance_percentage")
+            try:
+                fallback_btc_dominance = float(fallback_btc_dominance)
+            except (TypeError, ValueError):
+                fallback_btc_dominance = None
+            if fallback_btc_dominance is not None and not 0 <= fallback_btc_dominance <= 100:
+                fallback_btc_dominance = None
+            result.update(
+                market_cap=fallback_market_cap,
+                market_cap_percent=fallback_market_cap_change,
+                btc_dominance=fallback_btc_dominance,
+                market_source="CoinPaprika",
+            )
+        result.update(volume_record)
         result["volume_source"] = "CoinPaprika"
         print(
             f"[global-volume-fallback] CoinPaprika current={result['current']:.2f} "
             f"percent={result['percent']:.2f}",
             file=sys.stderr,
         )
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+    except source_errors as exc:
         print(f"[global-volume-fallback-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     return result
 
@@ -1745,24 +1766,19 @@ def save_spot_etf_flow_cache(snapshot: dict[str, Any]) -> None:
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     state["version"] = 1
-    state["spot_etf_flows"] = {
+    cache = {
         "version": SPOT_ETF_FLOW_CACHE_VERSION,
         "snapshot": snapshot,
-        "captured_at": cn_now().isoformat(timespec="seconds"),
     }
-    save_json(MARKET_STATE, state)
-
-
-def save_spot_etf_flow_failure() -> None:
-    state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
-    if not isinstance(state, dict):
-        state = {"version": 1, "snapshots": {}}
-    cache = state.get("spot_etf_flows")
-    if not isinstance(cache, dict) or cache.get("version") != SPOT_ETF_FLOW_CACHE_VERSION:
-        cache = {}
-    cache["version"] = SPOT_ETF_FLOW_CACHE_VERSION
-    cache["failed_at"] = cn_now().isoformat(timespec="seconds")
-    state["version"] = 1
+    captured_dates = []
+    for symbol in ("BTC", "ETH"):
+        asset = snapshot.get(symbol)
+        if isinstance(asset, dict):
+            captured_at = parse_cache_timestamp(asset.get("_captured_at"))
+            if captured_at is not None:
+                captured_dates.append(captured_at)
+    if captured_dates:
+        cache["captured_at"] = max(captured_dates).isoformat(timespec="seconds")
     state["spot_etf_flows"] = cache
     save_json(MARKET_STATE, state)
 
@@ -1770,35 +1786,55 @@ def save_spot_etf_flow_failure() -> None:
 def fetch_spot_etf_flow_snapshot() -> dict[str, Any]:
     cached, captured_at, failed_at = load_spot_etf_flow_cache()
     now = cn_now()
-
-    def stale_cached_snapshot() -> dict[str, Any]:
-        if cached is None:
-            return {}
-        result = dict(cached)
-        result["_stale"] = True
-        if captured_at is not None:
-            result["_captured_at"] = captured_at.isoformat(timespec="seconds")
-        return result
-
-    if cached is not None and captured_at is not None:
-        cache_age = (now - captured_at).total_seconds()
-        if 0 <= cache_age < SPOT_ETF_FLOW_CACHE_TTL_SECONDS:
-            return cached
-    if failed_at is not None and cached is not None:
-        failure_age = (now - failed_at).total_seconds()
-        if 0 <= failure_age < SPOT_ETF_FLOW_FAILURE_COOLDOWN_SECONDS:
-            print("[spot-etf-cache] refresh cooldown; using last snapshot", file=sys.stderr)
-            return stale_cached_snapshot()
-    try:
-        snapshot = fetch_spot_etf_flows_live()
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-        save_spot_etf_flow_failure()
-        print(f"[spot-etf-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-        if cached is not None:
-            print("[spot-etf-cache] using last successful snapshot", file=sys.stderr)
-            return stale_cached_snapshot()
-        return {}
-    save_spot_etf_flow_cache(snapshot)
+    snapshot: dict[str, Any] = {}
+    changed = False
+    for symbol, url in (
+        ("BTC", FARSIDE_BITCOIN_ETF_FLOW_URL),
+        ("ETH", FARSIDE_ETHEREUM_ETF_FLOW_URL),
+    ):
+        raw_asset = cached.get(symbol) if cached else None
+        asset = dict(raw_asset) if isinstance(raw_asset, dict) else {}
+        # Existing caches stored both assets' timestamps on the shared wrapper.
+        legacy_asset = bool(asset) and "_captured_at" not in asset and "_failed_at" not in asset
+        asset_captured_at = parse_cache_timestamp(asset.get("_captured_at"))
+        asset_failed_at = parse_cache_timestamp(asset.get("_failed_at"))
+        if legacy_asset:
+            asset_captured_at, asset_failed_at = captured_at, failed_at
+            if captured_at is not None:
+                asset["_captured_at"] = captured_at.isoformat(timespec="seconds")
+        try:
+            spot_etf_flow_values(asset)
+            available = True
+        except (ValueError, TypeError, KeyError, AttributeError):
+            available = False
+        if available and asset_captured_at is not None:
+            cache_age = (now - asset_captured_at).total_seconds()
+            if 0 <= cache_age < SPOT_ETF_FLOW_CACHE_TTL_SECONDS:
+                snapshot[symbol] = asset
+                continue
+        if asset_failed_at is not None:
+            failure_age = (now - asset_failed_at).total_seconds()
+            if 0 <= failure_age < SPOT_ETF_FLOW_FAILURE_COOLDOWN_SECONDS:
+                asset["_stale"] = True
+                asset["_failed_at"] = asset_failed_at.isoformat(timespec="seconds")
+                snapshot[symbol] = asset
+                print(f"[spot-etf-cache] {symbol} refresh cooldown", file=sys.stderr)
+                continue
+        try:
+            current = fetch_farside_etf_flow(url)
+            spot_etf_flow_values(current)
+            snapshot[symbol] = {
+                "records": current["records"],
+                "_captured_at": now.isoformat(timespec="seconds"),
+            }
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as exc:
+            asset["_stale"] = True
+            asset["_failed_at"] = now.isoformat(timespec="seconds")
+            snapshot[symbol] = asset
+            print(f"[spot-etf-error] {symbol} {type(exc).__name__}: {exc}", file=sys.stderr)
+        changed = True
+    if changed:
+        save_spot_etf_flow_cache(snapshot)
     return snapshot
 
 
@@ -1831,6 +1867,27 @@ def signed_etf_yi(value_millions: float) -> str:
     return "0.00"
 
 
+def spot_etf_flow_values(asset: Any) -> tuple[list[str], float]:
+    if not isinstance(asset, dict):
+        raise ValueError("missing ETF asset")
+    records = asset.get("records")
+    if not isinstance(records, list) or len(records) < SPOT_ETF_FLOW_SUMMARY_DAYS:
+        raise ValueError("incomplete ETF flow history")
+    daily_parts: list[str] = []
+    five_day_total = 0.0
+    for index, record in enumerate(records[:SPOT_ETF_FLOW_SUMMARY_DAYS]):
+        if not isinstance(record, dict):
+            raise ValueError("invalid ETF flow record")
+        record_date = dt.date.fromisoformat(str(record["record_date"]))
+        flow = float(record["flow_millions"])
+        if not math.isfinite(flow):
+            raise ValueError("non-finite ETF flow")
+        if index < SPOT_ETF_FLOW_DISPLAY_DAYS:
+            daily_parts.append(f"{record_date.strftime('%m-%d')} {signed_etf_yi(flow)}")
+        five_day_total += flow
+    return daily_parts, five_day_total
+
+
 def spot_etf_summary_lines(snapshot: dict[str, Any]) -> list[str]:
     heading = "现货ETF资金流（亿美元）"
     if snapshot.get("_stale"):
@@ -1839,30 +1896,24 @@ def spot_etf_summary_lines(snapshot: dict[str, Any]) -> list[str]:
             heading = f"现货ETF资金流（亿美元，缓存 {captured_at.strftime('%m-%d %H:%M')}）"
     lines = [heading]
     five_day_parts: list[str] = []
+    available = False
     for symbol in ("BTC", "ETH"):
         asset = snapshot.get(symbol)
-        if not isinstance(asset, dict):
-            return []
-        records = asset.get("records")
-        if not isinstance(records, list) or len(records) < SPOT_ETF_FLOW_SUMMARY_DAYS:
-            return []
-        daily_parts: list[str] = []
-        five_day_total = 0.0
-        for index, record in enumerate(records[:SPOT_ETF_FLOW_SUMMARY_DAYS]):
-            if not isinstance(record, dict):
-                return []
-            try:
-                record_date = dt.date.fromisoformat(str(record["record_date"]))
-                flow = float(record["flow_millions"])
-            except (KeyError, TypeError, ValueError):
-                return []
-            if not math.isfinite(flow):
-                return []
-            if index < SPOT_ETF_FLOW_DISPLAY_DAYS:
-                daily_parts.append(f"{record_date.strftime('%m-%d')} {signed_etf_yi(flow)}")
-            five_day_total += flow
-        lines.append(f"{symbol} " + " | ".join(daily_parts))
+        try:
+            daily_parts, five_day_total = spot_etf_flow_values(asset)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            lines.append(f"{symbol} 暂不可用")
+            five_day_parts.append(f"{symbol} 暂不可用")
+            continue
+        available = True
+        line = f"{symbol} " + " | ".join(daily_parts)
+        if asset.get("_stale"):
+            captured_at = parse_cache_timestamp(asset.get("_captured_at"))
+            line += f" | 缓存 {captured_at.strftime('%m-%d %H:%M')}" if captured_at else " | 缓存"
+        lines.append(line)
         five_day_parts.append(f"{symbol} {signed_etf_yi(five_day_total)}")
+    if not available and not any(symbol in snapshot for symbol in ("BTC", "ETH")):
+        return []
     lines.append("5日合计 " + " | ".join(five_day_parts))
     return lines
 
@@ -2241,17 +2292,27 @@ def fetch_stablecoin_summary() -> str:
     spot_lines: list[str] = []
     if global_volume or coinglass_market_structure:
         market_lines.append("加密市场")
-        if global_volume:
+        if global_volume.get("market_cap") is not None:
+            market_cap_percent = global_volume.get("market_cap_percent")
+            market_cap_change = (
+                f"{market_cap_percent:+.2f}%"
+                if isinstance(market_cap_percent, (int, float))
+                and math.isfinite(market_cap_percent)
+                else "暂不可用"
+            )
             market_lines.append(
                 f"总市值 {global_volume['market_cap'] / 1e12:.2f}万亿美元 | "
-                f"24H {global_volume['market_cap_percent']:+.2f}%"
+                f"24H {market_cap_change}"
+                + (" | 来源 CoinPaprika" if global_volume.get("market_source") == "CoinPaprika" else "")
             )
+        else:
+            market_lines.append("总市值 暂不可用")
         if coinglass_market_structure:
             dominance_line = (
                 f"BTC占比 {coinglass_market_structure['btc_dominance']:.2f}% | "
                 f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}%"
             )
-            if global_volume:
+            if global_volume.get("eth_dominance") is not None:
                 dominance_line += f" | ETH占比 {global_volume['eth_dominance']:.2f}%"
             exchange_line = (
                 f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
@@ -2267,11 +2328,13 @@ def fetch_stablecoin_summary() -> str:
                 dominance_line,
                 exchange_line,
             ])
-        elif global_volume:
-            market_lines.append(
-                f"BTC占比 {global_volume['btc_dominance']:.2f}% | "
-                f"ETH占比 {global_volume['eth_dominance']:.2f}%"
-            )
+        elif global_volume.get("btc_dominance") is not None or global_volume.get("eth_dominance") is not None:
+            dominance_parts = []
+            if global_volume.get("btc_dominance") is not None:
+                dominance_parts.append(f"BTC占比 {global_volume['btc_dominance']:.2f}%")
+            if global_volume.get("eth_dominance") is not None:
+                dominance_parts.append(f"ETH占比 {global_volume['eth_dominance']:.2f}%")
+            market_lines.append(" | ".join(dominance_parts))
         if global_volume_valid:
             volume_source = global_volume.get("volume_source", "CoinGecko")
             source_label = f" | 来源 {volume_source}" if volume_source != "CoinGecko" else ""

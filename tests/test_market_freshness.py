@@ -255,6 +255,7 @@ class GlobalVolumeTests(unittest.TestCase):
 
     def _fallback(self, volume=1.2e11, percent=20.0, age=0):
         return {
+            "market_cap_usd": 2.8e12,
             "volume_24h_usd": volume,
             "volume_24h_change_24h": percent,
             "last_updated": market.cn_now().timestamp() - age,
@@ -273,6 +274,8 @@ class GlobalVolumeTests(unittest.TestCase):
         self.assertEqual(result["percent"], 20.0)
         self.assertEqual(result["volume_source"], "CoinPaprika")
         self.assertEqual(result["market_cap"], 2.7e12)
+        self.assertEqual(result["market_cap_percent"], -2.0)
+        self.assertEqual(result["btc_dominance"], 60.0)
         self.assertEqual(result["eth_dominance"], 11.0)
         self.assertEqual(fetch.call_args.args[0], market.COINPAPRIKA_GLOBAL_URL)
 
@@ -349,6 +352,89 @@ class GlobalVolumeTests(unittest.TestCase):
             self.assertAlmostEqual(result["delta"], 1.2e11 - previous)
             self.assertEqual(result["percent"], percent)
 
+    def test_primary_request_failures_also_use_fallback(self):
+        errors = [
+            TimeoutError("timed out"),
+            urllib.error.URLError("connection failed"),
+            urllib.error.HTTPError(market.COINGECKO_GLOBAL_URL, 429, "limited", {}, None),
+            urllib.error.HTTPError(market.COINGECKO_GLOBAL_URL, 503, "unavailable", {}, None),
+            json.JSONDecodeError("invalid JSON", "", 0),
+            market.http.client.IncompleteRead(b"partial"),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch.object(
+                market, "fetch_market_json", side_effect=[error, self._fallback()],
+            ) as fetch:
+                result = market.fetch_global_volume()
+            self.assertTrue(result["volume_valid"])
+            self.assertEqual(result["volume_source"], "CoinPaprika")
+            self.assertEqual(result["current"], 1.2e11)
+            self.assertEqual(result["market_cap"], 2.8e12)
+            self.assertEqual(fetch.call_count, 2)
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+
+    def test_malformed_primary_response_also_uses_fallback(self):
+        for payload in (None, [], {}, {"data": None}, self._payload(1e11) | {"data": {}}):
+            with self.subTest(payload=payload), patch.object(
+                market, "fetch_market_json", side_effect=[payload, self._fallback()],
+            ):
+                result = market.fetch_global_volume()
+            self.assertTrue(result["volume_valid"])
+            self.assertEqual(result["volume_source"], "CoinPaprika")
+            self.assertEqual(result["market_cap"], 2.8e12)
+
+    def test_fallback_market_cap_is_validated_when_primary_is_down(self):
+        for cap in (None, float("nan"), float("inf"), 0, -1):
+            with self.subTest(cap=cap), patch.object(
+                market, "fetch_market_json", side_effect=[
+                    TimeoutError(), self._fallback() | {"market_cap_usd": cap},
+                ],
+            ):
+                result = market.fetch_global_volume()
+            self.assertFalse(result["volume_valid"])
+            self.assertIsNone(result["current"])
+
+    def test_both_sources_down_do_not_create_fake_market_data(self):
+        with patch.object(
+            market, "fetch_market_json", side_effect=[TimeoutError(), OSError()],
+        ):
+            result = market.fetch_global_volume()
+        self.assertFalse(result["volume_valid"])
+        self.assertIsNone(result["current"])
+        self.assertNotIn("market_cap", result)
+
+    def test_primary_failure_uses_available_fallback_market_metadata(self):
+        fallback = self._fallback() | {
+            "market_cap_change_24h": -1.5,
+            "bitcoin_dominance_percentage": 57.0,
+        }
+        with patch.object(
+            market, "fetch_market_json", side_effect=[TimeoutError(), fallback],
+        ):
+            result = market.fetch_global_volume()
+        self.assertTrue(result["volume_valid"])
+        self.assertEqual(result["market_cap"], 2.8e12)
+        self.assertEqual(result["market_cap_percent"], -1.5)
+        self.assertEqual(result["btc_dominance"], 57.0)
+        self.assertEqual(result["market_source"], "CoinPaprika")
+        self.assertNotIn("eth_dominance", result)
+
+    def test_invalid_optional_fallback_metadata_does_not_invent_changes(self):
+        for change, dominance in ((None, None), ("bad", "bad"), (float("nan"), float("nan")), (float("inf"), 101)):
+            with self.subTest(change=change, dominance=dominance), patch.object(
+                market, "fetch_market_json", side_effect=[
+                    TimeoutError(), self._fallback() | {
+                        "market_cap_change_24h": change,
+                        "bitcoin_dominance_percentage": dominance,
+                    },
+                ],
+            ):
+                result = market.fetch_global_volume()
+            self.assertTrue(result["volume_valid"])
+            self.assertIsNone(result["market_cap_percent"])
+            self.assertIsNone(result["btc_dominance"])
+
 
 class GlobalVolumeRenderingTests(unittest.TestCase):
     def _summary(self, global_volume, dex_volume=None):
@@ -412,6 +498,26 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertIn("全网 1200.00亿", summary)
         self.assertIn("CEX估算 暂不可用", summary)
         self.assertNotIn("CEX估算 -", summary)
+
+    def test_fallback_volume_renders_when_primary_market_metadata_is_missing(self):
+        volume = self._volume()
+        for key in ("market_cap", "market_cap_percent", "btc_dominance", "eth_dominance"):
+            volume.pop(key)
+        summary = self._summary(volume)
+        self.assertIn("总市值 暂不可用", summary)
+        self.assertIn("全网 1200.00亿", summary)
+        self.assertIn("CEX估算 1100.00亿", summary)
+        self.assertNotIn("ETH占比", summary)
+
+    def test_fallback_metadata_source_and_missing_change_are_visible(self):
+        volume = self._volume()
+        volume.pop("eth_dominance")
+        volume.update(market_cap_percent=None, market_source="CoinPaprika")
+        summary = self._summary(volume)
+        self.assertIn("总市值 2.70万亿美元 | 24H 暂不可用 | 来源 CoinPaprika", summary)
+        self.assertIn("BTC占比 60.00%", summary)
+        self.assertNotIn("ETH占比", summary)
+        self.assertIn("CEX估算 1100.00亿", summary)
 
 
 class MarketSeparatorTests(unittest.TestCase):
