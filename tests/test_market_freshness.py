@@ -414,6 +414,29 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertNotIn("CEX估算 -", summary)
 
 
+class MarketSeparatorTests(unittest.TestCase):
+    def test_live_and_cached_reports_use_short_separators(self):
+        self.assertEqual(market.TELEGRAM_SECTION_SEPARATOR, "━" * 20)
+        for separator in ("", "━" * 51, market.TELEGRAM_SECTION_SEPARATOR):
+            with self.subTest(separator_length=len(separator)):
+                summary = "\n".join(line for line in [
+                    "加密市场", "总市值 unchanged", separator,
+                    "市场现货（亿美元）", "全网 unchanged",
+                ] if line)
+                report = market.build_market_report(24, summary, generated_at="00:00")
+                self.assertEqual(report.splitlines(), [
+                    "市场全景 24H | 00:00",
+                    "加密市场", "总市值 unchanged",
+                    market.TELEGRAM_SECTION_SEPARATOR,
+                    "市场现货（亿美元）", "全网 unchanged",
+                ])
+
+    def test_old_and_new_separators_remain_recognizable(self):
+        self.assertTrue(market.is_telegram_section_separator("━" * 51))
+        self.assertTrue(market.is_telegram_section_separator(market.TELEGRAM_SECTION_SEPARATOR))
+        self.assertFalse(market.is_telegram_section_separator("市场现货（亿美元）"))
+
+
 class ChainDateTests(unittest.TestCase):
     def test_exact_beijing_interval(self):
         self.assertEqual(
