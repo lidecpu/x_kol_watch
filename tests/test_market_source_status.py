@@ -26,6 +26,83 @@ class StoredStateTests(unittest.TestCase):
 class MacroSourceStatusTests(StoredStateTests):
     fomc_page = "<h4>2026 FOMC Meetings</h4>\n<p>December 8-9</p>"
 
+    def test_calendar_dates_are_displayed_without_source_status_annotations(self):
+        for status in (
+            {"kind": "live"},
+            {"kind": "fallback"},
+            {"kind": "unverified"},
+            {"kind": "cache", "captured_at": "2026-10-31T12:00:00+08:00"},
+            {
+                "kind": "cache",
+                "captured_at": "2026-10-31T12:00:00+08:00",
+                "failed": True,
+            },
+        ):
+            with self.subTest(status=status):
+                calendar = {
+                    "美联储决议": dt.datetime(2026, 12, 10, 3, 0, tzinfo=market.CN_TZ),
+                    **self._bls(),
+                    "_status": {
+                        label: dict(status) for label in market.US_MACRO_CALENDAR_LABELS
+                    },
+                }
+                original = copy.deepcopy(calendar)
+                self.assertEqual(market.us_macro_calendar_lines(calendar), [
+                    "美国宏观日程",
+                    "非农/失业率 11-06 21:30 | CPI 11-10 21:30",
+                    "美联储决议 12-10 03:00",
+                ])
+                self.assertEqual(calendar, original)
+
+    def test_cached_reports_remove_only_macro_date_status_annotations(self):
+        for suffix in (
+            "（备用，未核验）",
+            "（旧缓存，未核验）",
+            "（缓存核验 10-31 12:00）",
+            "（缓存核验 10-31 12:00，刷新失败）",
+        ):
+            for captured_at, failed_at in (
+                (self.now - dt.timedelta(minutes=1), None),
+                (self.now - dt.timedelta(days=1), self.now - dt.timedelta(minutes=1)),
+            ):
+                with self.subTest(suffix=suffix, failed_at=failed_at):
+                    cached_summary = "\n".join([
+                        "美国宏观日程",
+                        f"非农/失业率 11-06 21:30{suffix} | CPI 11-10 21:30{suffix}",
+                        f"美联储决议 12-10 03:00{suffix}",
+                        market.TELEGRAM_SECTION_SEPARATOR,
+                        "Strategy（微策略）",
+                        "本次核验失败，沿用已核验缓存",
+                        "较新SEC文件未完成核验：10-26 | 非最新持仓确认",
+                        market.TELEGRAM_SECTION_SEPARATOR,
+                        "ETH 质押",
+                        "来源 ethereum.org | 指标更新时间未知",
+                        "观测值自 10-26 未变 | 来源新鲜度待核验",
+                    ])
+                    with patch.object(
+                        market, "load_market_summary_cache",
+                        return_value=(cached_summary, captured_at, failed_at),
+                    ), patch.object(
+                        market, "load_spot_etf_flow_cache", return_value=(None, None, None),
+                    ), patch.object(
+                        market, "fetch_us_macro_calendar",
+                        side_effect=AssertionError("cached calendar should not refresh"),
+                    ):
+                        summary = market.fetch_stablecoin_summary()
+                    self.assertEqual(summary.splitlines(), [
+                        "美国宏观日程",
+                        "非农/失业率 11-06 21:30 | CPI 11-10 21:30",
+                        "美联储决议 12-10 03:00",
+                        market.TELEGRAM_SECTION_SEPARATOR,
+                        "Strategy（微策略）",
+                        "本次核验失败，沿用已核验缓存",
+                        "较新SEC文件未完成核验：10-26 | 非最新持仓确认",
+                        market.TELEGRAM_SECTION_SEPARATOR,
+                        "ETH 质押",
+                        "来源 ethereum.org | 指标更新时间未知",
+                        "观测值自 10-26 未变 | 来源新鲜度待核验",
+                    ])
+
     def _event(self, release_at, captured_at=None, failed_at=None):
         event = {"release_at": release_at}
         if captured_at:
@@ -62,11 +139,15 @@ class MacroSourceStatusTests(StoredStateTests):
             calendar = market.fetch_us_macro_calendar()
             repeated = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
-        self.assertIn("非农/失业率 11-06 21:30（备用，未核验）", lines)
-        self.assertIn("CPI 11-10 21:30（备用，未核验）", lines)
+        self.assertIn("非农/失业率 11-06 21:30 | CPI 11-10 21:30", lines)
+        self.assertEqual(calendar["_status"]["非农"]["kind"], "fallback")
+        self.assertEqual(calendar["_status"]["CPI"]["kind"], "fallback")
         self.assertNotIn("captured_at", self.state.get("events", {}).get("非农", {}))
         repeated_lines = "\n".join(market.us_macro_calendar_lines(repeated))
-        self.assertIn("美联储决议 12-10 03:00（缓存核验 11-02 12:00）", repeated_lines)
+        self.assertIn("美联储决议 12-10 03:00", repeated_lines)
+        self.assertEqual(repeated["_status"]["美联储决议"], {
+            "kind": "cache", "captured_at": "2026-11-02T12:00:00+08:00", "failed": False,
+        })
 
     def test_failed_source_retries_after_short_cooldown_without_refetching_fomc(self):
         with patch.object(market, "fetch_bls_macro_calendar", side_effect=TimeoutError()), \
@@ -91,7 +172,10 @@ class MacroSourceStatusTests(StoredStateTests):
                 patch.object(market, "fetch_us_macro_page", return_value=self.fomc_page):
             calendar = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
-        self.assertIn("非农/失业率 11-06 21:30（缓存核验 10-31 12:00，刷新失败）", lines)
+        self.assertIn("非农/失业率 11-06 21:30 | CPI 11-10 21:30", lines)
+        self.assertEqual(calendar["_status"]["非农"], {
+            "kind": "cache", "captured_at": "2026-10-31T12:00:00+08:00", "failed": True,
+        })
         self.assertEqual(self.state["events"]["非农"]["captured_at"], "2026-10-31T12:00:00+08:00")
 
     def test_partial_bls_response_does_not_verify_missing_cpi(self):
@@ -100,7 +184,8 @@ class MacroSourceStatusTests(StoredStateTests):
                 patch.object(market, "fetch_us_macro_page", return_value=self.fomc_page):
             calendar = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
-        self.assertIn("CPI 11-10 21:30（备用，未核验）", lines)
+        self.assertIn("非农/失业率 11-06 21:30 | CPI 11-10 21:30", lines)
+        self.assertEqual(calendar["_status"]["CPI"]["kind"], "fallback")
         self.assertEqual(self.state["events"]["非农"]["captured_at"], "2026-11-02T12:00:00+08:00")
         self.assertNotIn("captured_at", self.state["events"]["CPI"])
 
@@ -116,7 +201,7 @@ class MacroSourceStatusTests(StoredStateTests):
             calendar = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
         self.assertIn("美联储决议 12-10 03:00", lines)
-        self.assertIn("未核验", lines)
+        self.assertEqual(calendar["_status"]["非农"]["kind"], "unverified")
         self.assertNotIn("captured_at", self.state["events"]["非农"])
 
     def test_legacy_success_does_not_prove_each_fallback_date_was_verified(self):
@@ -132,7 +217,8 @@ class MacroSourceStatusTests(StoredStateTests):
                 patch.object(market, "fetch_us_macro_page", return_value=self.fomc_page):
             calendar = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
-        self.assertIn("非农/失业率 11-06 21:30（旧缓存，未核验）", lines)
+        self.assertIn("非农/失业率 11-06 21:30 | CPI 11-10 21:30", lines)
+        self.assertEqual(calendar["_status"]["非农"]["kind"], "unverified")
         self.assertNotIn("captured_at", self.state["events"]["非农"])
 
     def test_future_corrupted_capture_time_is_not_reported_as_verified(self):
@@ -145,8 +231,9 @@ class MacroSourceStatusTests(StoredStateTests):
                 patch.object(market, "fetch_us_macro_page", return_value=self.fomc_page):
             calendar = market.fetch_us_macro_calendar()
         lines = "\n".join(market.us_macro_calendar_lines(calendar))
-        self.assertIn("非农/失业率 11-06 21:30（旧缓存，未核验）", lines)
-        self.assertNotIn("缓存核验 11-03", lines)
+        self.assertIn("非农/失业率 11-06 21:30 | CPI 11-10 21:30", lines)
+        self.assertEqual(calendar["_status"]["非农"]["kind"], "unverified")
+        self.assertNotIn("captured_at", self.state["events"]["非农"])
 
     def test_no_fallback_or_history_is_displayed_as_unavailable(self):
         self.now = dt.datetime(2027, 1, 2, 12, 0, tzinfo=market.CN_TZ)

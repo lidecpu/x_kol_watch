@@ -824,17 +824,6 @@ def us_macro_calendar_lines(calendar: dict[str, Any]) -> list[str]:
             f"{US_MACRO_CALENDAR_DISPLAY_LABELS.get(label, label)} "
             f"{release_at.strftime('%m-%d %H:%M')}"
         )
-        status = statuses.get(label, {})
-        kind = status.get("kind")
-        if kind == "fallback":
-            entry += "（备用，未核验）"
-        elif kind == "unverified":
-            entry += "（旧缓存，未核验）"
-        elif kind == "cache":
-            captured_at = parse_cache_timestamp(status.get("captured_at"))
-            if captured_at is not None:
-                failure = "，刷新失败" if status.get("failed") else ""
-                entry += f"（缓存核验 {captured_at.strftime('%m-%d %H:%M')}{failure}）"
         entries.append(entry)
     for label in ("非农", "CPI", "美联储决议"):
         if statuses.get(label, {}).get("kind") == "unavailable":
@@ -2152,6 +2141,13 @@ def normalize_stablecoin_summary_labels(summary: str) -> str:
     normalized = re.sub(
         r"链上确认交易（最新完整日 UTC \d{2}-\d{2}｜北京时间 (\d{2}-\d{2})）",
         r"链上确认交易（最新完整日 \1）",
+        normalized,
+    )
+    normalized = re.sub(
+        r"((?:非农/失业率|CPI|美联储决议) \d{2}-\d{2} \d{2}:\d{2})"
+        r"（(?:备用，未核验|旧缓存，未核验|"
+        r"缓存核验 \d{2}-\d{2} \d{2}:\d{2}(?:，刷新失败)?)）",
+        r"\1",
         normalized,
     )
     def replace_chain_date(match: re.Match[str]) -> str:
