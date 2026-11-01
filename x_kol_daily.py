@@ -92,9 +92,9 @@ BLS_MACRO_RELEASE_FALLBACKS = {
 }
 US_MACRO_CALENDAR_LABELS = frozenset({"非农", "CPI", "美联储决议"})
 US_MACRO_CALENDAR_DISPLAY_LABELS = {"非农": "非农/失业率"}
-US_MACRO_CALENDAR_CACHE_VERSION = 1
+US_MACRO_CALENDAR_CACHE_VERSION = 2
 US_MACRO_CALENDAR_CACHE_TTL_SECONDS = 24 * 60 * 60
-US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 24 * 60 * 60
+US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS = 30 * 60
 STRATEGY_PURCHASES_URL = "https://www.strategy.com/purchases"
 STRATEGY_SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK0001050446.json"
 STRATEGY_SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/1050446"
@@ -105,7 +105,7 @@ MARKET_HTTP_RETRIES = 2
 MARKET_RETRY_BASE_SECONDS = 2.0
 MARKET_SUMMARY_CACHE_TTL_SECONDS = 600
 MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS = 900
-MARKET_SUMMARY_CACHE_VERSION = 22
+MARKET_SUMMARY_CACHE_VERSION = 23
 GLOBAL_VOLUME_MAX_MARKET_CAP_RATIO = 5.0
 GLOBAL_VOLUME_MAX_AGE_SECONDS = 3600
 STRATEGY_BTC_CACHE_VERSION = 2
@@ -120,6 +120,7 @@ STRATEGY_BTC_LAST_VALID = {
     "total_cost_millions": 63727.0,
 }
 MARKET_SNAPSHOT_RETENTION_DAYS = 8
+ETH_STAKING_UNCHANGED_WARNING_SECONDS = 3 * 24 * 60 * 60
 COINGLASS_CACHE_TTL_SECONDS = 600
 COINGLASS_FAILURE_COOLDOWN_SECONDS = 900
 COINGLASS_CACHE_VERSION = 4
@@ -666,48 +667,42 @@ def future_macro_calendar(
     }
 
 
-def load_us_macro_calendar_cache() -> tuple[
-    dict[str, dt.datetime],
-    dt.datetime | None,
-    dt.datetime | None,
-]:
+def load_us_macro_calendar_cache() -> dict[str, dict[str, str]]:
     state = load_json(US_MACRO_STATE, {})
-    if not isinstance(state, dict) or state.get("version") != US_MACRO_CALENDAR_CACHE_VERSION:
-        return {}, None, None
-    raw_snapshot = state.get("snapshot")
-    snapshot: dict[str, dt.datetime] = {}
-    if isinstance(raw_snapshot, dict):
-        for label, value in raw_snapshot.items():
-            if label not in US_MACRO_CALENDAR_LABELS:
-                continue
-            parsed = parse_cache_timestamp(value)
-            if parsed is not None:
-                snapshot[label] = parsed.astimezone(CN_TZ)
-    return (
-        snapshot,
-        parse_cache_timestamp(state.get("captured_at")),
-        parse_cache_timestamp(state.get("failed_at")),
-    )
-
-
-def save_us_macro_calendar_cache(
-    calendar: dict[str, dt.datetime],
-    success: bool,
-) -> None:
-    state = load_json(US_MACRO_STATE, {})
-    if not isinstance(state, dict) or state.get("version") != US_MACRO_CALENDAR_CACHE_VERSION:
-        state = {"version": US_MACRO_CALENDAR_CACHE_VERSION}
-    state["snapshot"] = {
-        label: release_at.astimezone(CN_TZ).isoformat(timespec="minutes")
-        for label, release_at in calendar.items()
-        if label in US_MACRO_CALENDAR_LABELS and isinstance(release_at, dt.datetime)
-    }
-    if success:
-        state["captured_at"] = cn_now().isoformat(timespec="seconds")
-        state.pop("failed_at", None)
+    if not isinstance(state, dict):
+        return {}
+    if state.get("version") == US_MACRO_CALENDAR_CACHE_VERSION:
+        raw_events = state.get("events", {})
+    elif state.get("version") == 1 and isinstance(state.get("snapshot"), dict):
+        # Legacy snapshots can mix fallbacks with official dates even on partial success.
+        raw_events = {
+            label: {"release_at": value}
+            for label, value in state["snapshot"].items()
+        }
     else:
-        state["failed_at"] = cn_now().isoformat(timespec="seconds")
-    save_json(US_MACRO_STATE, state)
+        return {}
+    if not isinstance(raw_events, dict):
+        return {}
+    events = {}
+    now = cn_now()
+    for label in US_MACRO_CALENDAR_LABELS:
+        raw_event = raw_events.get(label)
+        if not isinstance(raw_event, dict):
+            continue
+        events[label] = {
+            key: parsed.astimezone(CN_TZ).isoformat(timespec="seconds")
+            for key in ("release_at", "captured_at", "failed_at")
+            if (parsed := parse_cache_timestamp(raw_event.get(key))) is not None
+            and (key == "release_at" or parsed <= now)
+        }
+    return events
+
+
+def save_us_macro_calendar_cache(events: dict[str, dict[str, str]]) -> None:
+    save_json(US_MACRO_STATE, {
+        "version": US_MACRO_CALENDAR_CACHE_VERSION,
+        "events": events,
+    })
 
 
 def fetch_bls_macro_calendar(now: dt.datetime) -> dict[str, dt.datetime]:
@@ -736,49 +731,83 @@ def fetch_bls_macro_calendar(now: dt.datetime) -> dict[str, dt.datetime]:
     return calendar
 
 
-def fetch_us_macro_calendar() -> dict[str, dt.datetime]:
+def fetch_us_macro_calendar() -> dict[str, Any]:
     now = cn_now()
-    cached, captured_at, failed_at = load_us_macro_calendar_cache()
-    calendar = bls_macro_schedule_fallback(now)
-    calendar.update(future_macro_calendar(cached, now))
-    if (
-        captured_at is not None
-        and US_MACRO_CALENDAR_LABELS.issubset(calendar)
-        and 0 <= (now - captured_at).total_seconds() < US_MACRO_CALENDAR_CACHE_TTL_SECONDS
-    ):
-        return calendar
-    if (
-        failed_at is not None
-        and calendar
-        and 0 <= (now - failed_at).total_seconds() < US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS
-    ):
-        print("[us-macro-cache] refresh cooldown active", file=sys.stderr)
-        return calendar
+    events = load_us_macro_calendar_cache()
+    live: set[str] = set()
 
-    errors: list[Exception] = []
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        bls_future = executor.submit(fetch_bls_macro_calendar, now)
-        fomc_future = executor.submit(
-            lambda: parse_fomc_calendar(fetch_us_macro_page(FOMC_CALENDAR_URL), now)
+    def needs_refresh(label: str) -> bool:
+        event = events.get(label, {})
+        failed_at = parse_cache_timestamp(event.get("failed_at"))
+        if failed_at is not None and (
+            0 <= (now - failed_at).total_seconds() < US_MACRO_CALENDAR_FAILURE_COOLDOWN_SECONDS
+        ):
+            return False
+        captured_at = parse_cache_timestamp(event.get("captured_at"))
+        release_at = parse_cache_timestamp(event.get("release_at"))
+        return not (
+            release_at is not None and release_at >= now
+            and captured_at is not None
+            and 0 <= (now - captured_at).total_seconds() < US_MACRO_CALENDAR_CACHE_TTL_SECONDS
+            and failed_at is None
         )
-        try:
-            calendar.update(bls_future.result())
-        except (OSError, ValueError, TypeError) as exc:
-            errors.append(exc)
-        try:
-            calendar["美联储决议"] = fomc_future.result()
-        except (OSError, ValueError, TypeError) as exc:
-            errors.append(exc)
-    calendar = future_macro_calendar(calendar, now)
-    if not calendar:
-        raise errors[0] if errors else ValueError("missing US macro calendar")
-    save_us_macro_calendar_cache(calendar, success=not errors)
-    if errors:
-        print("[us-macro-cache] using cached or fallback schedule", file=sys.stderr)
+
+    source_labels = {"BLS": ("非农", "CPI"), "FOMC": ("美联储决议",)}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        jobs = {
+            "BLS": lambda: fetch_bls_macro_calendar(now),
+            "FOMC": lambda: {
+                "美联储决议": parse_fomc_calendar(fetch_us_macro_page(FOMC_CALENDAR_URL), now),
+            },
+        }
+        futures = {
+            source: executor.submit(jobs[source])
+            for source, labels in source_labels.items()
+            if any(needs_refresh(label) for label in labels)
+        }
+        for source, future in futures.items():
+            try:
+                fetched = future.result()
+                fetched = future_macro_calendar(fetched, now)
+            except (OSError, ValueError, TypeError, AttributeError, http.client.HTTPException) as exc:
+                print(f"[us-macro-error] {source} {type(exc).__name__}: {exc}", file=sys.stderr)
+                fetched = {}
+            for label in source_labels[source]:
+                release_at = fetched.get(label)
+                if release_at is not None:
+                    events[label] = {
+                        "release_at": release_at.astimezone(CN_TZ).isoformat(timespec="seconds"),
+                        "captured_at": now.isoformat(timespec="seconds"),
+                    }
+                    live.add(label)
+                else:
+                    events.setdefault(label, {})["failed_at"] = now.isoformat(timespec="seconds")
+        if futures:
+            save_us_macro_calendar_cache(events)
+
+    fallback = bls_macro_schedule_fallback(now)
+    calendar: dict[str, Any] = {"_status": {}}
+    for label in US_MACRO_CALENDAR_LABELS:
+        event = events.get(label, {})
+        release_at = parse_cache_timestamp(event.get("release_at"))
+        captured_at = parse_cache_timestamp(event.get("captured_at"))
+        if release_at is not None and release_at >= now:
+            calendar[label] = release_at
+            kind = "live" if label in live else "cache" if captured_at is not None else "unverified"
+        elif label in fallback:
+            calendar[label] = fallback[label]
+            kind = "fallback"
+        else:
+            kind = "unavailable"
+        calendar["_status"][label] = {
+            "kind": kind,
+            "captured_at": event.get("captured_at"),
+            "failed": bool(event.get("failed_at")),
+        }
     return calendar
 
 
-def us_macro_calendar_lines(calendar: dict[str, dt.datetime]) -> list[str]:
+def us_macro_calendar_lines(calendar: dict[str, Any]) -> list[str]:
     scheduled = sorted(
         (
             (release_at, label)
@@ -788,16 +817,41 @@ def us_macro_calendar_lines(calendar: dict[str, dt.datetime]) -> list[str]:
         key=lambda item: item[0],
     )
     lines = ["美国宏观日程"]
-    entries = [
-        f"{US_MACRO_CALENDAR_DISPLAY_LABELS.get(label, label)} "
-        f"{release_at.strftime('%m-%d %H:%M')}"
-        for release_at, label in scheduled
-    ]
+    statuses = calendar.get("_status", {})
+    entries = []
+    for release_at, label in scheduled:
+        entry = (
+            f"{US_MACRO_CALENDAR_DISPLAY_LABELS.get(label, label)} "
+            f"{release_at.strftime('%m-%d %H:%M')}"
+        )
+        status = statuses.get(label, {})
+        kind = status.get("kind")
+        if kind == "fallback":
+            entry += "（备用，未核验）"
+        elif kind == "unverified":
+            entry += "（旧缓存，未核验）"
+        elif kind == "cache":
+            captured_at = parse_cache_timestamp(status.get("captured_at"))
+            if captured_at is not None:
+                failure = "，刷新失败" if status.get("failed") else ""
+                entry += f"（缓存核验 {captured_at.strftime('%m-%d %H:%M')}{failure}）"
+        entries.append(entry)
+    for label in ("非农", "CPI", "美联储决议"):
+        if statuses.get(label, {}).get("kind") == "unavailable":
+            entries.append(f"{US_MACRO_CALENDAR_DISPLAY_LABELS.get(label, label)} 暂不可用")
     lines.extend(" | ".join(entries[index:index + 2]) for index in range(0, len(entries), 2))
     return lines if entries else []
 
 
 def fetch_strategy_btc() -> dict[str, Any]:
+    try:
+        return fetch_strategy_btc_website()
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as exc:
+        print(f"[strategy-btc-website-error] {type(exc).__name__}: {exc}; trying SEC", file=sys.stderr)
+    return fetch_strategy_btc_sec()
+
+
+def fetch_strategy_btc_website() -> dict[str, Any]:
     request = urllib.request.Request(
         STRATEGY_PURCHASES_URL,
         headers={
@@ -805,13 +859,8 @@ def fetch_strategy_btc() -> dict[str, Any]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
         },
     )
-    try:
-        with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-            page = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        if exc.code != 403:
-            raise
-        return fetch_strategy_btc_sec()
+    with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+        page = response.read().decode("utf-8", "replace")
     parser = NextDataParser()
     parser.feed(page)
     if not parser.chunks:
@@ -981,6 +1030,7 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         })
     if not candidates:
         raise ValueError("missing Strategy SEC 8-K filing")
+    unverified_filings: list[str] = []
     for filing in sorted(candidates, key=lambda item: item["filing_date"], reverse=True)[:5]:
         accession_path = filing["accession"].replace("-", "")
         release_url = (
@@ -988,18 +1038,37 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
         )
         document_urls = [release_url]
         record = None
+        filing_incomplete = False
         for document_url in document_urls:
             request = urllib.request.Request(
                 document_url,
                 headers={"Accept": "text/html", "User-Agent": SEC_USER_AGENT},
             )
-            with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
-                page = response.read().decode("utf-8", "replace")
+            try:
+                with urllib.request.urlopen(request, timeout=STABLECOIN_TIMEOUT_SECONDS) as response:
+                    page = response.read().decode("utf-8", "replace")
+            except (OSError, http.client.HTTPException) as exc:
+                filing_incomplete = True
+                print(
+                    f"[strategy-btc-sec-document-error] filing={filing['filing_date']} "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
             parser = HTMLTextLinkParser()
             parser.feed(page)
             if re.search(r"Aggregate\s*BTC\s*Holdings|holds approximately", parser.text(), re.IGNORECASE):
-                record = parse_strategy_btc_sec(page)
-                break
+                try:
+                    record = parse_strategy_btc_sec(page)
+                except (ValueError, TypeError) as exc:
+                    filing_incomplete = True
+                    print(
+                        f"[strategy-btc-sec-parse-error] filing={filing['filing_date']} "
+                        f"{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                else:
+                    break
             if document_url != release_url:
                 continue
             # Some 8-Ks put the BTC table in a linked press-release exhibit.
@@ -1023,6 +1092,8 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
                     break
         if record is not None:
             break
+        if filing_incomplete and filing["filing_date"] not in unverified_filings:
+            unverified_filings.append(filing["filing_date"])
     else:
         raise ValueError("missing Strategy SEC BTC holdings in recent 8-K filings")
     previous = load_strategy_btc_cache()
@@ -1032,6 +1103,8 @@ def fetch_strategy_btc_sec() -> dict[str, Any]:
     record["verified_date"] = cn_now().date()
     record["verification_source"] = "SEC"
     record["filing_date"] = dt.date.fromisoformat(filing["filing_date"])
+    if unverified_filings:
+        record["unverified_filings"] = unverified_filings
     print(
         f"[strategy-btc-sec] filing={filing['filing_date']} "
         f"holdings={record['holdings']} as_of={record['holdings_as_of']}",
@@ -1072,6 +1145,18 @@ def normalize_strategy_btc_record(value: Any) -> dict[str, Any]:
         record["filing_date"] = filing_date
     if value.get("verification_source") == "SEC":
         record["verification_source"] = "SEC"
+    pending = value.get("unverified_filings")
+    if isinstance(pending, list) and record.get("verification_source") == "SEC":
+        dates = set()
+        for raw in pending:
+            try:
+                date = parse_date(raw)
+            except (TypeError, ValueError):
+                continue
+            if record.get("filing_date", record["record_date"]) <= date <= record["verified_date"]:
+                dates.add(date.isoformat())
+        if dates:
+            record["unverified_filings"] = sorted(dates, reverse=True)
     cutoff_time = str(value.get("holdings_as_of_time") or "")
     if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", cutoff_time):
         record["holdings_as_of_time"] = cutoff_time
@@ -1119,7 +1204,7 @@ def save_strategy_btc_cache(record: dict[str, Any]) -> None:
         "average_price": normalized["average_price"],
         "total_cost_millions": normalized["total_cost_millions"],
     }
-    for key in ("verification_source", "holdings_as_of_time"):
+    for key in ("verification_source", "holdings_as_of_time", "unverified_filings"):
         if key in normalized:
             state["strategy_btc"][key] = normalized[key]
     if "filing_date" in normalized:
@@ -1618,13 +1703,52 @@ def previous_eth_staking_total(day: str) -> float | None:
     return value if math.isfinite(value) and value >= 0 else None
 
 
-def save_eth_staking_snapshot(day: str, metrics: dict[str, float]) -> None:
+def save_eth_staking_snapshot(day: str, metrics: dict[str, float]) -> dict[str, Any]:
     state = load_json(MARKET_STATE, {"version": 1, "snapshots": {}})
     if not isinstance(state, dict):
         state = {"version": 1, "snapshots": {}}
     snapshots = state.get("snapshots")
     if not isinstance(snapshots, dict):
         snapshots = {}
+    now = cn_now()
+    values = {key: metrics[key] for key in ("total", "percent", "apr")}
+    previous = state.get("eth_staking_freshness", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    unchanged_since = now
+    last_changed_at = None
+    has_previous = all(key in previous for key in values)
+    if has_previous:
+        if all(previous[key] == value for key, value in values.items()):
+            observed_since = parse_cache_timestamp(previous.get("unchanged_since"))
+            if observed_since is not None and observed_since <= now:
+                unchanged_since = observed_since
+            last_changed_at = parse_cache_timestamp(previous.get("last_changed_at"))
+        else:
+            last_changed_at = now
+    else:
+        # Recover only the matching observed run; these are not upstream update times.
+        for snapshot_day in sorted(snapshots, reverse=True):
+            if snapshot_day > day:
+                continue
+            snapshot = snapshots[snapshot_day]
+            if not isinstance(snapshot, dict) or not any(
+                f"eth_staking_{key}" in snapshot for key in values
+            ):
+                continue
+            if any(snapshot.get(f"eth_staking_{key}") != value for key, value in values.items()):
+                break
+            observed_at = parse_cache_timestamp(snapshot.get("captured_at"))
+            if observed_at is None or observed_at > now:
+                break
+            unchanged_since = min(unchanged_since, observed_at)
+    freshness = values | {
+        "unchanged_since": unchanged_since.isoformat(timespec="seconds"),
+        "observed_at": now.isoformat(timespec="seconds"),
+    }
+    if last_changed_at is not None and unchanged_since <= last_changed_at <= now:
+        freshness["last_changed_at"] = last_changed_at.isoformat(timespec="seconds")
+    state["eth_staking_freshness"] = freshness
     snapshots.setdefault(day, {})
     if not isinstance(snapshots[day], dict):
         snapshots[day] = {}
@@ -1636,6 +1760,7 @@ def save_eth_staking_snapshot(day: str, metrics: dict[str, float]) -> None:
     state["version"] = 1
     state["snapshots"] = {key: snapshots[key] for key in keep}
     save_json(MARKET_STATE, state)
+    return freshness
 
 
 def parse_cache_timestamp(value: Any) -> dt.datetime | None:
@@ -2140,14 +2265,14 @@ def fetch_stablecoin_summary() -> str:
     coinglass_snapshot: dict[str, Any] = {}
     hyperliquid_liquidation: dict[str, Any] = {}
     coinglass_market_structure: dict[str, Any] = {}
-    eth_staking: dict[str, float] = {}
+    eth_staking: dict[str, Any] = {}
     us_treasury_debt: dict[str, Any] = {}
     us_treasury_yields: dict[str, Any] = {}
     spot_etf_flows: dict[str, Any] = {}
     etf_lines: list[str] = []
     strategy_btc: dict[str, Any] = {}
     bitmine_eth: dict[str, Any] = {}
-    us_macro_calendar: dict[str, dt.datetime] = {}
+    us_macro_calendar: dict[str, Any] = {}
     supply: dict[str, dict[str, float]] = {}
     volumes: dict[str, dict[str, float]] = {}
     derivatives_snapshot: float | None = None
@@ -2252,6 +2377,7 @@ def fetch_stablecoin_summary() -> str:
         try:
             strategy_btc = load_strategy_btc_cache()
             if strategy_btc:
+                strategy_btc = {**strategy_btc, "_stale": True}
                 verified_date = strategy_btc["verified_date"].isoformat()
                 print(
                     f"[strategy-btc-cache] using last verified record from {verified_date}",
@@ -2286,7 +2412,7 @@ def fetch_stablecoin_summary() -> str:
     if derivatives_snapshot is not None:
         save_derivatives_snapshot(today, derivatives_snapshot)
     if eth_staking_snapshot is not None:
-        save_eth_staking_snapshot(today, eth_staking_snapshot)
+        eth_staking.update(save_eth_staking_snapshot(today, eth_staking_snapshot) or {})
 
     market_lines: list[str] = []
     spot_lines: list[str] = []
@@ -2453,6 +2579,14 @@ def fetch_stablecoin_summary() -> str:
         staking_lines.append(
             f"比例 {compact_percent(eth_staking['percent'])} | APR {compact_percent(eth_staking['apr'])}"
         )
+        staking_lines.append("来源 ethereum.org | 指标更新时间未知")
+        unchanged_since = parse_cache_timestamp(eth_staking.get("unchanged_since"))
+        if unchanged_since is not None and (
+            (now - unchanged_since).total_seconds() >= ETH_STAKING_UNCHANGED_WARNING_SECONDS
+        ):
+            staking_lines.append(
+                f"观测值自 {unchanged_since.strftime('%m-%d')} 未变 | 来源新鲜度待核验"
+            )
         market_lines.extend(["ETH 质押", *staking_lines])
     stablecoin_lines: list[str] = []
     stablecoin_sections: list[str] = []
@@ -2498,8 +2632,9 @@ def fetch_stablecoin_summary() -> str:
         verified_date = strategy_btc["verified_date"].strftime("%m-%d")
         if strategy_btc.get("holdings_as_of_time"):
             holdings_as_of += f" {strategy_btc['holdings_as_of_time']}"
+        sec_verification_label = "SEC记录核验" if strategy_btc.get("unverified_filings") else "SEC核验"
         verification_label = (
-            "SEC核验" if strategy_btc.get("verification_source") == "SEC" else "官网核验"
+            sec_verification_label if strategy_btc.get("verification_source") == "SEC" else "官网核验"
         )
         filing_date = strategy_btc.get("filing_date")
         if (
@@ -2507,7 +2642,7 @@ def fetch_stablecoin_summary() -> str:
             and isinstance(filing_date, dt.date)
         ):
             verification_label = (
-                f"SEC披露 {filing_date.strftime('%m-%d')} | SEC核验"
+                f"SEC披露 {filing_date.strftime('%m-%d')} | {sec_verification_label}"
             )
         strategy_lines.extend([
             "Strategy（微策略）",
@@ -2516,6 +2651,12 @@ def fetch_stablecoin_summary() -> str:
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
         ])
+        if strategy_btc.get("_stale"):
+            strategy_lines.append("本次核验失败，沿用已核验缓存")
+        pending_filings = strategy_btc.get("unverified_filings", [])
+        if pending_filings:
+            dates = "、".join(dt.date.fromisoformat(value).strftime("%m-%d") for value in pending_filings)
+            strategy_lines.append(f"较新SEC文件未完成核验：{dates} | 非最新持仓确认")
     macro_lines = us_macro_calendar_lines(us_macro_calendar)
     bitmine_lines: list[str] = []
     if bitmine_eth:

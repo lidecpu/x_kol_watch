@@ -168,6 +168,84 @@ class StrategyParsingTests(unittest.TestCase):
                 patch.object(market, "fetch_strategy_btc_sec", return_value={"holdings": 900000}) as sec:
             self.assertEqual(market.fetch_strategy_btc()["holdings"], 900000)
         sec.assert_called_once()
+        error.close()
+
+    def test_incomplete_primary_still_checks_same_filing_exhibit(self):
+        filings = {"filings": {"recent": {
+            "form": ["8-K"],
+            "filingDate": ["2026-10-05"],
+            "accessionNumber": ["holdings"],
+            "primaryDocument": ["main.htm"],
+        }}}
+        primary = (
+            '<p>Strategy holds approximately 900,000 bitcoin.</p>'
+            '<a href="ex99.htm">Press release</a>'
+        )
+        with patch.object(market.urllib.request, "urlopen", side_effect=[
+            io.BytesIO(json.dumps(filings).encode()),
+            io.BytesIO(primary.encode()),
+            io.BytesIO(split_tables().encode()),
+        ]), patch.object(market, "load_strategy_btc_cache", return_value={}):
+            record = market.fetch_strategy_btc_sec()
+        self.assertEqual(record["holdings"], 900000)
+        self.assertEqual(record["filing_date"], dt.date(2026, 10, 5))
+        self.assertFalse(record.get("unverified_filings"))
+
+    def test_incomplete_newer_filing_does_not_relabel_older_record(self):
+        filings = {"filings": {"recent": {
+            "form": ["8-K", "8-K"],
+            "filingDate": ["2026-10-29", "2026-10-05"],
+            "accessionNumber": ["incomplete", "holdings"],
+            "primaryDocument": ["main.htm", "btc.htm"],
+        }}}
+        with patch.object(market.urllib.request, "urlopen", side_effect=[
+            io.BytesIO(json.dumps(filings).encode()),
+            io.BytesIO(b"<p>Strategy holds approximately 900,000 bitcoin.</p>"),
+            io.BytesIO(split_tables().encode()),
+        ]), patch.object(market, "load_strategy_btc_cache", return_value={}):
+            record = market.fetch_strategy_btc_sec()
+        self.assertEqual(record["filing_date"], dt.date(2026, 10, 5))
+        self.assertEqual(record["holdings_as_of"], dt.date(2026, 10, 5))
+        self.assertEqual(record["unverified_filings"], ["2026-10-29"])
+
+    def test_unreadable_exhibit_does_not_block_other_exhibits(self):
+        filings = {"filings": {"recent": {
+            "form": ["8-K"],
+            "filingDate": ["2026-10-05"],
+            "accessionNumber": ["holdings"],
+            "primaryDocument": ["main.htm"],
+        }}}
+        with patch.object(market.urllib.request, "urlopen", side_effect=[
+            io.BytesIO(json.dumps(filings).encode()),
+            io.BytesIO(b'<a href="broken.htm">Press release</a><a href="btc.htm">Press release</a>'),
+            TimeoutError("exhibit unavailable"),
+            io.BytesIO(split_tables().encode()),
+        ]), patch.object(market, "load_strategy_btc_cache", return_value={}):
+            record = market.fetch_strategy_btc_sec()
+        self.assertEqual(record["holdings"], 900000)
+        self.assertFalse(record.get("unverified_filings"))
+
+    def test_website_layout_change_uses_sec(self):
+        with patch.object(
+            market.urllib.request, "urlopen",
+            return_value=io.BytesIO(b"<main>New ledger layout</main>"),
+        ), patch.object(market, "fetch_strategy_btc_sec", return_value={"holdings": 900000}):
+            self.assertEqual(market.fetch_strategy_btc()["holdings"], 900000)
+
+    def test_cache_retains_newer_unverified_filing_warning(self):
+        record = market.parse_strategy_btc_sec(split_tables())
+        record.update(
+            verified_date=dt.date(2026, 11, 2),
+            verification_source="SEC",
+            filing_date=dt.date(2026, 10, 5),
+            unverified_filings=["2026-10-29"],
+        )
+        with patch.object(market, "load_json", return_value={}), \
+                patch.object(market, "save_json") as save:
+            market.save_strategy_btc_cache(record)
+        with patch.object(market, "load_json", return_value=save.call_args.args[1]):
+            restored = market.load_strategy_btc_cache()
+        self.assertEqual(restored.get("unverified_filings"), ["2026-10-29"])
 
     def test_cache_preserves_verification_and_cutoff(self):
         record = market.parse_strategy_btc_sec(split_tables())
@@ -437,12 +515,11 @@ class GlobalVolumeTests(unittest.TestCase):
 
 
 class GlobalVolumeRenderingTests(unittest.TestCase):
-    def _summary(self, global_volume, dex_volume=None):
+    def _summary(self, global_volume, dex_volume=None, **overrides):
         dex_volume = dex_volume or {
             "current": 1e10, "delta": 2e9, "percent": 25.0,
         }
-        with patch.multiple(
-            market,
+        replacements = dict(
             load_market_summary_cache=lambda: ("", None, None),
             refresh_cached_summary_etf=lambda summary, _: summary,
             previous_derivatives_volume=lambda _: None,
@@ -465,7 +542,9 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
             save_derivatives_snapshot=lambda *_: None,
             save_eth_staking_snapshot=lambda *_: None,
             save_json=lambda *_: None,
-        ):
+        )
+        replacements.update(overrides)
+        with patch.multiple(market, **replacements):
             return market.fetch_stablecoin_summary()
 
     def _volume(self):
@@ -518,6 +597,63 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertIn("BTC占比 60.00%", summary)
         self.assertNotIn("ETH占比", summary)
         self.assertIn("CEX估算 1100.00亿", summary)
+
+    def test_staking_unchanged_warning_reaches_report_without_inventing_source_date(self):
+        metrics = {"total": 43948738.0, "percent": 35.0, "apr": 2.5}
+        now = dt.datetime(2026, 11, 2, 12, 0, tzinfo=market.CN_TZ)
+        state = {"eth_staking_freshness": metrics | {
+            "unchanged_since": "2026-10-16T12:00:00+08:00",
+        }}
+        with patch.object(market, "cn_now", return_value=now):
+            summary = self._summary(
+                self._volume(),
+                fetch_eth_staking_metrics=lambda: metrics,
+                load_json=lambda *_: state,
+                save_eth_staking_snapshot=market.save_eth_staking_snapshot,
+            )
+        self.assertIn("质押量 4394.87万枚", summary)
+        self.assertIn("来源 ethereum.org | 指标更新时间未知", summary)
+        self.assertIn("观测值自 10-16 未变", summary)
+        self.assertNotIn("数据截至 11-02", summary)
+
+    def test_new_staking_observation_still_discloses_unknown_source_time(self):
+        metrics = {"total": 43948738.0, "percent": 35.0, "apr": 2.5}
+        summary = self._summary(
+            self._volume(),
+            fetch_eth_staking_metrics=lambda: metrics,
+            load_json=lambda *_: {},
+            save_eth_staking_snapshot=market.save_eth_staking_snapshot,
+        )
+        self.assertIn("指标更新时间未知", summary)
+        self.assertNotIn("观测值自", summary)
+
+    def test_newer_unverified_sec_filing_warning_is_visible_in_report(self):
+        record = market.parse_strategy_btc_sec(split_tables())
+        record.update(
+            verified_date=dt.date(2026, 11, 2), filing_date=dt.date(2026, 10, 5),
+            verification_source="SEC", unverified_filings=["2026-10-29"],
+        )
+        summary = self._summary(
+            self._volume(), fetch_strategy_btc=lambda: record,
+            save_strategy_btc_cache=lambda *_: None,
+        )
+        self.assertIn("SEC披露 10-05", summary)
+        self.assertIn("SEC记录核验 11-02", summary)
+        self.assertIn("较新SEC文件未完成核验：10-29", summary)
+        self.assertNotIn("SEC披露 10-29", summary)
+
+    def test_strategy_fallback_cache_is_explicitly_marked_after_refresh_failure(self):
+        record = market.parse_strategy_btc_sec(split_tables())
+        record.update(
+            verified_date=dt.date(2026, 10, 25), filing_date=dt.date(2026, 10, 5),
+            verification_source="SEC",
+        )
+        summary = self._summary(
+            self._volume(), fetch_strategy_btc=lambda: {},
+            load_strategy_btc_cache=lambda: record,
+        )
+        self.assertIn("本次核验失败，沿用已核验缓存", summary)
+        self.assertIn("SEC核验 10-25", summary)
 
 
 class MarketSeparatorTests(unittest.TestCase):
