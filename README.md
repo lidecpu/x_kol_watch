@@ -1,12 +1,12 @@
 # X KOL Watch
 
-每天扫描 `kols.txt` 里的 X/Twitter KOL，抓取最近 24 小时推文，英文自动翻译成中文，过滤低信息内容后发送 Telegram 摘要。
+每天发送市场全景到 Telegram；手动启用 KOL 扫描时，按 `kols.txt` 抓取最近 24 小时推文，英文自动翻译成中文，过滤低信息内容后生成摘要。
 
 这个仓库通过 Cloudflare Worker 定时触发 GitHub Actions，不需要在本地长期挂脚本。
 
 ## 功能
 
-- 每天北京时间 `23:30` 自动扫描最近 24 小时推文
+- 每天北京时间 `23:30` 自动发送市场全景，KOL 扫描需手动启用
 - 支持在 GitHub Actions 页面手动运行
 - 英文推文自动翻译成中文
 - Telegram 按 KOL 分组发送，长内容自动拆分
@@ -39,7 +39,7 @@ Secret 只填值本身，不要填 `KEY=value` 整行，也不要把 bot 名称�
 
 ## 手动运行
 
-进入 GitHub Actions 页面，选择 `X KOL Daily`，点击 `Run workflow` 即可手动触发。默认发送全量版 Telegram 摘要，并继续逐条过滤空内容、明显推广和低信号推文。
+进入 GitHub Actions 页面，选择 `X KOL Daily`，点击 `Run workflow` 即可手动触发。默认只发送市场全景；勾选 `scan_kol` 才扫描 KOL，另勾选 `send_kol` 才发送 KOL 摘要。KOL 摘要继续逐条过滤空内容、明显推广和低信号推文。
 
 本地只生成市场首页、不扫描 KOL：
 
@@ -60,6 +60,14 @@ python x_kol_daily.py --cdp-url "<VERIFIED_LOCAL_CDP_URL>" --max-kols 2 --no-sea
 ```
 
 `--cdp-url` 必须显式提供本机地址。程序访问 X 前会核验 Chrome 数据目录，不是 `szwechat8` 就停止。多个 Chrome 可能分别监听 IPv4、IPv6 的同一端口，不能只凭 `9222` 判断账号。程序不替换 Cookie，不关闭用户浏览器；扫描结束只关闭自己的标签页。这个模式默认不发送 Telegram，发送需要显式添加 `--send`，且不要同时使用 `--no-send`。它不改变 Cloudflare Worker 或 GitHub Actions 的定时流程，本机 Chrome 必须保持运行。
+
+### 扫描中断
+
+本机和云端 KOL 扫描遇到验证页、登录失效或限流时立即停止；连续两个账号页面未正常渲染时也停止，不自动重启浏览器继续尝试。单个页面渲染失败且后续页面正常时仍将整次扫描标记为未完成，不当作空结果成功。
+
+中断以非零退出码结束，已完成账号的推文和脱敏诊断单独保存为 `state/x-scan-incomplete-*.json`，标记 `complete=false`，列出中断阶段、账号、可观测的 HTTP 状态和未处理账号。文件不保存 Cookie、页面正文样本或已配置的凭据。中断结果不写入正式推文缓存、账号状态或报告，也不发送 Telegram；GitHub Actions 会通过现有诊断工件上传规则收集该文件。若磁盘写入失败，只记录脱敏错误类型，仍保持原始中断失败状态。
+
+这些处理用于保留证据和避免把失败当成功，不绕过 Cloudflare 验证，也不改变仅发送市场全景的定时流程。
 
 ### Cloudflare 浏览器只读探针
 

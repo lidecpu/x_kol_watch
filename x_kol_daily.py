@@ -138,6 +138,11 @@ PAGE_RENDER_ERROR = "X page did not render its main content"
 X_RATE_LIMIT_ERROR = "X returned an error or rate-limit page"
 X_AUTHENTICATION_REQUIRED_ERROR = "X authentication required"
 X_VERIFICATION_REQUIRED_ERROR = "X verification required"
+X_SCAN_STOP_ERRORS = (
+    X_AUTHENTICATION_REQUIRED_ERROR,
+    X_VERIFICATION_REQUIRED_ERROR,
+    X_RATE_LIMIT_ERROR,
+)
 RECOVERABLE_X_PAGE_ERRORS = (
     PAGE_RENDER_ERROR,
     X_RATE_LIMIT_ERROR,
@@ -174,6 +179,23 @@ CN_TZ = dt.timezone(dt.timedelta(hours=8))
 
 class RecoveryBudgetExceeded(RuntimeError):
     pass
+
+
+class XScanInterrupted(RuntimeError):
+    def __init__(
+        self,
+        reason: str,
+        results: list[dict[str, Any]],
+        *,
+        phase: str,
+        handle: str = "",
+        diagnostics: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(reason)
+        self.results = list(results)
+        self.handle = handle
+        self.diagnostics = diagnostics or {}
+        self.phase = str(self.diagnostics.get("page_health", {}).get("phase") or phase)
 
 
 class RecoveryBudget:
@@ -3533,13 +3555,16 @@ def navigate_x_page(
 ) -> None:
     """Detect document challenges even when navigation itself raises."""
     challenge_status: int | None = None
+    rate_limited = False
 
     def observe_response(response: Any) -> None:
-        nonlocal challenge_status
+        nonlocal challenge_status, rate_limited
         if response.request.resource_type != "document" or response.frame != page.main_frame:
             return
         if response.header_value("cf-mitigated") == "challenge":
             challenge_status = response.status
+        if response.status == 429:
+            rate_limited = True
 
     page.on("response", observe_response)
     try:
@@ -3550,7 +3575,7 @@ def navigate_x_page(
         try:
             response = page.reload(**options) if url is None else page.goto(url, **options)
         except Exception:
-            if challenge_status is None:
+            if challenge_status is None and not rate_limited:
                 raise
         else:
             if response is not None:
@@ -3567,6 +3592,16 @@ def navigate_x_page(
                 "http_status": challenge_status,
             }
         raise RuntimeError(X_VERIFICATION_REQUIRED_ERROR) from None
+    if rate_limited:
+        if diagnostics is not None:
+            diagnostics["page_health"] = {
+                "phase": phase,
+                "cloudflare_challenge": False,
+                "error_page": True,
+                "challenge_source": "response_status",
+                "http_status": 429,
+            }
+        raise RuntimeError(X_RATE_LIMIT_ERROR) from None
 
 
 def wait_for_x_page_ready(
@@ -3666,6 +3701,20 @@ def new_x_context(browser: Any, cookies: list[dict[str, Any]]) -> Any:
     context.route("**/*", route_static_assets)
     context.add_cookies(cookies)
     return context
+
+
+def close_x_scan_resource(resource: Any, label: str) -> None:
+    # Cleanup must not replace an in-flight scan error and its partial results.
+    preserving_error = sys.exc_info()[0] is not None
+    try:
+        resource.close()
+    except Exception as exc:
+        if not preserving_error:
+            raise
+        print(
+            f"[x-scan-cleanup] {label} close failed: {type(exc).__name__}",
+            file=sys.stderr, flush=True,
+        )
 
 
 def chromium_launch_env() -> dict[str, str]:
@@ -4075,6 +4124,8 @@ def scrape_handle(
     diagnostics: dict[str, Any] | None = None,
     deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     clean_handle = handle.lstrip("@")
     if diagnostics is not None:
         diagnostics.setdefault("profile_tweets", 0)
@@ -4112,7 +4163,11 @@ def scrape_handle(
                 deadline_monotonic,
             )
         except Exception as exc:
-            if url_index == 0 or str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+            if (
+                url_index == 0
+                or str(exc) in (*X_SCAN_STOP_ERRORS, PAGE_RENDER_ERROR)
+                or isinstance(exc, PlaywrightTimeoutError)
+            ):
                 raise
             if diagnostics is not None:
                 diagnostics["search_fallback_error"] = f"{type(exc).__name__}: {exc}"
@@ -4565,6 +4620,8 @@ def scrape_all_cdp(
     scroll_wait_ms: int,
     search_fallback: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     endpoint = local_cdp_url(endpoint)
     started = time.monotonic()
     try:
@@ -4580,6 +4637,10 @@ def scrape_all_cdp(
     # Use the selected profile as-is and close only the tab owned by this scan.
     page = browser.contexts[0].new_page()
     results: list[dict[str, Any]] = []
+    active_phase = "home"
+    active_handle = ""
+    active_diagnostics: dict[str, Any] = {}
+    page_failure_streak = 0
     try:
         page.goto("chrome://version", wait_until="domcontentloaded", timeout=10_000)
         profile_path = page.evaluate(
@@ -4590,9 +4651,9 @@ def scrape_all_cdp(
             raise RuntimeError(
                 "CDP is not connected to Google szwechat8; verify the Chrome profile and loopback address"
             )
-        navigate_x_page(page, "https://x.com/home", phase="home")
+        navigate_x_page(page, "https://x.com/home", active_diagnostics, phase="home")
         wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
-        ensure_x_page_healthy(page, phase="home")
+        ensure_x_page_healthy(page, diagnostics=active_diagnostics, phase="home")
         for index, kol in enumerate(kols, 1):
             diagnostics: dict[str, Any] = {
                 "profile_tweets": 0,
@@ -4609,21 +4670,27 @@ def scrape_all_cdp(
                     "diagnostics": {**diagnostics, "auto_recheck_paused": True},
                 })
                 continue
+            active_phase = "profile"
+            active_handle = kol["handle"]
+            active_diagnostics = diagnostics
             try:
                 tweets = scrape_handle(
                     page, kol["handle"], hours, limit, scrolls,
                     page_wait_ms, scroll_wait_ms, search_fallback, diagnostics,
                 )
             except Exception as exc:
-                if str(exc) in {
-                    X_AUTHENTICATION_REQUIRED_ERROR,
-                    X_VERIFICATION_REQUIRED_ERROR,
-                    X_RATE_LIMIT_ERROR,
-                }:
+                if str(exc) in X_SCAN_STOP_ERRORS:
                     raise
                 tweets, status, error = [], "error", f"{type(exc).__name__}: {exc}"
+                render_failure = (
+                    str(exc) == PAGE_RENDER_ERROR
+                    or isinstance(exc, PlaywrightTimeoutError)
+                )
+                diagnostics["deferred_recovery"] = render_failure
+                page_failure_streak = page_failure_streak + 1 if render_failure else 0
             else:
                 status, error = "ok", ""
+                page_failure_streak = 0
             results.append({
                 **kol, "status": status, "error": error, "tweets": tweets,
                 "diagnostics": diagnostics,
@@ -4633,8 +4700,28 @@ def scrape_all_cdp(
                 file=sys.stderr,
                 flush=True,
             )
+            if page_failure_streak >= GLOBAL_PAGE_FAILURE_STREAK:
+                raise RuntimeError(GLOBAL_PAGE_DEFERRED_ERROR)
+        failed_page = next((
+            item for item in results
+            if item.get("diagnostics", {}).get("deferred_recovery")
+        ), None)
+        if failed_page is not None:
+            active_phase = "profile"
+            active_handle = failed_page["handle"]
+            active_diagnostics = failed_page["diagnostics"]
+            raise RuntimeError(PAGE_RENDER_ERROR)
+    except Exception as exc:
+        if str(exc) in (
+            *X_SCAN_STOP_ERRORS, PAGE_RENDER_ERROR, GLOBAL_PAGE_DEFERRED_ERROR,
+        ):
+            raise XScanInterrupted(
+                str(exc), results, phase=active_phase,
+                handle=active_handle, diagnostics=active_diagnostics,
+            ) from None
+        raise
     finally:
-        page.close()
+        close_x_scan_resource(page, "owned_tab")
     return results, {"x_total": time.monotonic() - started}
 
 
@@ -4666,7 +4753,9 @@ def scrape_all(
     results: list[dict[str, Any]] = []
     phase_timings: dict[str, float] = {}
     scan_started = time.monotonic()
-    recovery_budget: RecoveryBudget | None = None
+    active_phase = "home"
+    active_handle = ""
+    active_diagnostics: dict[str, Any] = {}
     with sync_playwright() as p:
         launch_args = [
             "--disable-gpu",
@@ -4688,6 +4777,7 @@ def scrape_all(
             try:
                 page = context.new_page()
                 home_diagnostics: dict[str, Any] = {}
+                active_diagnostics = home_diagnostics
                 try:
                     navigate_x_page(page, "https://x.com/home", home_diagnostics, "home")
                     wait_for_x_page_ready(page, max(page_wait_ms, 5000), None)
@@ -4759,6 +4849,9 @@ def scrape_all(
                         "page_retries": 0,
                         "rename_checks": 0,
                     }
+                    active_phase = "profile"
+                    active_handle = handle
+                    active_diagnostics = diagnostics
                     rename_attempted = False
                     final_page_error = False
                     while True:
@@ -4775,17 +4868,19 @@ def scrape_all(
                                 diagnostics,
                             )
                         except Exception as exc:
-                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                            if str(exc) in X_SCAN_STOP_ERRORS:
                                 raise
                             if str(exc) == ACCOUNT_UNAVAILABLE_ERROR and not rename_attempted:
                                 rename_attempted = True
                                 try:
-                                    renamed_handle, checked = recover_renamed_handle(page, handle, page_wait_ms)
+                                    renamed_handle, checked = recover_renamed_handle(
+                                        page, handle, page_wait_ms, diagnostics,
+                                    )
                                     diagnostics["rename_checks"] = checked
                                     if renamed_handle:
                                         record_handle_alias(handle, renamed_handle)
                                 except Exception as recovery_exc:
-                                    if str(recovery_exc) == X_VERIFICATION_REQUIRED_ERROR:
+                                    if str(recovery_exc) in X_SCAN_STOP_ERRORS:
                                         raise
                                     diagnostics["rename_error"] = f"{type(recovery_exc).__name__}: {recovery_exc}"
                                     renamed_handle = ""
@@ -4794,6 +4889,7 @@ def scrape_all(
                                     kol.setdefault("configured_handle", previous_handle)
                                     kol["handle"] = renamed_handle
                                     handle = renamed_handle
+                                    active_handle = handle
                                     diagnostics["renamed_from"] = previous_handle
                                     diagnostics["renamed_to"] = renamed_handle
                                     print(
@@ -4914,25 +5010,7 @@ def scrape_all(
                             file=sys.stderr,
                             flush=True,
                         )
-                        break
-                    recycle_reason = (
-                        "search_fallback_error"
-                        if diagnostics.get("search_fallback_failed")
-                        else ""
-                    )
-                    if recycle_reason and index < total_kols:
-                        diagnostics["context_recycled_after_error"] = True
-                        diagnostics["context_recycle_reason"] = recycle_reason
-                        print(
-                            f"[x-context-recycle] {handle} reason={recycle_reason} "
-                            "continuing=true",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        replacement_context = new_x_context(browser, cookies)
-                        context.close()
-                        context = replacement_context
-                        page = context.new_page()
+                        raise RuntimeError(GLOBAL_PAGE_DEFERRED_ERROR)
                 phase_timings["x_profiles"] = time.monotonic() - profile_started
                 profile_page_failure = any(
                     item.get("diagnostics", {}).get("global_page_breaker_triggered")
@@ -4983,6 +5061,9 @@ def scrape_all(
                     for fallback_index, item in enumerate(selected_fallbacks, 1):
                         handle = str(item.get("handle") or "")
                         diagnostics = item.setdefault("diagnostics", {})
+                        active_phase = "search_fallback"
+                        active_handle = handle
+                        active_diagnostics = diagnostics
                         if fallback_budget.remaining_seconds < 2.0:
                             for pending_item in selected_fallbacks[fallback_index - 1:]:
                                 pending_item.setdefault("diagnostics", {})[
@@ -5015,14 +5096,21 @@ def scrape_all(
                                 fallback_budget.deadline(),
                             )
                         except Exception as exc:
-                            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+                            if str(exc) in X_SCAN_STOP_ERRORS:
                                 raise
                             fallback_error = f"{type(exc).__name__}: {exc}"
                             diagnostics["search_fallback_error"] = fallback_error
                             diagnostics["search_fallback_failed"] = True
+                            recoverable_page_error = (
+                                str(exc) in RECOVERABLE_X_PAGE_ERRORS
+                                or isinstance(exc, PlaywrightTimeoutError)
+                            )
                             budget_exhausted = (
                                 isinstance(exc, RecoveryBudgetExceeded)
-                                or fallback_budget.remaining_seconds < 1.0
+                                or (
+                                    fallback_budget.remaining_seconds < 1.0
+                                    and not recoverable_page_error
+                                )
                             )
                             if budget_exhausted:
                                 diagnostics["search_fallback_budget_exhausted"] = True
@@ -5037,10 +5125,6 @@ def scrape_all(
                                     flush=True,
                                 )
                                 break
-                            recoverable_page_error = (
-                                str(exc) in RECOVERABLE_X_PAGE_ERRORS
-                                or isinstance(exc, PlaywrightTimeoutError)
-                            )
                             print(
                                 f"[search-fallback {fallback_index}/{total_fallbacks}] "
                                 f"{handle} failed {time.time() - started:.1f}s "
@@ -5060,7 +5144,7 @@ def scrape_all(
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                                break
+                                raise RuntimeError(PAGE_RENDER_ERROR) from exc
                             continue
                         item["tweets"] = tweets
                         print(
@@ -5078,57 +5162,32 @@ def scrape_all(
                         flush=True,
                     )
                 phase_timings["x_fallback"] = time.monotonic() - fallback_started
+                failed_page = next((
+                    item for item in results
+                    if item.get("status") == "error"
+                    and item.get("diagnostics", {}).get("deferred_recovery")
+                ), None)
+                if failed_page is not None:
+                    active_phase = "profile"
+                    active_handle = str(failed_page.get("handle") or "")
+                    active_diagnostics = failed_page.get("diagnostics", {})
+                    raise RuntimeError(PAGE_RENDER_ERROR)
             finally:
-                context.close()
-            has_deferred_recovery = any(
-                item.get("status") == "error"
-                and (
-                    item.get("diagnostics", {}).get("deferred_recovery")
-                    or str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
-                )
-                for item in results
-            )
-            recovery_started = time.monotonic()
-            if has_deferred_recovery:
-                browser.close()
-                recovery_budget = RecoveryBudget(RECOVERY_TOTAL_BUDGET_SECONDS)
-                print(
-                    f"[x-deferred-recovery] quiet start "
-                    f"seconds={RECOVERY_QUIET_SECONDS:.0f}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                recovery_budget.sleep(RECOVERY_QUIET_SECONDS)
-                browser = p.chromium.launch(**launch_kwargs)
-                print(
-                    f"[x-deferred-recovery] quiet complete; browser restarted "
-                    f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                rescan_page_render_failures(
-                    browser,
-                    cookies,
-                    results,
-                    hours,
-                    limit,
-                    page_wait_ms,
-                    scroll_wait_ms,
-                    recovery_budget,
-                )
-            phase_timings["x_recovery"] = time.monotonic() - recovery_started
+                close_x_scan_resource(context, "context")
+        except Exception as exc:
+            if str(exc) in (
+                *X_SCAN_STOP_ERRORS, PAGE_RENDER_ERROR, GLOBAL_PAGE_DEFERRED_ERROR,
+            ):
+                raise XScanInterrupted(
+                    str(exc), results, phase=active_phase,
+                    handle=active_handle, diagnostics=active_diagnostics,
+                ) from None
+            raise
         finally:
             try:
-                browser.close()
+                close_x_scan_resource(browser, "browser")
             finally:
                 cleanup_chromium_debug_log()
-    if recovery_budget is not None:
-        print(
-            f"[x-recovery-budget] spent={recovery_budget.spent_seconds:.1f}s "
-            f"limit={recovery_budget.limit_seconds:.0f}s",
-            file=sys.stderr,
-            flush=True,
-        )
     phase_timings["x_total"] = time.monotonic() - scan_started
     return results, phase_timings
 
@@ -5276,6 +5335,128 @@ def save_json(path: Path, payload: Any) -> None:
     tmp.replace(path)
 
 
+def save_interrupted_x_scan(
+    interruption: XScanInterrupted,
+    kols: list[dict[str, str]],
+    hours: int,
+) -> Path:
+    # Diagnostic-only output must never become a normal report or tweet cache.
+    health_fields = (
+        "phase", "login_required", "verification_required", "cloudflare_challenge",
+        "error_page", "account_unavailable", "account_unavailable_reason",
+        "has_main", "challenge_source", "http_status",
+    )
+
+    def safe_health(diagnostics: dict[str, Any]) -> dict[str, Any]:
+        health = diagnostics.get("page_health", {})
+        return {
+            key: health[key] for key in health_fields
+            if key in health and isinstance(health[key], (str, bool, int))
+        }
+
+    health = safe_health(interruption.diagnostics)
+    reason = {
+        X_VERIFICATION_REQUIRED_ERROR: "verification_required",
+        X_AUTHENTICATION_REQUIRED_ERROR: "authentication_required",
+        X_RATE_LIMIT_ERROR: "rate_limit",
+        GLOBAL_PAGE_DEFERRED_ERROR: "consecutive_page_failures",
+        PAGE_RENDER_ERROR: "page_render_failure",
+    }.get(str(interruption), "scan_interrupted")
+    if health.get("cloudflare_challenge"):
+        reason = "cloudflare_challenge"
+    records = [
+        dict(item) for item in interruption.results
+        if not item.get("diagnostics", {}).get("global_page_deferred")
+    ]
+    active = next((
+        item for item in records
+        if str(item.get("handle") or "").lower() == interruption.handle.lower()
+    ), None)
+    if interruption.handle and active is None:
+        active = next((
+            dict(row) for row in kols
+            if row["handle"].lower() == interruption.handle.lower()
+        ), {"handle": interruption.handle})
+        active.update({"status": "interrupted", "error": reason, "tweets": []})
+        records.append(active)
+    elif active is not None and active.get("status") == "ok":
+        active["status"] = "interrupted"
+        active["error"] = reason
+    results = []
+    for item in records:
+        row = {
+            key: item[key] for key in (
+                "name", "handle", "configured_handle", "status", "error",
+            ) if key in item
+        }
+        row["tweets"] = [
+            {key: tweet[key] for key in (
+                "handle", "url", "text", "created_at", "created_at_ms",
+            ) if key in tweet}
+            for tweet in item.get("tweets", [])
+        ]
+        row["page_health"] = safe_health(item.get("diagnostics", {}))
+        results.append(row)
+    processed = {
+        str(item.get("configured_handle") or item.get("handle") or "").lower()
+        for item in records
+    }
+    unprocessed = [
+        row["handle"] for row in kols
+        if str(row.get("configured_handle") or row["handle"]).lower() not in processed
+    ]
+    now = cn_now()
+    payload = {
+        "version": 1,
+        "complete": False,
+        "created_at": now.isoformat(),
+        "hours": hours,
+        "stop": {
+            "reason": reason,
+            "phase": interruption.phase,
+            "handle": interruption.handle,
+            "page_health": health,
+        },
+        "summary": {
+            "planned": len(kols),
+            "success": sum(item.get("status") == "ok" for item in results),
+            "failed": sum(item.get("status") in {"error", "interrupted"} for item in results),
+            "paused": sum(item.get("status") == "paused" for item in results),
+            "unprocessed": len(unprocessed),
+        },
+        "unprocessed_handles": unprocessed,
+        "results": results,
+    }
+    secrets = [
+        value for key in (
+            "X_AUTH", "X_CT0", "CLOUDFLARE_BROWSER_API_TOKEN", "TELEGRAM_BOT_TOKEN",
+        ) if (value := os.environ.get(key, "").strip())
+    ]
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, str):
+            for secret in secrets:
+                value = value.replace(secret, "[REDACTED]")
+            return value
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, dict):
+            return {key: redact(item) for key, item in value.items()}
+        return value
+
+    payload = redact(payload)
+    print(
+        "[x-scan-interrupted] " + json.dumps({
+            "complete": False, "stop": payload["stop"], "summary": payload["summary"],
+        }, ensure_ascii=False),
+        file=sys.stderr, flush=True,
+    )
+    path = STATE_DIR / f"x-scan-incomplete-{now.strftime('%Y%m%d-%H%M%S-%f')}.json"
+    save_json(path, payload)
+    print(f"[x-scan-diagnostic] {path}", file=sys.stderr, flush=True)
+    return path
+
+
 def cached_status_ids(handle: str, limit: int = RENAME_STATUS_CANDIDATES) -> list[str]:
     target = canonical_handle(handle).lower()
     store = load_json(TWEET_STORE, {"version": 1, "tweets": {}}, strict=True)
@@ -5306,26 +5487,38 @@ def cached_status_ids(handle: str, limit: int = RENAME_STATUS_CANDIDATES) -> lis
     return status_ids
 
 
-def recover_renamed_handle(page: Any, handle: str, page_wait_ms: int) -> tuple[str, int]:
+def recover_renamed_handle(
+    page: Any,
+    handle: str,
+    page_wait_ms: int,
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple[str, int]:
     status_ids = cached_status_ids(handle)
     for status_id in status_ids:
         try:
-            navigate_x_page(page, f"https://x.com/i/status/{status_id}", phase="rename_status")
+            navigate_x_page(
+                page, f"https://x.com/i/status/{status_id}",
+                diagnostics, phase="rename_status",
+            )
             page.wait_for_timeout(page_wait_ms)
-            ensure_x_page_healthy(page)
+            ensure_x_page_healthy(page, diagnostics=diagnostics, phase="rename_status")
             candidate = canonical_handle(page.evaluate(STATUS_AUTHOR_JS, status_id))
             if not candidate or candidate.lower() == handle.lower():
                 continue
             navigate_x_page(
                 page,
                 f"https://x.com/{urllib.parse.quote(candidate.lstrip('@'))}",
+                diagnostics,
                 phase="rename_profile",
             )
             page.wait_for_timeout(page_wait_ms)
-            ensure_x_page_healthy(page, account_page=True)
+            ensure_x_page_healthy(
+                page, account_page=True,
+                diagnostics=diagnostics, phase="rename_profile",
+            )
             return candidate, len(status_ids)
         except Exception as exc:
-            if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
+            if str(exc) in X_SCAN_STOP_ERRORS:
                 raise
             continue
     return "", len(status_ids)
@@ -7145,17 +7338,27 @@ def main() -> int:
     run_started = time.monotonic()
     phase_timings: dict[str, float] = {}
     phase_started = time.monotonic()
-    results, x_phase_timings = scrape_all(
-        kols,
-        args.hours,
-        args.limit,
-        args.scrolls,
-        headless=not args.headed,
-        page_wait_ms=args.page_wait_ms,
-        scroll_wait_ms=args.scroll_wait_ms,
-        search_fallback=args.search_fallback,
-        cdp_url=args.cdp_url,
-    )
+    try:
+        results, x_phase_timings = scrape_all(
+            kols,
+            args.hours,
+            args.limit,
+            args.scrolls,
+            headless=not args.headed,
+            page_wait_ms=args.page_wait_ms,
+            scroll_wait_ms=args.scroll_wait_ms,
+            search_fallback=args.search_fallback,
+            cdp_url=args.cdp_url,
+        )
+    except XScanInterrupted as exc:
+        try:
+            save_interrupted_x_scan(exc, kols, args.hours)
+        except OSError as write_error:
+            print(
+                f"[x-scan-diagnostic] write failed: {type(write_error).__name__}",
+                file=sys.stderr, flush=True,
+            )
+        raise
     phase_timings["x_scan"] = time.monotonic() - phase_started
     phase_timings.update(x_phase_timings)
     update_kol_status(results)

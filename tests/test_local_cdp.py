@@ -46,10 +46,10 @@ class LocalCdpScanTests(unittest.TestCase):
             {"name": "second", "handle": "@second", "note": ""},
         ]
 
-    def scan(self, rows=None):
+    def scan(self, rows=None, search_fallback=False):
         return kol.scrape_all_cdp(
             self.playwright, "http://127.0.0.1:9222",
-            self.rows if rows is None else rows, 24, 8, 2, 2500, 900, False,
+            self.rows if rows is None else rows, 24, 8, 2, 2500, 900, search_fallback,
         )
 
     def assert_user_browser_preserved(self):
@@ -85,6 +85,121 @@ class LocalCdpScanTests(unittest.TestCase):
             self.scan()
         scrape.assert_called_once()
         self.assert_user_browser_preserved()
+
+    @patch.object(kol, "ensure_x_page_healthy")
+    @patch.object(kol, "wait_for_x_page_ready")
+    def test_access_restrictions_carry_prior_results_and_evidence(self, wait, healthy):
+        tweet = {"url": "https://x.com/first/status/123", "text": "Public update"}
+
+        def scrape(page, handle, *args):
+            if handle == "@first":
+                return [tweet]
+            args[-1]["page_health"] = {
+                "phase": "search_fallback",
+                "cloudflare_challenge": True,
+                "http_status": 403,
+            }
+            raise RuntimeError(kol.X_VERIFICATION_REQUIRED_ERROR)
+
+        with (
+            patch.object(kol, "scrape_handle", side_effect=scrape),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(kol.XScanInterrupted) as failure,
+        ):
+            self.scan()
+        self.assertEqual(failure.exception.results[0]["tweets"], [tweet])
+        self.assertEqual(failure.exception.handle, "@second")
+        self.assertEqual(failure.exception.phase, "search_fallback")
+        self.assertEqual(failure.exception.diagnostics["page_health"]["http_status"], 403)
+        self.assert_user_browser_preserved()
+
+    @patch.object(kol, "ensure_x_page_healthy")
+    @patch.object(kol, "wait_for_x_page_ready")
+    def test_owned_tab_cleanup_failure_cannot_replace_interruption(self, wait, healthy):
+        tweet = {"url": "https://x.com/first/status/123"}
+        self.page.close.side_effect = RuntimeError("private cleanup details")
+        output = io.StringIO()
+        with (
+            patch.object(kol, "scrape_handle", side_effect=[
+                [tweet], RuntimeError(kol.X_VERIFICATION_REQUIRED_ERROR),
+            ]),
+            redirect_stderr(output),
+            self.assertRaises(kol.XScanInterrupted) as failure,
+        ):
+            self.scan()
+        self.assertEqual(failure.exception.results[0]["tweets"], [tweet])
+        self.assertEqual(str(failure.exception), kol.X_VERIFICATION_REQUIRED_ERROR)
+        self.assertNotIn("private cleanup details", output.getvalue())
+        self.assert_user_browser_preserved()
+
+    def test_home_restriction_carries_evidence_and_does_not_start_profiles(self):
+        response = MagicMock()
+        response.request.resource_type = "document"
+        response.frame = self.page.main_frame
+        response.status = 429
+        response.header_value.return_value = None
+        self.page.goto.side_effect = [None, response]
+        with (
+            patch.object(kol, "scrape_handle", side_effect=AssertionError("must stop at home")),
+            self.assertRaises(kol.XScanInterrupted) as failure,
+        ):
+            self.scan()
+        self.assertEqual(failure.exception.phase, "home")
+        self.assertEqual(failure.exception.results, [])
+        self.assertEqual(failure.exception.diagnostics["page_health"]["http_status"], 429)
+        self.assert_user_browser_preserved()
+
+    @patch.object(kol, "ensure_x_page_healthy")
+    @patch.object(kol, "wait_for_x_page_ready")
+    def test_consecutive_render_failures_stop_before_next_profile(self, wait, healthy):
+        rows = self.rows + [{"name": "third", "handle": "@third", "note": ""}]
+        with (
+            patch.object(kol, "scrape_handle", side_effect=[
+                RuntimeError(kol.PAGE_RENDER_ERROR),
+                RuntimeError(kol.PAGE_RENDER_ERROR),
+                AssertionError("must not visit third"),
+            ]),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(kol.XScanInterrupted) as failure,
+        ):
+            self.scan(rows)
+        self.assertEqual(str(failure.exception), kol.GLOBAL_PAGE_DEFERRED_ERROR)
+        self.assertEqual(failure.exception.handle, "@second")
+        self.assertEqual(len(failure.exception.results), 2)
+        self.assert_user_browser_preserved()
+
+    @patch.object(kol, "ensure_x_page_healthy")
+    @patch.object(kol, "wait_for_x_page_ready")
+    def test_isolated_render_failure_keeps_later_success_but_is_not_complete(self, wait, healthy):
+        tweet = {"url": "https://x.com/second/status/123"}
+        with (
+            patch.object(kol, "scrape_handle", side_effect=[
+                RuntimeError(kol.PAGE_RENDER_ERROR), [tweet],
+            ]),
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(kol.XScanInterrupted) as failure,
+        ):
+            self.scan()
+        self.assertEqual(str(failure.exception), kol.PAGE_RENDER_ERROR)
+        self.assertEqual(failure.exception.handle, "@first")
+        self.assertEqual(failure.exception.results[1]["tweets"], [tweet])
+        self.assert_user_browser_preserved()
+
+    @patch.object(kol, "ensure_x_page_healthy")
+    @patch.object(kol, "wait_for_x_page_ready")
+    def test_search_render_failure_is_not_reported_as_an_empty_success(self, wait, healthy):
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        for error in (RuntimeError(kol.PAGE_RENDER_ERROR), PlaywrightTimeoutError("timeout")):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(kol, "scrape_handle_url", side_effect=[None, error]),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(kol.XScanInterrupted) as failure,
+                ):
+                    self.scan(self.rows[:1], search_fallback=True)
+                self.assertEqual(failure.exception.results[0]["status"], "error")
+                self.assertEqual(str(failure.exception), kol.PAGE_RENDER_ERROR)
 
     @patch.object(kol, "ensure_x_page_healthy")
     @patch.object(kol, "wait_for_x_page_ready")

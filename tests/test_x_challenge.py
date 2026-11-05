@@ -217,7 +217,7 @@ class ChallengePropagationTests(unittest.TestCase):
         scrape.assert_called_once()
         browser.new_context.return_value.close.assert_called_once()
 
-    def test_generic_page_failures_keep_deferred_recovery(self):
+    def test_generic_page_failures_stop_without_deferred_recovery(self):
         playwright = MagicMock()
         with (
             patch.object(kol, "wait_for_x_page_ready"),
@@ -225,14 +225,24 @@ class ChallengePropagationTests(unittest.TestCase):
             patch.object(kol, "scrape_handle", side_effect=RuntimeError(kol.PAGE_RENDER_ERROR)),
             patch.object(kol, "RecoveryBudget") as budget,
             patch.object(kol, "rescan_page_render_failures") as rescan,
+            self.assertRaises(kol.XScanInterrupted) as failure,
         ):
-            budget.return_value.remaining_seconds = 30.0
-            budget.return_value.spent_seconds = 60.0
-            budget.return_value.limit_seconds = 90.0
             self.scan_cloud(playwright, search_fallback=False)
-        budget.return_value.sleep.assert_called_once_with(kol.RECOVERY_QUIET_SECONDS)
-        rescan.assert_called_once()
-        self.assertEqual(playwright.chromium.launch.call_count, 2)
+        self.assertEqual(str(failure.exception), kol.GLOBAL_PAGE_DEFERRED_ERROR)
+        self.assertEqual(len(failure.exception.results), 2)
+        budget.assert_not_called()
+        rescan.assert_not_called()
+        playwright.chromium.launch.assert_called_once()
+        playwright.chromium.launch.return_value.close.assert_called_once()
+
+    def test_search_access_restrictions_are_not_swallowed_as_empty_results(self):
+        for reason in (kol.X_RATE_LIMIT_ERROR, kol.X_AUTHENTICATION_REQUIRED_ERROR):
+            with (
+                self.subTest(reason=reason),
+                patch.object(kol, "scrape_handle_url", side_effect=[None, RuntimeError(reason)]),
+                self.assertRaisesRegex(RuntimeError, reason),
+            ):
+                kol.scrape_handle(MagicMock(), "@first", 24, 8, 2, 2500, 900, True, {})
 
     def test_failed_scan_never_writes_cache_or_sends_telegram(self):
         for send_mode in ("--send", "--no-send"):
