@@ -150,11 +150,7 @@ RECOVERABLE_X_PAGE_ERRORS = (
 )
 ACCOUNT_UNAVAILABLE_ERROR = "X account unavailable"
 GLOBAL_PAGE_DEFERRED_ERROR = "X scan deferred after global page failure"
-RECOVERY_TOTAL_BUDGET_SECONDS = 90.0
-RECOVERY_QUIET_SECONDS = 60.0
 GLOBAL_PAGE_FAILURE_STREAK = 2
-RECOVERY_ATTEMPT_CAP_SECONDS = 8.0
-RECOVERY_MIN_ATTEMPT_SECONDS = 3.0
 SEARCH_FALLBACK_TOTAL_BUDGET_SECONDS = 180.0
 MAX_PLANNED_X_PAGE_LOADS_PER_RUN = 88
 MAX_SEARCH_FALLBACK_SCROLLS = 2
@@ -219,14 +215,6 @@ class RecoveryBudget:
         if remaining <= 0:
             raise RecoveryBudgetExceeded("X recovery budget exhausted")
         return self.started_at_monotonic + self.limit_seconds
-
-    def sleep(self, seconds: float) -> None:
-        delay = max(0.0, float(seconds))
-        if delay <= 0:
-            return
-        if self.remaining_seconds <= delay:
-            raise RecoveryBudgetExceeded("X recovery budget exhausted")
-        time.sleep(delay)
 
 
 class TelegramIPv4HTTPSConnection(http.client.HTTPSConnection):
@@ -4231,191 +4219,6 @@ def fmt_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m{sec:02d}s"
     return f"{sec}s"
-
-
-def rescan_page_render_failures(
-    browser: Any,
-    cookies: list[dict[str, Any]],
-    results: list[dict[str, Any]],
-    hours: int,
-    limit: int,
-    page_wait_ms: int,
-    scroll_wait_ms: int,
-    recovery_budget: RecoveryBudget,
-) -> None:
-    pending_items = [
-        item
-        for item in results
-        if item.get("status") == "error"
-        and (
-            item.get("diagnostics", {}).get("deferred_recovery")
-            or str(item.get("error") or "").endswith(RECOVERABLE_X_PAGE_ERRORS)
-        )
-    ]
-    if not pending_items:
-        return
-    for item in pending_items:
-        diagnostics = item.setdefault("diagnostics", {})
-        diagnostics.setdefault("recovery_original_error", str(item.get("error") or ""))
-    print(
-        f"[x-deferred-recovery] queued={len(pending_items)} "
-        "mode=shared-profile-only "
-        f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
-        file=sys.stderr,
-        flush=True,
-    )
-    context = None
-    home_diagnostics: dict[str, Any] = {}
-    try:
-        deadline_monotonic = recovery_budget.deadline()
-        context = new_x_context(browser, cookies)
-        page = context.new_page()
-        navigate_x_page(
-            page, "https://x.com/home", home_diagnostics, "recovery_home_probe",
-            deadline_monotonic,
-        )
-        recovery_wait_for_timeout(
-            page,
-            max(page_wait_ms, 5000),
-            deadline_monotonic,
-        )
-        ensure_x_page_healthy(
-            page,
-            diagnostics=home_diagnostics,
-            phase="recovery_home_probe",
-            deadline_monotonic=deadline_monotonic,
-        )
-    except Exception as exc:
-        if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
-            if context is not None:
-                context.close()
-            raise
-        probe_error = f"{type(exc).__name__}: {exc}"
-        for item in pending_items:
-            diagnostics = item.setdefault("diagnostics", {})
-            diagnostics["fresh_context_recovered"] = False
-            diagnostics["recovery_home_probe_error"] = probe_error
-            diagnostics["recovery_home_probe_diagnostics"] = home_diagnostics
-            diagnostics["recovery_budget_spent_seconds"] = round(
-                recovery_budget.spent_seconds,
-                3,
-            )
-            if isinstance(exc, RecoveryBudgetExceeded):
-                diagnostics["recovery_budget_exhausted"] = True
-        print(
-            f"[x-deferred-recovery] home probe failed "
-            f"error={probe_error}",
-            file=sys.stderr,
-            flush=True,
-        )
-        if context is not None:
-            context.close()
-            context = None
-        return
-    else:
-        for item in pending_items:
-            diagnostics = item.setdefault("diagnostics", {})
-            diagnostics["recovery_home_probe_healthy"] = True
-        print(
-            f"[x-deferred-recovery] home probe healthy "
-            f"budget_remaining={recovery_budget.remaining_seconds:.1f}s",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    try:
-        for item_index, item in enumerate(pending_items):
-            handle = str(item.get("handle") or "")
-            started = time.time()
-            retry_diagnostics: dict[str, Any] = {
-                "profile_tweets": 0,
-                "search_fallback_used": False,
-                "scroll_rounds": 0,
-                "early_stops": 0,
-            }
-            diagnostics = item.setdefault("diagnostics", {})
-            remaining_seconds = recovery_budget.remaining_seconds
-            if remaining_seconds < RECOVERY_MIN_ATTEMPT_SECONDS:
-                for pending_item in pending_items[item_index:]:
-                    pending_diagnostics = pending_item.setdefault("diagnostics", {})
-                    pending_diagnostics["recovery_budget_exhausted"] = True
-                    pending_diagnostics["recovery_budget_spent_seconds"] = round(
-                        recovery_budget.spent_seconds,
-                        3,
-                    )
-                print(
-                    f"[x-deferred-recovery] remaining={len(pending_items) - item_index} "
-                    f"deferred; budget_remaining={remaining_seconds:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                break
-            attempt_seconds = min(RECOVERY_ATTEMPT_CAP_SECONDS, remaining_seconds)
-            diagnostics["fresh_context_retry"] = int(
-                diagnostics.get("fresh_context_retry") or 0
-            ) + 1
-            diagnostics["page_retries"] = int(diagnostics.get("page_retries") or 0) + 1
-            diagnostics["recovery_attempted"] = True
-            diagnostics["recovery_budget_limit_seconds"] = recovery_budget.limit_seconds
-            diagnostics["recovery_quiet_seconds"] = RECOVERY_QUIET_SECONDS
-            diagnostics["recovery_profile_only"] = True
-            print(
-                f"[x-deferred-recovery] {handle} start "
-                f"mode=profile-only attempt_budget={attempt_seconds:.1f}s",
-                file=sys.stderr,
-                flush=True,
-            )
-            try:
-                deadline_monotonic = min(
-                    recovery_budget.deadline(),
-                    time.monotonic() + attempt_seconds,
-                )
-                tweets = scrape_handle(
-                    page,
-                    handle,
-                    hours,
-                    limit,
-                    0,
-                    page_wait_ms,
-                    scroll_wait_ms,
-                    False,
-                    retry_diagnostics,
-                    deadline_monotonic,
-                )
-            except Exception as exc:
-                if str(exc) == X_VERIFICATION_REQUIRED_ERROR:
-                    raise
-                diagnostics["fresh_context_recovered"] = False
-                diagnostics["fresh_context_error"] = f"{type(exc).__name__}: {exc}"
-                diagnostics["fresh_context_diagnostics"] = retry_diagnostics
-                if isinstance(exc, RecoveryBudgetExceeded):
-                    diagnostics["recovery_attempt_timed_out"] = True
-                print(
-                    f"[x-deferred-recovery] {handle} failed "
-                    f"{time.time() - started:.1f}s error={type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            else:
-                diagnostics["fresh_context_recovered"] = True
-                diagnostics["fresh_context_diagnostics"] = retry_diagnostics
-                item["status"] = "ok"
-                item["error"] = ""
-                item["tweets"] = tweets
-                print(
-                    f"[x-deferred-recovery] {handle} recovered tweets={len(tweets)} "
-                    f"{time.time() - started:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            finally:
-                diagnostics["recovery_budget_spent_seconds"] = round(
-                    recovery_budget.spent_seconds,
-                    3,
-                )
-    finally:
-        if context is not None:
-            context.close()
 
 
 def local_cdp_url(value: str) -> str:

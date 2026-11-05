@@ -152,12 +152,10 @@ class ChallengePropagationTests(unittest.TestCase):
             patch.object(kol, "wait_for_x_page_ready"),
             patch.object(kol, "ensure_x_page_healthy"),
             patch.object(kol, "scrape_handle", side_effect=RuntimeError(kol.X_VERIFICATION_REQUIRED_ERROR)) as scrape,
-            patch.object(kol, "rescan_page_render_failures") as rescan,
             self.assertRaisesRegex(RuntimeError, kol.X_VERIFICATION_REQUIRED_ERROR),
         ):
             self.scan_cloud(playwright, search_fallback=True)
         scrape.assert_called_once()
-        rescan.assert_not_called()
         playwright.chromium.launch.assert_called_once()
         playwright.chromium.launch.return_value.close.assert_called_once()
 
@@ -175,47 +173,10 @@ class ChallengePropagationTests(unittest.TestCase):
             patch.object(kol, "ensure_x_page_healthy"),
             patch.object(kol, "scrape_handle", return_value=[]),
             patch.object(kol, "scrape_handle_search_fallback", side_effect=RuntimeError(kol.X_VERIFICATION_REQUIRED_ERROR)) as search,
-            patch.object(kol, "rescan_page_render_failures") as rescan,
             self.assertRaisesRegex(RuntimeError, kol.X_VERIFICATION_REQUIRED_ERROR),
         ):
             self.scan_cloud(playwright, search_fallback=True)
         search.assert_called_once()
-        rescan.assert_not_called()
-
-    def test_recovery_home_challenge_closes_context_and_stops(self):
-        browser = MagicMock()
-        page = browser.new_context.return_value.new_page.return_value
-        page.goto.return_value = challenged_response(page)
-        pending = [{"status": "error", "error": kol.PAGE_RENDER_ERROR, "diagnostics": {}}]
-        budget = kol.RecoveryBudget(90)
-        with (
-            redirect_stderr(io.StringIO()),
-            patch.object(kol, "scrape_handle") as scrape,
-            self.assertRaisesRegex(RuntimeError, kol.X_VERIFICATION_REQUIRED_ERROR),
-        ):
-            kol.rescan_page_render_failures(browser, [], pending, 24, 8, 2500, 900, budget)
-        scrape.assert_not_called()
-        browser.new_context.return_value.close.assert_called_once()
-
-    def test_recovery_profile_challenge_stops_other_retries(self):
-        browser = MagicMock()
-        pending = [
-            {**row, "status": "error", "error": kol.PAGE_RENDER_ERROR, "diagnostics": {}}
-            for row in self.rows
-        ]
-        with (
-            redirect_stderr(io.StringIO()),
-            patch.object(kol, "navigate_x_page"),
-            patch.object(kol, "recovery_wait_for_timeout"),
-            patch.object(kol, "ensure_x_page_healthy"),
-            patch.object(kol, "scrape_handle", side_effect=RuntimeError(kol.X_VERIFICATION_REQUIRED_ERROR)) as scrape,
-            self.assertRaisesRegex(RuntimeError, kol.X_VERIFICATION_REQUIRED_ERROR),
-        ):
-            kol.rescan_page_render_failures(
-                browser, [], pending, 24, 8, 2500, 900, kol.RecoveryBudget(90),
-            )
-        scrape.assert_called_once()
-        browser.new_context.return_value.close.assert_called_once()
 
     def test_generic_page_failures_stop_without_deferred_recovery(self):
         playwright = MagicMock()
@@ -224,14 +185,12 @@ class ChallengePropagationTests(unittest.TestCase):
             patch.object(kol, "ensure_x_page_healthy"),
             patch.object(kol, "scrape_handle", side_effect=RuntimeError(kol.PAGE_RENDER_ERROR)),
             patch.object(kol, "RecoveryBudget") as budget,
-            patch.object(kol, "rescan_page_render_failures") as rescan,
             self.assertRaises(kol.XScanInterrupted) as failure,
         ):
             self.scan_cloud(playwright, search_fallback=False)
         self.assertEqual(str(failure.exception), kol.GLOBAL_PAGE_DEFERRED_ERROR)
         self.assertEqual(len(failure.exception.results), 2)
         budget.assert_not_called()
-        rescan.assert_not_called()
         playwright.chromium.launch.assert_called_once()
         playwright.chromium.launch.return_value.close.assert_called_once()
 

@@ -39,7 +39,6 @@ class ScanInterruptionTests(unittest.TestCase):
         stack.enter_context(patch.object(kol, "cleanup_chromium_debug_log"))
         stack.enter_context(patch.object(kol, "wait_for_x_page_ready"))
         stack.enter_context(patch.object(kol, "ensure_x_page_healthy"))
-        stack.enter_context(patch.object(kol, "rescan_page_render_failures"))
         budget = stack.enter_context(patch.object(kol, "RecoveryBudget"))
         budget.return_value.remaining_seconds = 180.0
         budget.return_value.spent_seconds = 0.0
