@@ -36,21 +36,7 @@ export default {
       return jsonResponse({ ok: false, error: "GitHub dispatch failed" }, 502);
     }
   },
-
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runScheduled(env));
-  },
 };
-
-async function runScheduled(env) {
-  try {
-    const result = await triggerGithub(env, "cron");
-    logDispatch(result);
-  } catch (error) {
-    logDispatch({ ok: false, source: "cron", error: errorMessage(error) }, "error");
-    throw error;
-  }
-}
 
 async function triggerGithub(env, source) {
   requireEnv(env, "GITHUB_TOKEN");
@@ -58,7 +44,6 @@ async function triggerGithub(env, source) {
   const owner = env.GITHUB_OWNER || "lidecpu";
   const repo = env.GITHUB_REPO || "x_kol_watch";
   const workflow = env.GITHUB_WORKFLOW || "x-kol-daily.yml";
-  // Scheduled production runs must always use the production branch.
   const ref = "main";
   const { activeRuns, ignoredRuns } = await listActiveRuns(env, owner, repo, workflow, ref);
   const sendOnceKey = beijingSendOnceKey();
