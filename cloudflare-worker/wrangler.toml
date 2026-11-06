@@ -7,7 +7,7 @@ enabled = true
 head_sampling_rate = 1
 
 [triggers]
-crons = ["30 15 * * *"]
+crons = []
 
 [vars]
 GITHUB_OWNER = "lidecpu"
