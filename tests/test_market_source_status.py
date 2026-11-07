@@ -54,55 +54,6 @@ class MacroSourceStatusTests(StoredStateTests):
                 ])
                 self.assertEqual(calendar, original)
 
-    def test_cached_reports_remove_only_macro_date_status_annotations(self):
-        for suffix in (
-            "（备用，未核验）",
-            "（旧缓存，未核验）",
-            "（缓存核验 10-31 12:00）",
-            "（缓存核验 10-31 12:00，刷新失败）",
-        ):
-            for captured_at, failed_at in (
-                (self.now - dt.timedelta(minutes=1), None),
-                (self.now - dt.timedelta(days=1), self.now - dt.timedelta(minutes=1)),
-            ):
-                with self.subTest(suffix=suffix, failed_at=failed_at):
-                    cached_summary = "\n".join([
-                        "美国宏观日程",
-                        f"非农/失业率 11-06 21:30{suffix} | CPI 11-10 21:30{suffix}",
-                        f"美联储决议 12-10 03:00{suffix}",
-                        market.TELEGRAM_SECTION_SEPARATOR,
-                        "Strategy（微策略）",
-                        "本次核验失败，沿用已核验缓存",
-                        "较新SEC文件未完成核验：10-26 | 非最新持仓确认",
-                        market.TELEGRAM_SECTION_SEPARATOR,
-                        "ETH 质押",
-                        "来源 ethereum.org | 指标更新时间未知",
-                        "观测值自 10-26 未变 | 来源新鲜度待核验",
-                    ])
-                    with patch.object(
-                        market, "load_market_summary_cache",
-                        return_value=(cached_summary, captured_at, failed_at),
-                    ), patch.object(
-                        market, "load_spot_etf_flow_cache", return_value=(None, None, None),
-                    ), patch.object(
-                        market, "fetch_us_macro_calendar",
-                        side_effect=AssertionError("cached calendar should not refresh"),
-                    ):
-                        summary = market.fetch_stablecoin_summary()
-                    self.assertEqual(summary.splitlines(), [
-                        "美国宏观日程",
-                        "非农/失业率 11-06 21:30 | CPI 11-10 21:30",
-                        "美联储决议 12-10 03:00",
-                        market.TELEGRAM_SECTION_SEPARATOR,
-                        "Strategy（微策略）",
-                        "本次核验失败，沿用已核验缓存",
-                        "较新SEC文件未完成核验：10-26 | 非最新持仓确认",
-                        market.TELEGRAM_SECTION_SEPARATOR,
-                        "ETH 质押",
-                        "来源 ethereum.org | 指标更新时间未知",
-                        "观测值自 10-26 未变 | 来源新鲜度待核验",
-                    ])
-
     def _event(self, release_at, captured_at=None, failed_at=None):
         event = {"release_at": release_at}
         if captured_at:

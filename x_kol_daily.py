@@ -1908,42 +1908,12 @@ def save_spot_etf_flow_cache(snapshot: dict[str, Any]) -> None:
 
 
 def fetch_spot_etf_flow_snapshot() -> dict[str, Any]:
-    cached, captured_at, failed_at = load_spot_etf_flow_cache()
     now = cn_now()
     snapshot: dict[str, Any] = {}
-    changed = False
     for symbol, url in (
         ("BTC", FARSIDE_BITCOIN_ETF_FLOW_URL),
         ("ETH", FARSIDE_ETHEREUM_ETF_FLOW_URL),
     ):
-        raw_asset = cached.get(symbol) if cached else None
-        asset = dict(raw_asset) if isinstance(raw_asset, dict) else {}
-        # Existing caches stored both assets' timestamps on the shared wrapper.
-        legacy_asset = bool(asset) and "_captured_at" not in asset and "_failed_at" not in asset
-        asset_captured_at = parse_cache_timestamp(asset.get("_captured_at"))
-        asset_failed_at = parse_cache_timestamp(asset.get("_failed_at"))
-        if legacy_asset:
-            asset_captured_at, asset_failed_at = captured_at, failed_at
-            if captured_at is not None:
-                asset["_captured_at"] = captured_at.isoformat(timespec="seconds")
-        try:
-            spot_etf_flow_values(asset)
-            available = True
-        except (ValueError, TypeError, KeyError, AttributeError):
-            available = False
-        if available and asset_captured_at is not None:
-            cache_age = (now - asset_captured_at).total_seconds()
-            if 0 <= cache_age < SPOT_ETF_FLOW_CACHE_TTL_SECONDS:
-                snapshot[symbol] = asset
-                continue
-        if asset_failed_at is not None:
-            failure_age = (now - asset_failed_at).total_seconds()
-            if 0 <= failure_age < SPOT_ETF_FLOW_FAILURE_COOLDOWN_SECONDS:
-                asset["_stale"] = True
-                asset["_failed_at"] = asset_failed_at.isoformat(timespec="seconds")
-                snapshot[symbol] = asset
-                print(f"[spot-etf-cache] {symbol} refresh cooldown", file=sys.stderr)
-                continue
         try:
             current = fetch_farside_etf_flow(url)
             spot_etf_flow_values(current)
@@ -1952,13 +1922,8 @@ def fetch_spot_etf_flow_snapshot() -> dict[str, Any]:
                 "_captured_at": now.isoformat(timespec="seconds"),
             }
         except (OSError, ValueError, TypeError, KeyError, AttributeError, http.client.HTTPException) as exc:
-            asset["_stale"] = True
-            asset["_failed_at"] = now.isoformat(timespec="seconds")
-            snapshot[symbol] = asset
+            snapshot[symbol] = {}
             print(f"[spot-etf-error] {symbol} {type(exc).__name__}: {exc}", file=sys.stderr)
-        changed = True
-    if changed:
-        save_spot_etf_flow_cache(snapshot)
     return snapshot
 
 
@@ -2086,7 +2051,7 @@ def market_summary_with_separators(lines: list[str]) -> list[str]:
         if (
             line in section_headings
             or line.startswith("链上确认交易（")
-            or line.startswith("Hyperliquid清算价（BTC，缓存 ")
+            or line.startswith("Hyperliquid清算价（BTC，")
             or line.startswith("现货ETF资金流（亿美元，缓存 ")
         ) and separated:
             separated.append(TELEGRAM_SECTION_SEPARATOR)
@@ -2250,20 +2215,9 @@ def merge_partial_market_summary(
 
 
 def fetch_stablecoin_summary() -> str:
-    cached_summary, cached_at, failed_at = load_market_summary_cache()
-    cached_summary = normalize_stablecoin_summary_labels(cached_summary)
-    cached_summary = refresh_cached_summary_etf(cached_summary, cached_at)
+    # Current market sections are live-only; persisted snapshots remain only for
+    # historical comparisons such as "yesterday" deltas.
     now = cn_now()
-    if cached_at is not None:
-        cache_age = (now - cached_at).total_seconds()
-        if 0 <= cache_age < MARKET_SUMMARY_CACHE_TTL_SECONDS:
-            return cached_summary
-    if failed_at is not None and cached_summary:
-        failure_age = (now - failed_at).total_seconds()
-        if 0 <= failure_age < MARKET_SUMMARY_FAILURE_COOLDOWN_SECONDS:
-            print("[market-cache] refresh cooldown active", file=sys.stderr)
-            return cached_summary
-
     dex_volume: dict[str, float] = {}
     global_volume: dict[str, float] = {}
     derivatives_volume: dict[str, float] = {}
@@ -2379,18 +2333,6 @@ def fetch_stablecoin_summary() -> str:
             save_strategy_btc_cache(strategy_btc)
         except market_errors as exc:
             print(f"[strategy-btc-cache-error] {type(exc).__name__}: {exc}", file=sys.stderr)
-    else:
-        try:
-            strategy_btc = load_strategy_btc_cache()
-            if strategy_btc:
-                strategy_btc = {**strategy_btc, "_stale": True}
-                verified_date = strategy_btc["verified_date"].isoformat()
-                print(
-                    f"[strategy-btc-cache] using last verified record from {verified_date}",
-                    file=sys.stderr,
-                )
-        except market_errors as exc:
-            print(f"[strategy-btc-cache-error] {type(exc).__name__}: {exc}", file=sys.stderr)
     bitmine_eth = fetched.get("bitmine_eth", {})
     us_macro_calendar = fetched.get("us_macro_calendar", {})
     supply = fetched.get("supply", {})
@@ -2439,13 +2381,22 @@ def fetch_stablecoin_summary() -> str:
             )
         else:
             market_lines.append("总市值 暂不可用")
-        if coinglass_market_structure:
+        if "btc_dominance" in coinglass_market_structure:
             dominance_line = (
                 f"BTC占比 {coinglass_market_structure['btc_dominance']:.2f}% | "
                 f"24H {coinglass_market_structure['btc_dominance_change_24h']:+.2f}%"
             )
             if global_volume.get("eth_dominance") is not None:
                 dominance_line += f" | ETH占比 {global_volume['eth_dominance']:.2f}%"
+            market_lines.append(dominance_line)
+        elif global_volume.get("btc_dominance") is not None or global_volume.get("eth_dominance") is not None:
+            dominance_parts = []
+            if global_volume.get("btc_dominance") is not None:
+                dominance_parts.append(f"BTC占比 {global_volume['btc_dominance']:.2f}%")
+            if global_volume.get("eth_dominance") is not None:
+                dominance_parts.append(f"ETH占比 {global_volume['eth_dominance']:.2f}%")
+            market_lines.append(" | ".join(dominance_parts))
+        if "exchange_balance" in coinglass_market_structure:
             exchange_line = (
                 f"交易所BTC {coinglass_market_structure['exchange_balance'] / 1e4:.2f}万枚 | "
                 f"24H {compact_btc_change(coinglass_market_structure['exchange_balance_change_24h'])} | "
@@ -2456,17 +2407,9 @@ def fetch_stablecoin_summary() -> str:
                 exchange_line += (
                     f" | 数据截至 {coinglass_captured_at.strftime('%m-%d %H:%M')}"
                 )
-            market_lines.extend([
-                dominance_line,
-                exchange_line,
-            ])
-        elif global_volume.get("btc_dominance") is not None or global_volume.get("eth_dominance") is not None:
-            dominance_parts = []
-            if global_volume.get("btc_dominance") is not None:
-                dominance_parts.append(f"BTC占比 {global_volume['btc_dominance']:.2f}%")
-            if global_volume.get("eth_dominance") is not None:
-                dominance_parts.append(f"ETH占比 {global_volume['eth_dominance']:.2f}%")
-            market_lines.append(" | ".join(dominance_parts))
+            market_lines.append(exchange_line)
+        else:
+            market_lines.append("交易所BTC 暂不可用")
         if global_volume_valid:
             volume_source = global_volume.get("volume_source", "CoinGecko")
             source_label = f" | 来源 {volume_source}" if volume_source != "CoinGecko" else ""
@@ -2518,13 +2461,12 @@ def fetch_stablecoin_summary() -> str:
         ])
     if hyperliquid_liquidation:
         liquidation_heading = "Hyperliquid清算价（BTC）"
-        if hyperliquid_liquidation.get("_stale"):
-            captured_at = parse_cache_timestamp(hyperliquid_liquidation.get("_captured_at"))
-            if captured_at is not None:
-                liquidation_heading = (
-                    "Hyperliquid清算价（BTC，缓存 "
-                    f"{captured_at.strftime('%m-%d %H:%M')}）"
-                )
+        captured_at = parse_cache_timestamp(hyperliquid_liquidation.get("_captured_at"))
+        if captured_at is not None:
+            liquidation_heading = (
+                "Hyperliquid清算价（BTC，截至 "
+                f"{captured_at.strftime('%m-%d %H:%M')}）"
+            )
         long_lines = [
             f"多头 {liquidation_level_text(level)}"
             for level in hyperliquid_liquidation.get("long_levels", [])
@@ -2542,27 +2484,33 @@ def fetch_stablecoin_summary() -> str:
                 *long_lines,
                 *short_lines,
             ]
-            ratio = hyperliquid_liquidation.get("long_short_ratio")
-            if isinstance(ratio, dict):
-                long_users = int(ratio["long_users"])
-                short_users = int(ratio["short_users"])
-                total_users = long_users + short_users
-                long_percent = long_users / total_users * 100
-                short_percent = short_users / total_users * 100
-                ratio_value = float(ratio["ratio"])
-                if long_users > short_users:
-                    crowding = "多单人数占优"
-                elif short_users > long_users:
-                    crowding = "空单人数占优"
-                else:
-                    crowding = "人数相当"
-                liquidation_lines.extend([
-                    "持仓人数多空比（1天）",
-                    f"多单 {long_users:,}（{long_percent:.2f}%） | "
-                    f"空单 {short_users:,}（{short_percent:.2f}%）",
-                    f"多空比 {ratio_value:.2f}（{crowding}）",
-                ])
-            market_lines.extend(liquidation_lines)
+        else:
+            liquidation_lines = [liquidation_heading, "清算价 暂不可用"]
+    else:
+        liquidation_lines = ["Hyperliquid清算价（BTC）", "清算价 暂不可用"]
+    ratio = hyperliquid_liquidation.get("long_short_ratio")
+    if isinstance(ratio, dict):
+        long_users = int(ratio["long_users"])
+        short_users = int(ratio["short_users"])
+        total_users = long_users + short_users
+        long_percent = long_users / total_users * 100
+        short_percent = short_users / total_users * 100
+        ratio_value = float(ratio["ratio"])
+        if long_users > short_users:
+            crowding = "多单人数占优"
+        elif short_users > long_users:
+            crowding = "空单人数占优"
+        else:
+            crowding = "人数相当"
+        liquidation_lines.extend([
+            "持仓人数多空比（1天）",
+            f"多单 {long_users:,}（{long_percent:.2f}%） | "
+            f"空单 {short_users:,}（{short_percent:.2f}%）",
+            f"多空比 {ratio_value:.2f}（{crowding}）",
+        ])
+    else:
+        liquidation_lines.append("持仓人数多空比（1天）暂不可用")
+    market_lines.extend(liquidation_lines)
     treasury_lines: list[str] = []
     if us_treasury_debt:
         record_date = us_treasury_debt["record_date"].strftime("%m-%d")
@@ -2585,7 +2533,13 @@ def fetch_stablecoin_summary() -> str:
         staking_lines.append(
             f"比例 {compact_percent(eth_staking['percent'])} | APR {compact_percent(eth_staking['apr'])}"
         )
-        staking_lines.append("来源 ethereum.org | 指标更新时间未知")
+        observed_at = parse_cache_timestamp(eth_staking.get("observed_at"))
+        observed_label = (
+            observed_at.strftime("%m-%d %H:%M")
+            if observed_at is not None
+            else "未知"
+        )
+        staking_lines.append(f"来源 ethereum.org | 本次观测 {observed_label}")
         unchanged_since = parse_cache_timestamp(eth_staking.get("unchanged_since"))
         if unchanged_since is not None and (
             (now - unchanged_since).total_seconds() >= ETH_STAKING_UNCHANGED_WARNING_SECONDS
@@ -2657,12 +2611,12 @@ def fetch_stablecoin_summary() -> str:
             f"平均成本 ${strategy_btc['average_price']:,.0f}/枚 | "
             f"累计成本 {strategy_btc['total_cost_millions'] / 100:.2f}亿美元",
         ])
-        if strategy_btc.get("_stale"):
-            strategy_lines.append("本次核验失败，沿用已核验缓存")
         pending_filings = strategy_btc.get("unverified_filings", [])
         if pending_filings:
             dates = "、".join(dt.date.fromisoformat(value).strftime("%m-%d") for value in pending_filings)
             strategy_lines.append(f"较新SEC文件未完成核验：{dates} | 非最新持仓确认")
+    else:
+        strategy_lines.extend(["Strategy（微策略）", "BTC持仓 暂不可用"])
     macro_lines = us_macro_calendar_lines(us_macro_calendar)
     bitmine_lines: list[str] = []
     if bitmine_eth:
@@ -2690,15 +2644,10 @@ def fetch_stablecoin_summary() -> str:
         )
     )
     if market_fetch_failed:
-        if cached_summary:
-            summary = merge_partial_market_summary(summary, cached_summary, cached_at)
-            print("[market-cache] merged current modules with cached failures", file=sys.stderr)
-        elif not summary:
-            print("[market-cache] no current or cached market data", file=sys.stderr)
+        if not summary:
+            print("[market-live] no current market data", file=sys.stderr)
             return ""
         return summary
-    if summary:
-        save_market_summary_cache(summary)
     return summary
 
 
@@ -3824,9 +3773,24 @@ def normalize_coinglass_market_structure(raw: Any) -> dict[str, float]:
             text = text[:-len(suffix)].strip()
         return float(text)
 
+    normalized: dict[str, float] = {}
+    if "dominance" in raw:
+        try:
+            dominance = parse_number(raw.get("dominance"), "%")
+            dominance_change = parse_number(raw.get("dominance_change"), "%")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid CoinGlass dominance data") from exc
+        if not math.isfinite(dominance_change) or not 0 <= dominance <= 100:
+            raise ValueError("out-of-range CoinGlass dominance data")
+        normalized.update(
+            btc_dominance=dominance,
+            btc_dominance_change_24h=dominance_change,
+        )
+    if "balance" not in raw:
+        if normalized:
+            return normalized
+        raise ValueError("missing CoinGlass balance and dominance data")
     try:
-        dominance = parse_number(raw.get("dominance"), "%")
-        dominance_change = parse_number(raw.get("dominance_change"), "%")
         balance_text = str(raw.get("balance") or "").strip()
         balance_multiplier = 1e4 if balance_text.endswith("万") else 1.0
         balance = parse_number(balance_text, "万") * balance_multiplier
@@ -3836,23 +3800,21 @@ def normalize_coinglass_market_structure(raw: Any) -> dict[str, float]:
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid CoinGlass market structure data") from exc
     balance_changes = (balance_change_24h, balance_change_7d, balance_change_30d)
-    values = (dominance, dominance_change, balance, *balance_changes)
+    values = (balance, *balance_changes)
     if not all(math.isfinite(value) for value in values):
         raise ValueError("non-finite CoinGlass market structure data")
     if (
-        not 0 <= dominance <= 100
-        or balance <= 0
+        balance <= 0
         or any(abs(change) > balance for change in balance_changes)
     ):
         raise ValueError("out-of-range CoinGlass market structure data")
-    return {
-        "btc_dominance": dominance,
-        "btc_dominance_change_24h": dominance_change,
+    normalized.update({
         "exchange_balance": balance,
         "exchange_balance_change_24h": balance_change_24h,
         "exchange_balance_change_7d": balance_change_7d,
         "exchange_balance_change_30d": balance_change_30d,
-    }
+    })
+    return normalized
 
 
 def fetch_coinglass_live() -> dict[str, Any]:
@@ -3905,9 +3867,8 @@ def fetch_coinglass_live() -> dict[str, Any]:
 
                     await context.route("**/*", route_assets)
 
-                    async def read_page(url: str, script: str, ready_key: str) -> Any:
+                    async def read_page(url: str, script: str, normalize: Any) -> Any:
                         page = await context.new_page()
-                        deadline = time.monotonic() + COINGLASS_PAGE_WAIT_SECONDS
                         try:
                             try:
                                 await page.goto(
@@ -3917,46 +3878,61 @@ def fetch_coinglass_live() -> dict[str, Any]:
                                 )
                             except PlaywrightTimeoutError:
                                 pass
-                            raw: Any = None
+                            deadline = time.monotonic() + COINGLASS_PAGE_WAIT_SECONDS
+                            last_error: Exception | None = None
                             while time.monotonic() < deadline:
                                 raw = await page.evaluate(script)
-                                if isinstance(raw, dict) and raw.get(ready_key):
-                                    return raw
+                                try:
+                                    return normalize(raw)
+                                except (TypeError, ValueError, OverflowError) as exc:
+                                    last_error = exc
                                 await page.wait_for_timeout(500)
-                            raise ValueError(f"CoinGlass page data timeout: {ready_key}")
+                            raise ValueError(f"CoinGlass page data timeout: {last_error}")
                         finally:
                             await page.close()
 
-                    liquidation_raw, ratio_raw, market_raw, balance_raw = await asyncio.gather(
+                    raw_results = await asyncio.gather(
                         read_page(
                             COINGLASS_HYPERLIQUID_LIQUIDATION_URL,
                             COINGLASS_LIQUIDATION_OPTION_JS,
-                            "current_price",
+                            normalize_hyperliquid_liquidation,
                         ),
                         read_page(
                             COINGLASS_HYPERLIQUID_LONG_SHORT_RATIO_URL,
                             COINGLASS_LONG_SHORT_RATIO_JS,
-                            "long_users",
+                            normalize_hyperliquid_long_short_ratio,
                         ),
                         read_page(
                             COINGLASS_MARKET_OVERVIEW_URL,
                             COINGLASS_MARKET_STRUCTURE_JS,
-                            "dominance",
+                            normalize_coinglass_market_structure,
                         ),
                         read_page(
                             COINGLASS_BALANCE_URL,
                             COINGLASS_BALANCE_TOTAL_JS,
-                            "balance",
+                            normalize_coinglass_market_structure,
                         ),
+                        return_exceptions=True,
                     )
-                    snapshot = normalize_hyperliquid_liquidation(liquidation_raw)
-                    snapshot["long_short_ratio"] = normalize_hyperliquid_long_short_ratio(
-                        ratio_raw
-                    )
-                    snapshot["market_structure"] = normalize_coinglass_market_structure({
-                        **market_raw,
-                        **balance_raw,
-                    })
+                    snapshot: dict[str, Any] = {}
+                    errors: list[str] = []
+                    for name, result in zip(
+                        ("liquidation", "long_short_ratio", "market", "balance"), raw_results,
+                    ):
+                        if isinstance(result, BaseException):
+                            errors.append(f"{name}:{type(result).__name__}: {result}")
+                        elif name == "liquidation":
+                            snapshot.update(result)
+                        elif name == "long_short_ratio":
+                            snapshot[name] = result
+                        else:
+                            snapshot.setdefault("market_structure", {}).update(result)
+                    if not snapshot:
+                        detail = ", ".join(errors) or "no usable live data"
+                        raise ValueError(f"CoinGlass live snapshot unavailable: {detail}")
+                    snapshot["_captured_at"] = cn_now().isoformat(timespec="seconds")
+                    if errors:
+                        snapshot["_partial_errors"] = errors
                     return snapshot
                 finally:
                     await context.close()
@@ -3970,36 +3946,19 @@ def fetch_coinglass_live() -> dict[str, Any]:
 
 
 def fetch_coinglass_snapshot() -> dict[str, Any]:
-    cached, captured_at, failed_at = load_coinglass_cache()
-    now = cn_now()
-
-    def stale_cached_snapshot() -> dict[str, Any]:
-        if cached is None:
-            return {}
-        result = dict(cached)
-        result["_stale"] = True
-        if captured_at is not None:
-            result["_captured_at"] = captured_at.isoformat(timespec="minutes")
-        return result
-
-    if cached is not None and captured_at is not None:
-        cache_age = (now - captured_at).total_seconds()
-        if 0 <= cache_age < COINGLASS_CACHE_TTL_SECONDS:
-            return cached
-    if failed_at is not None:
-        failure_age = (now - failed_at).total_seconds()
-        if 0 <= failure_age < COINGLASS_FAILURE_COOLDOWN_SECONDS:
-            if cached is not None:
-                print("[coinglass-cache] refresh cooldown; using last snapshot", file=sys.stderr)
-                return stale_cached_snapshot()
-            return {}
+    # CoinGlass is live-only. A failed page must not turn an old snapshot into
+    # a current-looking liquidation or market-structure value.
     started_at = time.monotonic()
-    snapshot: dict[str, Any] | None = None
     last_error: Exception | None = None
     for attempt in range(COINGLASS_LIVE_RETRIES + 1):
         try:
             snapshot = fetch_coinglass_live()
-            break
+            print(
+                f"[coinglass] live fields={','.join(sorted(key for key in snapshot if not key.startswith('_')))} "
+                f"elapsed={time.monotonic() - started_at:.1f}s",
+                file=sys.stderr,
+            )
+            return snapshot
         except Exception as exc:
             last_error = exc
             if attempt < COINGLASS_LIVE_RETRIES:
@@ -4009,29 +3968,12 @@ def fetch_coinglass_snapshot() -> dict[str, Any]:
                     file=sys.stderr,
                 )
                 time.sleep(1.0)
-    if snapshot is None:
-        exc = last_error or RuntimeError("CoinGlass live fetch failed")
-        save_coinglass_failure()
-        print(
-            f"[coinglass-error] {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        if cached is not None:
-            print("[coinglass-cache] using last successful snapshot", file=sys.stderr)
-            return stale_cached_snapshot()
-        return {}
-    save_coinglass_cache(snapshot)
-    market_structure = snapshot["market_structure"]
+    exc = last_error or RuntimeError("CoinGlass live fetch failed")
     print(
-        f"[coinglass] BTC current={snapshot['current_price']:.2f} "
-        f"long={len(snapshot['long_levels'])} short={len(snapshot['short_levels'])} "
-        f"ratio={snapshot['long_short_ratio']['ratio']:.4f} "
-        f"dominance={market_structure['btc_dominance']:.2f}% "
-        f"balance={market_structure['exchange_balance']:.2f} "
-        f"elapsed={time.monotonic() - started_at:.1f}s",
+        f"[coinglass-error] {type(exc).__name__}: {exc}",
         file=sys.stderr,
     )
-    return snapshot
+    return {}
 
 
 def scrape_handle_url(

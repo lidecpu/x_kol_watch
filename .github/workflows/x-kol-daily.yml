@@ -4,6 +4,11 @@ run-name: X KOL Daily ${{ inputs.send_once_key || github.event_name }}
 on:
   workflow_dispatch:
     inputs:
+      market_preview:
+        description: Build a fresh market preview without sending Telegram
+        required: false
+        default: false
+        type: boolean
       scan_kol:
         description: Run the X KOL scan for a manual probe
         required: false
@@ -106,8 +111,13 @@ jobs:
             fi
             cmd+=(--max-kols "$MAX_KOLS")
           else
-            cmd=(python x_kol_daily.py --market-only --send)
-            mode="market-only"
+            if [ "${{ inputs.market_preview }}" = "true" ]; then
+              cmd=(python x_kol_daily.py --market-only --no-send --telegram-preview)
+              mode="market-preview"
+            else
+              cmd=(python x_kol_daily.py --market-only --send)
+              mode="market-only"
+            fi
           fi
           if [ -n "$SEND_ONCE_KEY" ]; then
             cmd+=(--send-once-key "$SEND_ONCE_KEY")

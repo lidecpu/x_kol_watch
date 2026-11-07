@@ -562,7 +562,8 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertIn("全网 1200.00亿 | +200.00亿（+20.00%） | 来源 CoinPaprika", summary)
         self.assertIn("DEX 100.00亿 | +20.00亿（+25.00%）", summary)
         self.assertIn("CEX估算 1100.00亿 | +180.00亿（+19.57%）", summary)
-        self.assertNotIn("暂不可用", summary)
+        self.assertNotIn("全网 暂不可用", summary)
+        self.assertNotIn("CEX估算 暂不可用", summary)
 
     def test_both_sources_failed_are_visible_as_unavailable(self):
         summary = self._summary({})
@@ -612,11 +613,11 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
                 save_eth_staking_snapshot=market.save_eth_staking_snapshot,
             )
         self.assertIn("质押量 4394.87万枚", summary)
-        self.assertIn("来源 ethereum.org | 指标更新时间未知", summary)
+        self.assertIn("来源 ethereum.org | 本次观测 11-02 12:00", summary)
         self.assertIn("观测值自 10-16 未变", summary)
         self.assertNotIn("数据截至 11-02", summary)
 
-    def test_new_staking_observation_still_discloses_unknown_source_time(self):
+    def test_new_staking_observation_discloses_local_observation_time(self):
         metrics = {"total": 43948738.0, "percent": 35.0, "apr": 2.5}
         summary = self._summary(
             self._volume(),
@@ -624,8 +625,67 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
             load_json=lambda *_: {},
             save_eth_staking_snapshot=market.save_eth_staking_snapshot,
         )
-        self.assertIn("指标更新时间未知", summary)
+        self.assertIn("来源 ethereum.org | 本次观测", summary)
         self.assertNotIn("观测值自", summary)
+
+    def test_partial_hyperliquid_snapshot_marks_ratio_unavailable(self):
+        snapshot = {
+            "current_price": 80000.0,
+            "long_levels": [
+                {"price": 79000.0, "intensity": 200.0, "distance_percent": -1.25},
+            ],
+            "short_levels": [
+                {"price": 81000.0, "intensity": 200.0, "distance_percent": 1.25},
+            ],
+            "market_structure": {
+                "btc_dominance": 60.0,
+                "btc_dominance_change_24h": 0.1,
+                "exchange_balance": 2500000.0,
+                "exchange_balance_change_24h": -100.0,
+                "exchange_balance_change_7d": -1000.0,
+                "exchange_balance_change_30d": -2000.0,
+            },
+            "_captured_at": "2026-11-02T12:00:00+08:00",
+        }
+        summary = self._summary(
+            self._volume(),
+            fetch_coinglass_snapshot=lambda: snapshot,
+        )
+        self.assertIn("持仓人数多空比（1天）暂不可用", summary)
+
+    def test_live_liquidation_heading_keeps_section_separator(self):
+        lines = market.market_summary_with_separators([
+            "加密市场", "总市值 2.50万亿美元",
+            "Hyperliquid清算价（BTC，截至 11-08 03:50）", "现价 $80,000",
+        ])
+        self.assertEqual(lines[2], market.TELEGRAM_SECTION_SEPARATOR)
+
+    def test_ratio_renders_without_liquidation_chart(self):
+        summary = self._summary(
+            self._volume(),
+            fetch_coinglass_snapshot=lambda: {
+                "long_short_ratio": {
+                    "long_users": 71507, "short_users": 24211, "ratio": 2.9535,
+                },
+                "_captured_at": "2026-11-08T03:50:00+08:00",
+            },
+        )
+        self.assertIn("多单 71,507", summary)
+        self.assertIn("空单 24,211", summary)
+        self.assertIn("多空比 2.95", summary)
+
+    def test_partial_market_structure_keeps_live_exchange_balance(self):
+        summary = self._summary(
+            self._volume(),
+            fetch_coinglass_snapshot=lambda: {"market_structure": {
+                "exchange_balance": 2580736.30,
+                "exchange_balance_change_24h": 0,
+                "exchange_balance_change_7d": -18382.30,
+                "exchange_balance_change_30d": -24816.84,
+            }},
+        )
+        self.assertIn("交易所BTC 258.07万枚", summary)
+        self.assertIn("BTC占比 60.00%", summary)
 
     def test_newer_unverified_sec_filing_warning_is_visible_in_report(self):
         record = market.parse_strategy_btc_sec(split_tables())
@@ -642,7 +702,7 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertIn("较新SEC文件未完成核验：10-29", summary)
         self.assertNotIn("SEC披露 10-29", summary)
 
-    def test_strategy_fallback_cache_is_explicitly_marked_after_refresh_failure(self):
+    def test_strategy_refresh_failure_does_not_reuse_cached_holdings(self):
         record = market.parse_strategy_btc_sec(split_tables())
         record.update(
             verified_date=dt.date(2026, 10, 25), filing_date=dt.date(2026, 10, 5),
@@ -652,8 +712,9 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
             self._volume(), fetch_strategy_btc=lambda: {},
             load_strategy_btc_cache=lambda: record,
         )
-        self.assertIn("本次核验失败，沿用已核验缓存", summary)
-        self.assertIn("SEC核验 10-25", summary)
+        self.assertIn("Strategy（微策略）\nBTC持仓 暂不可用", summary)
+        self.assertNotIn("SEC核验 10-25", summary)
+        self.assertNotIn("沿用", summary)
 
 
 class MarketSeparatorTests(unittest.TestCase):
