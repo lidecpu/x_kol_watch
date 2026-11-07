@@ -36,9 +36,23 @@ export default {
       return jsonResponse({ ok: false, error: "GitHub dispatch failed" }, 502);
     }
   },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScheduled(event, env));
+  },
 };
 
-async function triggerGithub(env, source) {
+async function runScheduled(event, env) {
+  try {
+    const result = await triggerGithub(env, "cron", new Date(event.scheduledTime));
+    logDispatch(result);
+  } catch (error) {
+    logDispatch({ ok: false, source: "cron", error: errorMessage(error) }, "error");
+    throw error;
+  }
+}
+
+async function triggerGithub(env, source, scheduledDate) {
   requireEnv(env, "GITHUB_TOKEN");
 
   const owner = env.GITHUB_OWNER || "lidecpu";
@@ -46,7 +60,7 @@ async function triggerGithub(env, source) {
   const workflow = env.GITHUB_WORKFLOW || "x-kol-daily.yml";
   const ref = "main";
   const { activeRuns, ignoredRuns } = await listActiveRuns(env, owner, repo, workflow, ref);
-  const sendOnceKey = beijingSendOnceKey();
+  const sendOnceKey = beijingSendOnceKey(scheduledDate);
   if (activeRuns.length) {
     return {
       ok: true,
@@ -82,6 +96,8 @@ async function triggerGithub(env, source) {
         ref,
         inputs: {
           send_once_key: sendOnceKey,
+          scan_kol: "false",
+          send_kol: "false",
         },
       }),
       signal: controller.signal,
