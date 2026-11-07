@@ -1,5 +1,8 @@
 import datetime as dt
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import x_kol_daily as market
@@ -26,16 +29,22 @@ class LiveMarketSourceTests(unittest.TestCase):
                 "exchange_balance_change_30d": -2000.0,
             },
         }
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name) / "market.json"
+        state.write_text(json.dumps({
+            "coinglass": {
+                "version": 4, "snapshot": self.cache,
+                "captured_at": (self.now - dt.timedelta(days=2)).isoformat(),
+            },
+        }), encoding="utf-8")
+        patched = patch.object(market, "MARKET_STATE", state)
+        patched.start()
+        self.addCleanup(patched.stop)
 
     def test_failed_live_coinglass_does_not_return_old_snapshot(self):
-        captured_at = self.now - dt.timedelta(days=2)
         with (
             patch.object(market, "cn_now", return_value=self.now),
-            patch.object(
-                market,
-                "load_coinglass_cache",
-                return_value=(self.cache, captured_at, None),
-            ) as load_cache,
             patch.object(
                 market,
                 "fetch_coinglass_live",
@@ -44,7 +53,6 @@ class LiveMarketSourceTests(unittest.TestCase):
         ):
             snapshot = market.fetch_coinglass_snapshot()
         self.assertEqual(snapshot, {})
-        load_cache.assert_not_called()
 
     def test_partial_live_coinglass_does_not_fill_missing_fields_from_cache(self):
         live = {
@@ -55,20 +63,12 @@ class LiveMarketSourceTests(unittest.TestCase):
         }
         with (
             patch.object(market, "cn_now", return_value=self.now),
-            patch.object(
-                market,
-                "load_coinglass_cache",
-                return_value=(self.cache, self.now - dt.timedelta(hours=1), None),
-            ) as load_cache,
             patch.object(market, "fetch_coinglass_live", return_value=live),
-            patch.object(market, "save_coinglass_cache") as save,
         ):
             snapshot = market.fetch_coinglass_snapshot()
         self.assertEqual(snapshot["current_price"], 80000.0)
         self.assertNotIn("long_short_ratio", snapshot)
         self.assertNotIn("market_structure", snapshot)
-        load_cache.assert_not_called()
-        save.assert_not_called()
 
 
 class NoSummaryCacheFallbackTests(unittest.TestCase):
@@ -81,13 +81,17 @@ class NoSummaryCacheFallbackTests(unittest.TestCase):
             "btc_dominance": 60.0,
             "eth_dominance": 10.0,
         }
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name) / "market.json"
+        state.write_text(json.dumps({
+            "summary_cache": {
+                "version": 23, "summary": old,
+                "captured_at": dt.datetime.now(market.CN_TZ).isoformat(),
+            },
+        }), encoding="utf-8")
         with (
-            patch.object(
-                market,
-                "load_market_summary_cache",
-                return_value=(old, dt.datetime.now(market.CN_TZ), None),
-            ) as load_cache,
-            patch.object(market, "refresh_cached_summary_etf") as refresh_cache,
+            patch.object(market, "MARKET_STATE", state),
             patch.object(market, "previous_derivatives_volume", return_value=None),
             patch.object(market, "previous_eth_staking_total", return_value=None),
             patch.object(market, "fetch_dex_volume", return_value={}),
@@ -111,8 +115,6 @@ class NoSummaryCacheFallbackTests(unittest.TestCase):
             summary = market.fetch_stablecoin_summary()
         self.assertIn("总市值 2.50万亿美元", summary)
         self.assertNotIn("总市值 1.00万亿美元", summary)
-        load_cache.assert_not_called()
-        refresh_cache.assert_not_called()
 
 
 if __name__ == "__main__":

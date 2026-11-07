@@ -265,12 +265,6 @@ class StrategyParsingTests(unittest.TestCase):
         self.assertEqual(restored["filing_date"], dt.date(2026, 10, 6))
         self.assertEqual(restored["change"], 334)
 
-    def test_cached_holdings_label_preserves_cutoff_without_timezone(self):
-        old = "BTC持仓 900,000枚 | 持仓截至 10-05 04:00（北京时间） | SEC核验 10-07"
-        expected = "BTC持仓 900,000枚 | 持仓截至 10-05 04:00 | SEC核验 10-07"
-        self.assertEqual(market.normalize_stablecoin_summary_labels(old), expected)
-        self.assertEqual(market.normalize_stablecoin_summary_labels(expected), expected)
-
     def test_holdings_filing_date_is_preserved_separately_from_verification_date(self):
         record = market.parse_strategy_btc_sec(split_tables())
         record.update(
@@ -520,8 +514,6 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
             "current": 1e10, "delta": 2e9, "percent": 25.0,
         }
         replacements = dict(
-            load_market_summary_cache=lambda: ("", None, None),
-            refresh_cached_summary_etf=lambda summary, _: summary,
             previous_derivatives_volume=lambda _: None,
             previous_eth_staking_total=lambda _: None,
             fetch_dex_volume=lambda: dex_volume,
@@ -535,12 +527,12 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
             fetch_stablecoin_volumes=lambda: {},
             fetch_strategy_btc=lambda: {},
             load_strategy_btc_cache=lambda: {},
-            fetch_us_macro_calendar=lambda: {},
+            fetch_us_macro_calendar=lambda **_: {},
             fetch_bitmine_eth=lambda: {},
             fetch_coinglass_snapshot=lambda: {},
             fetch_spot_etf_flow_snapshot=lambda: {},
             save_derivatives_snapshot=lambda *_: None,
-            save_eth_staking_snapshot=lambda *_: None,
+            save_eth_staking_snapshot=lambda *_, **__: None,
             save_json=lambda *_: None,
         )
         replacements.update(overrides)
@@ -587,7 +579,7 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         self.assertIn("总市值 暂不可用", summary)
         self.assertIn("全网 1200.00亿", summary)
         self.assertIn("CEX估算 1100.00亿", summary)
-        self.assertNotIn("ETH占比", summary)
+        self.assertNotIn("ETH占比", summary.split("数据提示")[0])
 
     def test_fallback_metadata_source_and_missing_change_are_visible(self):
         volume = self._volume()
@@ -596,7 +588,7 @@ class GlobalVolumeRenderingTests(unittest.TestCase):
         summary = self._summary(volume)
         self.assertIn("总市值 2.70万亿美元 | 24H 暂不可用 | 来源 CoinPaprika", summary)
         self.assertIn("BTC占比 60.00%", summary)
-        self.assertNotIn("ETH占比", summary)
+        self.assertNotIn("ETH占比", summary.split("数据提示")[0])
         self.assertIn("CEX估算 1100.00亿", summary)
 
     def test_staking_unchanged_warning_reaches_report_without_inventing_source_date(self):
@@ -751,23 +743,9 @@ class ChainDateTests(unittest.TestCase):
             market.chain_activity_heading(dt.date(2026, 12, 31)),
         )
 
-    def test_old_cached_labels_normalize_and_merge_once(self):
-        new = market.chain_activity_heading(dt.date(2026, 10, 5))
-        old = "链上确认交易（最新完整日 10-06）"
-        for cached in (
-            old,
-            "链上确认交易（最新完整日 UTC 10-05｜北京时间 10-06）",
-            "链上确认交易（最新完整区间，北京时间 10-05 08:00 至 10-06 08:00）",
-            new,
-        ):
-            with self.subTest(cached=cached):
-                self.assertEqual(market.normalize_stablecoin_summary_labels(cached), new)
-                self.assertEqual(market.summary_block_key([cached]), market.summary_block_key([new]))
-                merged = market.merge_partial_market_summary(
-                    new + "\nBTC current", cached + "\nBTC old", None,
-                )
-                self.assertEqual(merged, new + "\nBTC current")
-        separated = market.market_summary_with_separators(["加密市场", new])
+    def test_chain_activity_starts_a_separate_section(self):
+        heading = market.chain_activity_heading(dt.date(2026, 10, 5))
+        separated = market.market_summary_with_separators(["加密市场", heading])
         self.assertEqual(separated[1], market.TELEGRAM_SECTION_SEPARATOR)
 
 

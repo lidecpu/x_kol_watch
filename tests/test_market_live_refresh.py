@@ -1,7 +1,10 @@
 import datetime as dt
 import io
+import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 import x_kol_daily as market
@@ -19,12 +22,26 @@ def etf_asset():
 
 
 class LiveEtfTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        state = Path(directory.name) / "market.json"
+        state.write_text(json.dumps({
+            "spot_etf_flows": {
+                "version": 4,
+                "snapshot": {"BTC": etf_asset(), "ETH": etf_asset()},
+                "captured_at": "2026-11-08T03:50:00+08:00",
+                "failed_at": "2026-11-08T03:50:00+08:00",
+            },
+        }), encoding="utf-8")
+        patched = patch.object(market, "MARKET_STATE", state)
+        patched.start()
+        self.addCleanup(patched.stop)
+
     def test_every_call_refreshes_both_assets_even_with_recent_cache(self):
         now = dt.datetime(2026, 11, 8, 3, 50, tzinfo=market.CN_TZ)
         with (
             patch.object(market, "cn_now", return_value=now),
-            patch.object(market, "load_spot_etf_flow_cache",
-                         return_value=({"BTC": etf_asset(), "ETH": etf_asset()}, now, now)),
             patch.object(market, "fetch_farside_etf_flow", side_effect=[
                 etf_asset(), etf_asset(), etf_asset(), etf_asset(),
             ]) as fetch,
@@ -39,8 +56,6 @@ class LiveEtfTests(unittest.TestCase):
     def test_failed_asset_is_unavailable_without_reusing_old_flows(self):
         now = dt.datetime(2026, 11, 8, 3, 50, tzinfo=market.CN_TZ)
         with (
-            patch.object(market, "load_spot_etf_flow_cache",
-                         return_value=({"BTC": etf_asset()}, now, None)),
             patch.object(market, "fetch_farside_etf_flow",
                          side_effect=[TimeoutError(), etf_asset()]),
             patch.object(market, "save_json"),

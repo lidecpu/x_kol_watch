@@ -132,6 +132,17 @@ jobs:
           "${cmd[@]}" 2>&1 | tee run.log
           status="${PIPESTATUS[0]}"
           set -e
+          market_summary="$(grep -F '{"market":' run.log | tail -n 1 || true)"
+          if [ -n "$market_summary" ]; then
+            {
+              echo "### Market data status"
+              echo
+              echo '```json'
+              echo "$market_summary"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ "$status" != "0" ]; then
             {
               echo "### X KOL watcher failed"
@@ -191,7 +202,7 @@ jobs:
           fi
 
       - name: Save tweet cache
-        if: ${{ always() && hashFiles('cache/**') != '' }}
+        if: ${{ always() && inputs.market_preview != true && hashFiles('cache/**') != '' }}
         uses: actions/cache/save@v6
         with:
           path: |
